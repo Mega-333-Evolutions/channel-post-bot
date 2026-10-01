@@ -11,34 +11,45 @@ jobs:
     steps:
       - name: Checkout GitHub Repository
         uses: actions/checkout@v3
+        with:
+          lfs: true
 
       - name: Sync Code to Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # 1. Clone your Hugging Face Space 
+          # 1. Clone your Hugging Face Space
           git clone https://user:${HF_TOKEN}@huggingface.co/spaces/Mega-Evolutions/ButtonBot hf_space
           
-          # 2. Go into the HF Space and delete everything EXCEPT .git, README.md, and .gitattributes
+          # 2. Backup HF README.md to a safe temporary location
+          if [ -f "hf_space/README.md" ]; then
+            cp hf_space/README.md /tmp/HF_README.md
+          fi
+          
+          # 3. Cleanly remove old files using git to clear ghost LFS records
           cd hf_space
-          find . -maxdepth 1 ! -name 'README.md' ! -name '.git' ! -name '.gitattributes' ! -name '.' -exec rm -rf {} +
+          git rm -rf . || true
           cd ..
           
-          # 3. Copy everything from your GitHub repo into the HF Space 
+          # 4. Copy everything from your GitHub repo into the HF space
           rsync -av --exclude='.git' --exclude='README.md' --exclude='.github' ./ hf_space/
           
-          # 4. Setup Git LFS for binary files
+          # 5. Restore the Hugging Face README.md
+          if [ -f "/tmp/HF_README.md" ]; then
+            cp /tmp/HF_README.md hf_space/README.md
+          fi
+          
+          # 6. Setup Git LFS for binary files
           cd hf_space
           git lfs install
           git lfs track "*.jpg" "*.jpeg" "*.png" "*.ttf" "*.otf" "*.webp" "*.mp4" "*.mp3"
           
-          # 5. Commit and push the updated files back to Hugging Face
+          # 7. Commit and push back to Hugging Face
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .gitattributes
+          git add .gitattributes README.md
           git add .
           
-          # Only attempt to commit if there are actual changes
           if git diff-index --quiet HEAD --; then
             echo "No changes to commit"
           else
