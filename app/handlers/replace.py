@@ -13,7 +13,8 @@ from telethon import Button, errors, types
 from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, require_owner, say, show
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
-from ..tgutil import button_url, edit_raw, esc, explain_rpc, get_rights, peer_of, with_url
+from ..tgutil import build_markup, button_url, edit_raw, esc, explain_rpc, get_rights, peer_of, short, with_url
+from ..ui import CANCEL
 from .channels import parse_channel_ref
 
 log = logging.getLogger(__name__)
@@ -101,6 +102,9 @@ def summary_text(job: Job) -> str:
             block += f"\n{s.total} post(s) to change: {b} button link(s), {h} hyperlink(s), {t} typed link(s)"
             if s.foreign:
                 block += f"\n• {s.foreign} of them were not posted by this bot"
+            fb = sum(1 for i in s.infos.values() if not i.mine and i.buttons)
+            if fb:
+                block += f"\n• {fb} are button posts made by someone else - Telegram may refuse to edit those (check with /testedit)"
             cb = sum(1 for i in s.infos.values() if i.callbacks)
             if cb:
                 block += f"\n• {cb} carry other bots' buttons (e.g. reactions) - those stay as they are"
@@ -118,11 +122,11 @@ def summary_text(job: Job) -> str:
 
 def register(ctx: Ctx) -> None:
     client, db, cfg = ctx.client, ctx.db, ctx.cfg
-    lock = asyncio.Lock()
+    lock = ctx.lock
 
     def purge_tokens() -> None:
         now = time.monotonic()
-        for k in [k for k, v in ctx.pending.items() if now - getattr(v, "created", now) > TOKEN_TTL]:
+        for k in [k for k, v in ctx.pending.items() if not getattr(v, "running", False) and now - getattr(v, "created", now) > TOKEN_TTL]:
             ctx.pending.pop(k, None)
 
     def make_updater(event):
@@ -230,6 +234,7 @@ def register(ctx: Ctx) -> None:
         batch_id = secrets.token_hex(6)
         o = job.opts
         totals = ApplyResult()
+        stopped: list = []
         async with lock:
             await db.create_batch(batch_id, o.old, o.new, event.sender_id)
             todo = sum(s.total for s in job.scans)
@@ -255,6 +260,8 @@ def register(ctx: Ctx) -> None:
                 totals.missing += res.missing
                 totals.no_perm += res.no_perm
                 totals.failed += res.failed
+                if res.aborted:
+                    stopped.append((s.channel.title, res.aborted))
         ctx.pending.pop(token, None)
         lines = [f"✅ <b>Done</b> - <code>@{esc(o.old)}</code> → <code>@{esc(o.new)}</code>", f"• edited: <b>{totals.edited}</b>"]
         if totals.unchanged:
@@ -267,8 +274,10 @@ def register(ctx: Ctx) -> None:
             sample = ", ".join(f"#{m} {esc(n)}" for m, n in totals.failed[:8])
             lines.append(f"• <b>failed: {len(totals.failed)}</b> ({sample}{'…' if len(totals.failed) > 8 else ''})")
             names = {n for _, n in totals.failed}
-            if names & {"MessageAuthorRequiredError", "InlineBotRequiredError", "ChatAdminRequiredError"}:
-                lines.append("  Telegram doesn't let this bot edit those posts (see /testedit).")
+            if names & {"MessageAuthorRequiredError", "InlineBotRequiredError", "ChatAdminRequiredError", "MessageIdInvalidError"}:
+                lines.append("  Telegram doesn't let this bot edit those posts (see /testedit and /selftest).")
+        for title, name in stopped:
+            lines.append(f"⚠️ Stopped early in <b>{esc(title)}</b>: Telegram refused 5 edits in a row ({esc(name)}).")
         kb = [[Button.inline("↩️ Undo this replace", f"ruc:{batch_id}")]] if totals.edited else None
         if kb:
             try:
@@ -321,6 +330,94 @@ def register(ctx: Ctx) -> None:
         if res.failed:
             text += f"\n⚠️ {len(res.failed)} could not be restored (" + ", ".join(f"#{m} {esc(n)}" for m, n in res.failed[:6]) + ")."
         await upd(text, force=True)
+
+
+    # ---------------------------------------------------------------- /selftest
+    async def ask_selftest(event, ch) -> None:
+        await say(
+            event,
+            f"🧪 <b>Self-test in {esc(ch.title)}</b>\n"
+            "The bot posts a short test message with one button (silently), changes the button link, reads it back "
+            "and deletes the message again. It takes a few seconds and shows whether editing buttons works "
+            "for posts made by this bot.",
+            [[Button.inline("🧪 Run the test", f"st:{ch.id}"), Button.inline("✖️ Cancel", "cx")]],
+        )
+
+    @client.on(cmd("selftest", args=True))
+    @guard(ctx, owner=True)
+    async def h_selftest(event):
+        ref = (event.pattern_match.group(1) or "").strip() or None
+        try:
+            chans = pick_channels(await db.list_channels(), ref)
+        except ValueError as e:
+            raise UserError(str(e))
+        if not chans:
+            raise UserError("No channels registered yet. Use /addchannel.")
+        if len(chans) == 1:
+            await ask_selftest(event, chans[0])
+            return
+        kb = [[Button.inline(f"📢 {short(c.title, 40)}", f"stc:{c.id}")] for c in chans] + CANCEL
+        await say(event, "Run the self-test in which channel?", kb)
+
+    @on_cb(ctx, "stc")
+    async def cb_selftest_pick(event, parts):
+        require_owner(ctx, event)
+        ch = await db.get_channel(int(parts[0]))
+        if ch is None:
+            raise UserError("That channel is not registered.")
+        await ask_selftest(event, ch)
+
+    @on_cb(ctx, "st")
+    async def cb_selftest(event, parts):
+        require_owner(ctx, event)
+        ch = await db.get_channel(int(parts[0]))
+        if ch is None:
+            raise UserError("That channel is not registered.")
+        peer = peer_of(ch)
+        first = build_markup([[{"t": "Test button", "u": "https://example.com/a"}]])
+        second = build_markup([[{"t": "Test button", "u": "https://example.com/b"}]])
+        lines = [f"🧪 <b>Self-test in {esc(ch.title)}</b>"]
+        edit_ok = False
+        sent = None
+        try:
+            sent = await client.send_message(
+                peer, "🧪 Edit test - this message deletes itself in a moment.", buttons=first, link_preview=False, silent=True
+            )
+            lines.append("✅ posted a test message")
+        except errors.RPCError as e:
+            lines.append(f"❌ could not post: {esc(explain_rpc(e))}")
+        if sent is not None:
+            try:
+                await edit_raw(client, peer, sent.id, markup=second)
+                got = (await client.get_messages(peer, ids=[sent.id]))[0]
+                urls = []
+                if got is not None and isinstance(got.reply_markup, types.ReplyInlineMarkup):
+                    urls = [button_url(b) for row in got.reply_markup.rows for b in row.buttons if button_url(b)]
+                edit_ok = urls == ["https://example.com/b"]
+                lines.append(
+                    "✅ changed the button link and read it back"
+                    if edit_ok
+                    else "⚠️ Telegram accepted the edit but the link did not change"
+                )
+            except errors.RPCError as e:
+                lines.append(f"❌ could not edit the button: {esc(explain_rpc(e))}")
+            try:
+                res = await client.delete_messages(peer, [sent.id])
+                gone = sum(getattr(r, "pts_count", 0) or 0 for r in res)
+                lines.append("✅ deleted the test message" if gone else "⚠️ could not delete it - please delete it by hand")
+            except errors.RPCError as e:
+                lines.append(f"⚠️ could not delete it ({esc(type(e).__name__)}) - please delete it by hand")
+        if edit_ok:
+            lines.append(
+                "\n<b>Editing buttons works for posts made by this bot.</b> If /testedit still fails on Channel Help "
+                "posts, Telegram doesn't let this bot change buttons that another bot added."
+            )
+        else:
+            lines.append(
+                "\n<b>Editing failed even for this bot's own post</b>, so check the bot's admin rights in the channel "
+                "(Post messages, Edit messages of others, Delete messages)."
+            )
+        await show(event, "\n".join(lines))
 
     # ---------------------------------------------------------------- /testedit
     link_rx = re.compile(
@@ -395,9 +492,18 @@ def register(ctx: Ctx) -> None:
         try:
             await edit_raw(client, peer, job.mid, markup=types.ReplyInlineMarkup(rows))
         except errors.RPCError as e:
+            extra = ""
+            if type(e).__name__ == "MessageIdInvalidError":
+                extra = (
+                    "\n\nThe post does exist - I read it a moment ago - so this is not about a missing message. "
+                    "For edits Telegram uses this error when the bot isn't allowed to change the message, typically "
+                    "because the buttons were added by another bot.\n"
+                    "Run /selftest: it tries the same edit on a post made by this bot. If that works, your setup is fine "
+                    "and Telegram simply doesn't let this bot change those buttons."
+                )
             await show(
                 event,
-                f"❌ <b>Telegram refused the edit</b>\n{esc(explain_rpc(e))}\n\n"
+                f"❌ <b>Telegram refused the edit</b> ({esc(type(e).__name__)})\n{esc(explain_rpc(e))}{extra}\n\n"
                 "So /replace can NOT change the buttons of this post with this bot.",
             )
             return

@@ -209,3 +209,26 @@ def compute_message_changes(msg, old: str, new: str, *, include_typed: bool = Tr
         ),
         skipped,
     )
+
+
+def url_only_markup(markup, old: Optional[str] = None, new: Optional[str] = None, include_posts: bool = False):
+    """Buttons for a copy of a post: link buttons only (other bots' buttons would be dead), with the username
+    swapped when `old`/`new` are given. Returns (markup or None, number_of_buttons_not_copied)."""
+    if not isinstance(markup, types.ReplyInlineMarkup):
+        return None, 0
+    rows, dropped = [], 0
+    for row in markup.rows:
+        btns = []
+        for b in row.buttons:
+            url = button_url(b)
+            if url is None:
+                dropped += 1
+                continue
+            if old and new:
+                kind = classify_url(url, old)
+                if kind == "link" or (kind == "post" and include_posts):
+                    b = with_url(b, swap_url(url, old, new))
+            btns.append(b)
+        if btns:
+            rows.append(types.KeyboardButtonRow(btns))
+    return (types.ReplyInlineMarkup(rows) if rows else None), dropped

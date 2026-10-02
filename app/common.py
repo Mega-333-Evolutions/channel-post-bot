@@ -1,6 +1,7 @@
 """Shared context, permission guard, message helpers and post send/edit operations."""
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ class Ctx:
     seen_channels: dict = field(default_factory=dict)  # channel id -> Channel entity seen in updates
     text_handlers: dict = field(default_factory=dict)  # mode -> async fn(event, state)
     callbacks: dict = field(default_factory=dict)  # prefix -> async fn(event, parts)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one long job (replace / repost) at a time
 
 
 def is_cb(event) -> bool:

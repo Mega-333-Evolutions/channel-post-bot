@@ -23,7 +23,9 @@ HELP = (
     "<b>Owner tools</b>\n"
     "/replace @old @new - swap the username inside t.me links (button links and hyperlinks) in all channels\n"
     "/undo - undo the last /replace\n"
+    "/repost @old @new - copy every post of a channel in order (links swapped), then delete the old posts\n"
     "/testedit &lt;post link&gt; - check that the bot can edit the buttons of one specific post\n"
+    "/selftest - check that editing buttons works on a post made by this bot\n"
     "/export - download a JSON backup of your posts"
 )
 

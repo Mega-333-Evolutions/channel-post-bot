@@ -102,6 +102,37 @@ class Change(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Migration(Base):
+    """One /repost run: a channel copied post by post, so it can be continued, undone or finished."""
+
+    __tablename__ = "migrations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    old_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    new_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    include_typed: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_posts: Mapped[bool] = mapped_column(Boolean, default=False)
+    first_id: Mapped[int] = mapped_column(BigInteger)
+    last_id: Mapped[int] = mapped_column(BigInteger)
+    partial: Mapped[bool] = mapped_column(Boolean, default=False)
+    # copying | stopped | incomplete | copied | old_deleted | copies_deleted
+    status: Mapped[str] = mapped_column(String(16), default="copying")
+    created_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MigrationItem(Base):
+    __tablename__ = "migration_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    migration_id: Mapped[str] = mapped_column(String(32), ForeignKey("migrations.id"), index=True)
+    old_id: Mapped[int] = mapped_column(BigInteger)
+    new_id: Mapped[int] = mapped_column(BigInteger)
+    old_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    new_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 def normalize_db_url(url: str) -> tuple:
     """Turn a plain DATABASE_URL into a SQLAlchemy async URL + connect args."""
     connect_args: dict = {}
@@ -357,6 +388,85 @@ class Database:
                 if b is not None:
                     b.undone = True
             await s.commit()
+
+
+    # ------------------------------------------------------------------ /repost
+    OPEN_STATES = ("copying", "stopped", "incomplete", "copied")
+
+    async def create_migration(self, mid: str, channel_id: int, *, old, new, include_typed: bool, include_posts: bool,
+                               first_id: int, last_id: int, partial: bool, user_id: int) -> None:
+        async with self.Session() as s:
+            s.add(Migration(id=mid, channel_id=channel_id, old_username=old, new_username=new,
+                            include_typed=include_typed, include_posts=include_posts, first_id=first_id,
+                            last_id=last_id, partial=partial, created_by=user_id))
+            await s.commit()
+
+    async def get_migration(self, mid: str) -> Optional[Migration]:
+        async with self.Session() as s:
+            return await s.get(Migration, mid)
+
+    async def open_migration(self, channel_id: Optional[int] = None) -> Optional[Migration]:
+        """The newest repost that is not finished yet (copies exist, old posts not deleted / copies not removed)."""
+        async with self.Session() as s:
+            q = select(Migration).where(Migration.status.in_(self.OPEN_STATES))
+            if channel_id is not None:
+                q = q.where(Migration.channel_id == channel_id)
+            q = q.order_by(desc(Migration.created_at)).limit(1)
+            return (await s.execute(q)).scalar_one_or_none()
+
+    async def set_migration_status(self, mid: str, status: str) -> None:
+        async with self.Session() as s:
+            m = await s.get(Migration, mid)
+            if m is not None:
+                m.status = status
+                await s.commit()
+
+    async def migration_done_old_ids(self, mid: str) -> set:
+        async with self.Session() as s:
+            q = select(MigrationItem.old_id).where(MigrationItem.migration_id == mid)
+            return set((await s.execute(q)).scalars())
+
+    async def record_repost(self, mid: str, channel_id: int, rows: list, user_id: int) -> None:
+        """rows: [{old_id, new_id, post: {Post fields}}] - saves the mapping and registers the new posts."""
+        if not rows:
+            return
+        async with self.Session() as s:
+            for r in rows:
+                s.add(MigrationItem(migration_id=mid, old_id=r["old_id"], new_id=r["new_id"]))
+                s.add(Post(channel_id=channel_id, message_id=r["new_id"], status="sent", source="bot",
+                           created_by=user_id, sent_at=utcnow(), **r["post"]))
+            await s.commit()
+
+    async def migration_pending_ids(self, mid: str, which: str, limit: int = 100) -> list:
+        col, flag = (MigrationItem.old_id, MigrationItem.old_deleted) if which == "old" else (MigrationItem.new_id, MigrationItem.new_deleted)
+        async with self.Session() as s:
+            q = select(col).where(MigrationItem.migration_id == mid, flag.is_(False)).order_by(col).limit(limit)
+            return list((await s.execute(q)).scalars())
+
+    async def mark_migration_deleted(self, mid: str, channel_id: int, which: str, ids: list) -> None:
+        """The messages are gone from Telegram: flag them and drop their saved post copies."""
+        if not ids:
+            return
+        col, flag = ("old_id", "old_deleted") if which == "old" else ("new_id", "new_deleted")
+        async with self.Session() as s:
+            q = select(MigrationItem).where(MigrationItem.migration_id == mid, getattr(MigrationItem, col).in_(ids))
+            for it in (await s.execute(q)).scalars():
+                setattr(it, flag, True)
+            pq = select(Post).where(Post.channel_id == channel_id, Post.message_id.in_(ids))
+            for p in (await s.execute(pq)).scalars():
+                await s.delete(p)
+            await s.commit()
+
+    async def migration_counts(self, mid: str) -> dict:
+        async with self.Session() as s:
+            total = (await s.execute(select(func.count()).select_from(MigrationItem).where(MigrationItem.migration_id == mid))).scalar_one()
+            old_left = (await s.execute(select(func.count()).select_from(MigrationItem).where(
+                MigrationItem.migration_id == mid, MigrationItem.old_deleted.is_(False)))).scalar_one()
+            new_left = (await s.execute(select(func.count()).select_from(MigrationItem).where(
+                MigrationItem.migration_id == mid, MigrationItem.new_deleted.is_(False)))).scalar_one()
+            lo = (await s.execute(select(func.min(MigrationItem.new_id)).where(MigrationItem.migration_id == mid))).scalar_one()
+            hi = (await s.execute(select(func.max(MigrationItem.new_id)).where(MigrationItem.migration_id == mid))).scalar_one()
+            return {"copied": total, "old_left": old_left, "new_left": new_left, "first_new": lo, "last_new": hi}
 
     # -------------------------------------------------------------------- export
     async def export_all(self) -> dict:

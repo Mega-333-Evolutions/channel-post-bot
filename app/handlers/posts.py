@@ -386,8 +386,8 @@ def register(ctx: Ctx) -> None:
         await show(
             event,
             f"Delete this post from <b>{esc(ch.title)}</b>?\n\n"
-            "Telegram only lets a bot delete posts that are less than 48 hours old. For older posts, delete them "
-            "by hand in the channel and then use “Only forget it”.",
+            "Telegram's documentation says bots can only delete posts younger than 48 hours; in channels that limit may "
+            "not apply. If Telegram refuses, delete the post by hand and then use “Only forget it in the bot”.",
             [
                 [Button.inline("🗑 Delete from channel", f"dly:{post.id}:a")],
                 [Button.inline("🧹 Only forget it in the bot", f"dly:{post.id}:b")],
@@ -402,8 +402,9 @@ def register(ctx: Ctx) -> None:
             res = await client.delete_messages(peer_of(ch), [post.message_id])
             if not sum(getattr(r, "pts_count", 0) or 0 for r in res):
                 raise UserError(
-                    "Telegram did not delete that message - bots can only delete posts younger than 48 hours. "
-                    "Delete it by hand in the channel, then use “Only forget it in the bot”."
+                    "Telegram did not delete that message (the bot may lack the Delete right, or the post is older than "
+                    "the 48 hours Telegram's documentation mentions). Delete it by hand in the channel, then use "
+                    "“Only forget it in the bot”."
                 )
         await db.delete_post(post.id)
         await show(event, "🗑 Done.", [[Button.inline("📚 My posts", "pl")]])

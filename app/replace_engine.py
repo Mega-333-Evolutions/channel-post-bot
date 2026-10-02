@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 CHUNK = 100  # Telegram returns at most 100 messages per request
 FALLBACK_EMPTY_BATCHES = 15  # used only when the newest message id can't be determined
+ABORT_AFTER = 5  # stop a channel after this many identical Telegram refusals in a row
 
 
 @dataclass
@@ -75,6 +76,7 @@ class ApplyResult:
     missing: int = 0
     no_perm: int = 0
     failed: list = field(default_factory=list)
+    aborted: Optional[str] = None  # error name that made us stop early
 
 
 @dataclass
@@ -83,7 +85,7 @@ class UndoResult:
     failed: list = field(default_factory=list)
 
 
-async def _fetch(client, peer, ids: list) -> list:
+async def fetch_messages(client, peer, ids: list) -> list:
     res = await flood_retry(lambda: client.get_messages(peer, ids=ids))
     return list(res)
 
@@ -100,7 +102,7 @@ async def get_top_id(client, peer) -> Optional[int]:
     return None
 
 
-def _skip(m) -> bool:
+def is_skippable(m) -> bool:
     return m is None or isinstance(m, (types.MessageEmpty, types.MessageService))
 
 
@@ -126,7 +128,7 @@ async def scan_channel(
         if top is not None and a > top:
             break
         hi = a + CHUNK - 1 if top is None else min(a + CHUNK - 1, top)
-        msgs = await _fetch(client, peer, list(range(a, hi + 1)))
+        msgs = await fetch_messages(client, peer, list(range(a, hi + 1)))
         found = False
         for m in msgs:
             if m is None or isinstance(m, types.MessageEmpty):
@@ -192,6 +194,7 @@ async def apply_channel(
     res = ApplyResult()
     ids = sorted(scan.infos)
     buf: list = []
+    streak, last_name = 0, None
 
     async def flush() -> None:
         nonlocal buf
@@ -202,9 +205,9 @@ async def apply_channel(
     try:
         for i in range(0, len(ids), CHUNK):
             chunk = ids[i:i + CHUNK]
-            msgs = await _fetch(client, peer, chunk)
+            msgs = await fetch_messages(client, peer, chunk)
             for mid, m in zip(chunk, msgs):
-                if _skip(m):
+                if is_skippable(m):
                     res.missing += 1
                     continue
                 # re-check against the live message: it may have been edited since the scan
@@ -226,9 +229,16 @@ async def apply_channel(
                     res.unchanged += 1
                     continue
                 except errors.RPCError as e:
-                    log.warning("edit of %s/%s failed: %s", ch.id, m.id, e)
-                    res.failed.append((m.id, type(e).__name__))
+                    name = type(e).__name__
+                    log.warning("edit of %s/%s failed: %s", ch.id, m.id, name)
+                    res.failed.append((m.id, name))
+                    streak = streak + 1 if name == last_name else 1
+                    last_name = name
+                    if streak >= ABORT_AFTER:
+                        res.aborted = name
+                        break
                     continue
+                streak, last_name = 0, None
                 res.edited += 1
                 kind, fid = media_info(m)
                 adopt = {
@@ -252,6 +262,8 @@ async def apply_channel(
                 if progress:
                     await progress(res)
                 await asyncio.sleep(edit_delay)
+            if res.aborted:
+                break
     finally:
         await flush()
     return res

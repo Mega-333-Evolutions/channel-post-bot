@@ -11,7 +11,7 @@ from telethon.sessions import StringSession
 from app.common import Ctx
 from app.config import Config, load_config
 from app.db import Database
-from app.handlers import basic, channels, create, posts, replace
+from app.handlers import basic, channels, create, posts, replace, repost
 from app.health import start_health_server
 
 log = logging.getLogger("bot")
@@ -22,8 +22,10 @@ COMMANDS = [
     ("addchannel", "Register a channel"),
     ("channels", "List channels"),
     ("replace", "Swap a username in links (owner)"),
+    ("repost", "Copy a whole channel in order (owner)"),
     ("undo", "Undo the last replace (owner)"),
     ("testedit", "Test editing one post (owner)"),
+    ("selftest", "Test editing the bot's own post (owner)"),
     ("export", "Backup as JSON (owner)"),
     ("cancel", "Cancel what I'm doing"),
     ("help", "Show help"),
@@ -42,7 +44,7 @@ def build_client(cfg: Config) -> TelegramClient:
 
 
 def register_all(ctx: Ctx) -> None:
-    for module in (basic, channels, create, posts, replace):
+    for module in (basic, channels, create, posts, replace, repost):
         module.register(ctx)
 
 
