@@ -1,9 +1,12 @@
 """Repost a whole channel in order.
 
 Every post is copied to the end of the channel (silently), in the same order as the original:
-  1. server-side copy (messages.forwardMessages with drop_author): text, formatting, quotes, media and
-     albums are copied exactly by Telegram itself;
-  2. if the channel forbids forwarding, or a copy can't be fixed up, the post is rebuilt from its parts.
+  1. a post that needs no change (no buttons, no link to swap) is copied by Telegram itself
+     (messages.forwardMessages with drop_author): text, formatting, quotes, media and albums stay exact;
+  2. a post with buttons, or with links to swap, is created again in ONE request that carries its final
+     text, formatting and buttons - exactly how the bot publishes a post of its own - and is then read back
+     to make sure the buttons really are there (a copy that is edited afterwards can end up without them);
+  3. if the channel forbids forwarding, every post is created like in 2.
 Links can be swapped on the way, the new posts are registered in the database, and the old posts are removed
 later in a separate step. Nothing here deletes anything unless asked to (delete_copies).
 """
@@ -16,9 +19,19 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from telethon import errors, functions, types, utils
 
+from .buttons_sync import ButtonsNotShown, ensure_markup, link_urls
 from .linkswap import compute_message_changes, url_only_markup
 from .replace_engine import CHUNK, FALLBACK_EMPTY_BATCHES, fetch_messages, get_top_id, is_skippable, preview_flag
-from .tgutil import classify_media, edit_raw, flood_retry, media_ref, peer_of, ser_entities, ser_markup
+from .tgutil import (
+    build_markup,
+    classify_media,
+    de_entities,
+    flood_retry,
+    media_ref,
+    peer_of,
+    ser_entities,
+    ser_markup,
+)
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +87,9 @@ def final_state(src, opts: RepostOptions) -> Final:
     markup, dropped = url_only_markup(
         src.reply_markup, opts.old if opts.swaps else None, opts.new if opts.swaps else None, opts.include_posts
     )
+    # Send exactly what is saved: go through the stored form that "My posts" also uses to build its edits.
+    markup = build_markup(ser_markup(markup)) if markup is not None else None
+    entities = de_entities(ser_entities(entities))
     return Final(
         text=text,
         entities=entities,
@@ -250,18 +266,6 @@ async def forward_unit(client, peer, unit: list) -> list:
     return new_messages_from(result)
 
 
-async def edit_copies(client, peer, unit: list, finals: list, news: list) -> None:
-    """A copy may carry the old keyboard / old links: set the final text and buttons."""
-    for src, f, new in zip(unit, finals, news):
-        if f.text_changed or src.reply_markup is not None:
-            try:
-                await flood_retry(
-                    lambda: edit_raw(client, peer, new.id, text=f.text, entities=f.entities, markup=f.markup, preview=f.preview)
-                )
-            except errors.MessageNotModifiedError:
-                pass
-
-
 def _inverted(m) -> Optional[bool]:
     return True if getattr(m, "invert_media", False) else None
 
@@ -318,26 +322,26 @@ async def resend_unit(client, peer, unit: list, finals: list) -> list:
 
 @dataclass
 class _State:
-    mode: str = "forward"
+    mode: str = "forward"  # becomes "resend" when the channel forbids forwarding
     forwarded: int = 0
     rebuilt: int = 0
+    repaired: int = 0  # new posts whose buttons had to be set again after posting
+
+
+def is_pure(src, f: Final) -> bool:
+    """True when a server-side copy is already the final post: nothing to swap and no keyboard to rebuild."""
+    return not f.text_changed and src.reply_markup is None
 
 
 async def copy_unit(client, peer, unit: list, finals: list, st: _State) -> list:
-    if st.mode == "forward":
-        news = None
+    pure = all(is_pure(m, f) for m, f in zip(unit, finals))
+    if st.mode == "forward" and pure:
         try:
             news = await forward_unit(client, peer, unit)
-            if len(news) != len(unit):
-                await delete_ids(client, peer, [n.id for n in news])
-                news = None
-            else:
-                try:
-                    await edit_copies(client, peer, unit, finals, news)
-                except errors.RPCError as e:
-                    log.info("could not fix up a copy (%s) - rebuilding the post", type(e).__name__)
-                    await delete_ids(client, peer, [n.id for n in news])
-                    news = None
+            if len(news) == len(unit):
+                st.forwarded += 1
+                return news
+            await delete_ids(client, peer, [n.id for n in news])
         except errors.ChatForwardsRestrictedError:
             st.mode = "resend"
             log.info("this channel restricts forwarding - rebuilding posts from their parts instead")
@@ -345,12 +349,28 @@ async def copy_unit(client, peer, unit: list, finals: list, st: _State) -> list:
             if type(e).__name__ in FATAL:
                 raise
             log.info("copy failed (%s) - rebuilding the post", type(e).__name__)
-        if news is not None:
-            st.forwarded += 1
-            return news
     news = await resend_unit(client, peer, unit, finals)
     st.rebuilt += 1
     return news
+
+
+async def settle_buttons(client, peer, finals: list, news: list, st: _State, *, pause: float) -> None:
+    """Read the new posts back: each must show the link buttons it should. Repairs it, or removes the copies."""
+    for f, new in zip(finals, news):
+        if not link_urls(f.markup):
+            continue
+        try:
+            how = await ensure_markup(client, peer, new.id, f.markup, pause=pause)
+        except errors.RPCError as e:
+            await delete_ids(client, peer, [n.id for n in news])
+            if type(e).__name__ in FATAL:
+                raise
+            raise ButtonsNotShown(f"could not set the buttons ({type(e).__name__})") from e
+        except (ButtonsNotShown, LookupError) as e:
+            await delete_ids(client, peer, [n.id for n in news])
+            raise ButtonsNotShown(str(e)) from e
+        if how != "fine":
+            st.repaired += 1
 
 
 @dataclass
@@ -361,6 +381,7 @@ class RepostResult:
     failed: list = field(default_factory=list)  # [(first old id, error name)]
     forwarded: int = 0
     rebuilt: int = 0
+    repaired: int = 0
     aborted: Optional[str] = None
     stopped: bool = False
     first_new: Optional[int] = None
@@ -399,6 +420,7 @@ async def run_repost(
     delay: float = 1.2,
     progress: Optional[Callable[[RepostResult], Awaitable[None]]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    settle_pause: float = 0.7,
 ) -> RepostResult:
     """Copy the posts of migration `mig` (ids first_id..last_id) in order; safe to run again to continue."""
     opts = RepostOptions(
@@ -418,6 +440,7 @@ async def run_repost(
         finals = [final_state(m, opts) for m in unit]
         try:
             news = await copy_unit(client, peer, unit, finals, st)
+            await settle_buttons(client, peer, finals, news, st, pause=settle_pause)
         except Exception as e:  # one bad post must not stop the others
             name = type(e).__name__
             log.warning("copying %s failed: %s %s", ids, name, e)
@@ -445,7 +468,7 @@ async def run_repost(
         if progress:
             await progress(res)
         await asyncio.sleep(delay)
-    res.forwarded, res.rebuilt = st.forwarded, st.rebuilt
+    res.forwarded, res.rebuilt, res.repaired = st.forwarded, st.rebuilt, st.repaired
     return res
 
 
@@ -453,36 +476,93 @@ async def run_repost(
 @dataclass
 class DeleteResult:
     deleted: int = 0
+    by_userbot: int = 0  # of those, how many only the userbot could delete
     remaining: int = 0
-    blocked: bool = False  # Telegram removed nothing from a whole batch
-    error: Optional[str] = None
+    blocked: bool = False  # some messages are still there although Telegram did not report an error
+    error: Optional[str] = None  # the bot's Telegram error that stopped the run
+    fallback_error: Optional[str] = None  # why the userbot could not help
+    tried_userbot: bool = False
+
+
+async def gone_ids(client, peer, ids: list) -> set:
+    """Which of `ids` no longer exist in the channel."""
+    msgs = await fetch_messages(client, peer, ids)
+    return {i for i, m in zip(ids, msgs) if m is None or isinstance(m, types.MessageEmpty)}
+
+
+@dataclass
+class BatchOutcome:
+    gone: set = field(default_factory=set)  # message ids that no longer exist afterwards
+    bot_error: Optional[str] = None
+    by_userbot: int = 0
+    fallback_error: Optional[str] = None
+    tried_userbot: bool = False
+
+
+async def delete_batch(client, peer, ids: list, fallback: Optional[Callable[[list], Awaitable[Any]]] = None) -> BatchOutcome:
+    """Delete up to 100 messages: the bot tries first, the result is checked by reading the messages back, and
+    whatever is still there goes to `fallback(ids)` (the userbot), followed by a second check."""
+    out = BatchOutcome()
+    try:
+        await flood_retry(lambda: client(functions.channels.DeleteMessagesRequest(channel=peer, id=list(ids))))
+    except errors.RPCError as e:
+        out.bot_error = type(e).__name__
+    out.gone = await gone_ids(client, peer, ids)
+    left = [x for x in ids if x not in out.gone]
+    if left and fallback is not None:
+        out.tried_userbot = True
+        try:
+            await fallback(left)
+        except Exception as e:  # a userbot problem must not hide what the bot already did
+            log.warning("the userbot could not delete %s message(s): %s", len(left), e)
+            out.fallback_error = str(e) or type(e).__name__
+        again = await gone_ids(client, peer, left)
+        out.by_userbot = len(again)
+        out.gone |= again
+    return out
 
 
 async def delete_copies(
-    client, db, ch, mig, which: str, *, delay: float = 0.5, progress: Optional[Callable[[DeleteResult], Awaitable[None]]] = None
+    client,
+    db,
+    ch,
+    mig,
+    which: str,
+    *,
+    delay: float = 0.5,
+    progress: Optional[Callable[[DeleteResult], Awaitable[None]]] = None,
+    fallback: Optional[Callable[[list], Awaitable[Any]]] = None,
 ) -> DeleteResult:
-    """which='old': remove the original posts; which='new': remove the copies (undo). Oldest first, 100 per request."""
+    """which='old': remove the original posts; which='new': remove the copies (undo). Oldest first, 100 per request.
+
+    The bot tries first and the result is always checked by reading the messages back. Whatever the bot could not
+    delete (Telegram may refuse old posts) goes to `fallback(ids)` - the userbot - if there is one, and is checked
+    again. A batch the bot cannot delete does not stop the run: newer posts may still be deletable.
+    """
     peer = peer_of(ch)
     res = DeleteResult()
-    while True:
-        ids = await db.migration_pending_ids(mig.id, which, 100)
-        if not ids:
-            break
-        try:
-            await flood_retry(lambda: client(functions.channels.DeleteMessagesRequest(channel=peer, id=ids)))
-        except errors.RPCError as e:
-            res.error = type(e).__name__
-            break
-        still = await fetch_messages(client, peer, ids)
-        gone = [i for i, m in zip(ids, still) if m is None or isinstance(m, types.MessageEmpty)]
-        if not gone:
-            res.blocked = True
-            break
-        await db.mark_migration_deleted(mig.id, ch.id, which, gone)
-        res.deleted += len(gone)
+    todo = await db.migration_pending_ids(mig.id, which, 1_000_000)
+    use_fallback = fallback
+    for i in range(0, len(todo), 100):
+        ids = todo[i : i + 100]
+        out = await delete_batch(client, peer, ids, use_fallback)
+        res.tried_userbot = res.tried_userbot or out.tried_userbot
+        res.by_userbot += out.by_userbot
+        if out.fallback_error:
+            res.fallback_error = out.fallback_error
+            use_fallback = None  # it will not work for the next batches either
+        left = [x for x in ids if x not in out.gone]
+        if out.gone:
+            await db.mark_migration_deleted(mig.id, ch.id, which, sorted(out.gone))
+            res.deleted += len(out.gone)
+        if left and out.bot_error:
+            res.error = res.error or out.bot_error  # remembered for the report
+            if out.bot_error in FATAL and use_fallback is None:
+                break  # e.g. no "Delete messages" right: the next batch would fail the same way
         if progress:
             await progress(res)
         await asyncio.sleep(delay)
     counts = await db.migration_counts(mig.id)
     res.remaining = counts["old_left"] if which == "old" else counts["new_left"]
+    res.blocked = res.remaining > 0 and not res.error
     return res

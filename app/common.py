@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -27,11 +28,13 @@ class Ctx:
     db: Database
     client: TelegramClient
     state: dict = field(default_factory=dict)  # user id -> {"mode": ..., ...}
-    pending: dict = field(default_factory=dict)  # tokens for confirm dialogs (replace, test edit)
+    pending: dict = field(default_factory=dict)  # tokens for confirm dialogs (replace, repost)
     seen_channels: dict = field(default_factory=dict)  # channel id -> Channel entity seen in updates
     text_handlers: dict = field(default_factory=dict)  # mode -> async fn(event, state)
     callbacks: dict = field(default_factory=dict)  # prefix -> async fn(event, parts)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one long job (replace / repost) at a time
+    userbot: Any = None  # app.userbot.Userbot or None
+    reporter: Any = None  # app.errorlog.ErrorReporter or None
 
 
 def is_cb(event) -> bool:
@@ -68,9 +71,10 @@ def guard(ctx: Ctx, owner: bool = False) -> Callable:
             except UserError as e:
                 await notify_error(event, str(e))
             except errors.RPCError as e:
+                log.error("Telegram refused a request in handler %s (user %s)", fn.__name__, uid, exc_info=True)
                 await notify_error(event, "❌ " + explain_rpc(e))
             except Exception as e:
-                log.exception("handler %s failed", fn.__name__)
+                log.exception("Unhandled exception in handler %s (user %s)", fn.__name__, uid)
                 await notify_error(event, f"⚠️ Something went wrong: {type(e).__name__}: {str(e)[:200]}")
 
         return wrapper
@@ -174,6 +178,18 @@ async def apply_edit(ctx: Ctx, post, ch, *, replace_media: bool = False, **chang
         except errors.RPCError as e:
             raise UserError("❌ " + explain_rpc(e) + "\nNothing was changed.")
     return await ctx.db.update_post(post.id, **changes)
+
+
+def purge_pending(ctx: Ctx, ttl: float = 3600.0) -> None:
+    """Forget confirm dialogs (replace plans, repost choices...) nobody answered for a while."""
+    now = time.monotonic()
+    stale = [
+        k
+        for k, v in ctx.pending.items()
+        if not getattr(v, "running", False) and now - getattr(v, "created", now) > ttl
+    ]
+    for k in stale:
+        ctx.pending.pop(k, None)
 
 
 def on_cb(ctx: Ctx, prefix: str):

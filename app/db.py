@@ -293,6 +293,16 @@ class Database:
             )
             return list((await s.execute(q)).scalars())
 
+    async def sent_posts(self, channel_id: int) -> list:
+        """Every published post of a channel, oldest first."""
+        async with self.Session() as s:
+            q = (
+                select(Post)
+                .where(Post.channel_id == channel_id, Post.status == "sent", Post.message_id.is_not(None))
+                .order_by(Post.message_id)
+            )
+            return list((await s.execute(q)).scalars())
+
     async def mine_message_ids(self, channel_id: int) -> set:
         async with self.Session() as s:
             q = select(Post.message_id).where(

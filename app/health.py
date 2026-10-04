@@ -17,6 +17,10 @@ async def start_health_server(port: int):
         finally:
             writer.close()
 
-    server = await asyncio.start_server(handle, "0.0.0.0", port)
+    try:
+        server = await asyncio.start_server(handle, "0.0.0.0", port)
+    except OSError as e:  # e.g. something else (python -m http.server) already uses the port
+        log.warning("could not open the health endpoint on :%s (%s) - continuing without it", port, e)
+        return None
     log.info("health endpoint listening on :%s", port)
     return server

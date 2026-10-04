@@ -1,5 +1,4 @@
 """Drive the real handlers with fake events and a fake Telegram client (no network)."""
-import datetime
 import itertools
 import re
 from types import SimpleNamespace
@@ -13,6 +12,7 @@ from app.db import Database
 from bot import register_all
 
 from .dbutil import db_url_for
+from .fakes import FakeChannelClient
 
 
 class FakeSent:
@@ -80,14 +80,18 @@ class Outbox:
         raise AssertionError(f"no button {label_part!r} in {self.last_buttons()}")
 
 
-class FakeTG:
+class FakeTG(FakeChannelClient):
+    """The bot's Telegram connection: a simulated channel plus a log of what the bot sent to the user."""
+
     def __init__(self):
+        super().__init__()
         self.handlers = []
         self.sent = []
         self.edits = []
         self.deleted = []
         self.ids = itertools.count(100)
         self.parse_mode = "html"
+        self.rights = dict(admin=True, post=True, edit=True, delete=True, invite=False, add_admins=False)
 
     def on(self, builder):
         def deco(fn):
@@ -116,19 +120,20 @@ class FakeTG:
     async def __call__(self, req):
         if isinstance(req, functions.messages.EditMessageRequest):
             self.edits.append(("raw", req.id, req))
-            return None
-        if isinstance(req, functions.channels.GetParticipantRequest):
-            rights = types.ChatAdminRights(post_messages=True, edit_messages=True, delete_messages=True)
-            return SimpleNamespace(participant=types.ChannelParticipantAdmin(
-                user_id=1, promoted_by=1, date=datetime.datetime.now(datetime.timezone.utc), admin_rights=rights))
-        raise NotImplementedError(type(req))
+            if req.id not in self.msgs:  # a post the simulation doesn't hold: just note the edit
+                return None
+        if isinstance(req, functions.channels.DeleteMessagesRequest):
+            self.deleted.append(list(req.id))
+        return await super().__call__(req)
 
 
 class App:
-    def __init__(self, tmp_path, owner=1):
-        cfg = Config(api_id=1, api_hash="x", bot_token="1:x", owners=frozenset({owner}), admins=frozenset(),
-                     database_url=db_url_for(tmp_path, "h.db"), db_pool="null", session_path="x", session_string="",
-                     edit_delay=0.3, replace_typed_links=True, port=0, log_level="INFO")
+    def __init__(self, tmp_path, owner=1, **cfg_overrides):
+        base = dict(api_id=1, api_hash="x", bot_token="1:x", owners=frozenset({owner}), admins=frozenset(),
+                    database_url=db_url_for(tmp_path, "h.db"), db_pool="null", session_path="x", session_string="",
+                    edit_delay=0.3, replace_typed_links=True, port=0, log_level="INFO")
+        base.update(cfg_overrides)
+        cfg = Config(**base)
         self.tg = FakeTG()
         self.db = Database(cfg.database_url)
         self.ctx = Ctx(cfg=cfg, db=self.db, client=self.tg)

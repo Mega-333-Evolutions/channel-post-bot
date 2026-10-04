@@ -343,9 +343,14 @@ async def get_rights(client, ch):
             return True if (creator and r is None) else bool(getattr(r, name, False))
 
         return SimpleNamespace(
-            admin=True, post=has("post_messages"), edit=has("edit_messages"), delete=has("delete_messages")
+            admin=True,
+            post=has("post_messages"),
+            edit=has("edit_messages"),
+            delete=has("delete_messages"),
+            invite=has("invite_users"),
+            add_admins=has("add_admins"),
         )
-    return SimpleNamespace(admin=False, post=False, edit=False, delete=False)
+    return SimpleNamespace(admin=False, post=False, edit=False, delete=False, invite=False, add_admins=False)
 
 
 _HINTS = {
@@ -353,7 +358,10 @@ _HINTS = {
     "MessageAuthorRequiredError": "Telegram wants the message author. Give the bot the 'Edit messages of others' right.",
     "InlineBotRequiredError": "That post was sent through another bot's inline mode, so only that bot can edit it.",
     "MessageEditTimeExpiredError": "Telegram no longer allows editing that message.",
-    "MessageIdInvalidError": "That message no longer exists in the channel.",
+    "MessageIdInvalidError": (
+        "Telegram won't let the bot change that message (or it was deleted). If the post is still there, "
+        "the usual reason is that its buttons were added by another bot: only that bot may change them."
+    ),
     "ButtonUrlInvalidError": "Telegram rejected one of the button links.",
     "ReplyMarkupInvalidError": "Telegram rejected the buttons.",
     "ChatWriteForbiddenError": "The bot can't post in that channel - check its admin rights.",

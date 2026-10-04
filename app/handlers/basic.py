@@ -1,6 +1,7 @@
-"""/start /help /cancel /export, plus the routers for free text and inline-button presses."""
+"""/start /help /cancel /export /userbot /testerror, plus the routers for free text and inline-button presses."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -8,6 +9,7 @@ import logging
 from telethon import events
 
 from ..common import Ctx, cmd, clear_state, discard_temp, guard, say, show
+from ..tgutil import esc
 
 log = logging.getLogger(__name__)
 
@@ -24,8 +26,8 @@ HELP = (
     "/replace @old @new - swap the username inside t.me links (button links and hyperlinks) in all channels\n"
     "/undo - undo the last /replace\n"
     "/repost @old @new - copy every post of a channel in order (links swapped), then delete the old posts\n"
-    "/testedit &lt;post link&gt; - check that the bot can edit the buttons of one specific post\n"
-    "/selftest - check that editing buttons works on a post made by this bot\n"
+    "/userbot - status of the helper account that deletes posts the bot is not allowed to delete\n"
+    "/testerror - send a test error to the error log chat\n"
     "/export - download a JSON backup of your posts"
 )
 
@@ -53,6 +55,49 @@ def register(ctx: Ctx) -> None:
         buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8"))
         buf.name = "channel-posts-export.json"
         await event.respond(f"📦 Backup: {len(data['channels'])} channel(s), {len(data['posts'])} post(s).", file=buf)
+
+    @client.on(cmd("userbot"))
+    @guard(ctx, owner=True)
+    async def h_userbot(event):
+        ub = ctx.userbot
+        if ub is None or not ub.enabled:
+            await say(
+                event,
+                "🤖 <b>Userbot: not set up.</b>\n"
+                "The bot deletes old posts itself first. If Telegram refuses (posts older than 48 hours), a helper "
+                "account - the userbot - can do it: it joins the channel through an invite link the bot makes, the bot "
+                "gives it the “Delete messages” right if it has the “Add new admins” right, and takes it away again "
+                "afterwards.\n\n"
+                "To set it up: on your own computer run <code>python make_userbot_session.py</code> with a "
+                "<b>separate</b> Telegram account, and put the printed text into the bot's secrets as "
+                "<code>USERBOT_SESSION</code>. See the README.",
+            )
+            return
+        if not ub.ready:
+            await ub.connect()
+        kept = "stays an admin" if ub.keep_admin else "is made admin only while deleting"
+        await say(event, f"🤖 <b>Userbot:</b> {esc(ub.describe())}\nIt {kept} (USERBOT_KEEP_ADMIN).")
+
+    @client.on(cmd("testerror", args=True))
+    @guard(ctx, owner=True)
+    async def h_testerror(event):
+        rep = getattr(ctx, "reporter", None)
+        if rep is None or not rep.enabled:
+            await say(event, "The error log is switched off (ERROR_LOG_CHAT_ID is 0 / off).")
+            return
+        mode = (event.pattern_match.group(1) or "").strip().lower()
+        if mode == "task":
+            async def boom():
+                raise RuntimeError("Test error from /testerror task")
+
+            asyncio.get_running_loop().create_task(boom())  # nobody awaits it, like a forgotten background task
+            await say(event, "A background task will fail in a moment - look in the error log chat.")
+            return
+        await say(event, "Raising a test error now - look in the error log chat. (Use <code>/testerror task</code> to test a background task.)")
+        try:
+            raise KeyError("test")
+        except KeyError as e:
+            raise RuntimeError("Test error from /testerror") from e
 
     @client.on(
         events.NewMessage(incoming=True, func=lambda e: e.is_private and not (e.raw_text or "").startswith("/"))

@@ -32,8 +32,10 @@ from ..common import (
     show,
 )
 from ..db import utcnow
+from ..repost_engine import delete_batch
 from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link, ser_entities, short
 from ..ui import CANCEL, post_label
+from ..userbot import delete_problem_text
 from .panel import (
     check_lengths,
     load_post,
@@ -84,13 +86,13 @@ def register(ctx: Ctx) -> None:
             rows, total = await db.list_posts(cid, status, page * PAGE, PAGE)
         kb = [[Button.inline(post_label(p), f"po:{p.id}")] for p in rows]
         if pages > 1:
-            nav = []
-            if page > 0:
-                nav.append(Button.inline("⬅️ Prev", f"pc:{key}:{page - 1}"))
-            nav.append(Button.inline(f"{page + 1}/{pages}", "noop"))
+            # "Prev" is always there: on the first page it jumps to the last one
+            nav = [Button.inline("⬅️ Prev", f"pc:{key}:{(page - 1) % pages}"), Button.inline(f"{page + 1}/{pages}", "noop")]
             if page < pages - 1:
                 nav.append(Button.inline("Next ➡️", f"pc:{key}:{page + 1}"))
             kb.append(nav)
+        if cid is not None and ctx.cfg.is_owner(event.sender_id):
+            kb.append([Button.inline("🔧 Check buttons", f"pk:{cid}")])
         kb.append([Button.inline("🔙 Channels", "pl")])
         head = f"📚 <b>{esc(title)}</b> - {total} post(s)"
         if not rows:
@@ -387,7 +389,8 @@ def register(ctx: Ctx) -> None:
             event,
             f"Delete this post from <b>{esc(ch.title)}</b>?\n\n"
             "Telegram's documentation says bots can only delete posts younger than 48 hours; in channels that limit may "
-            "not apply. If Telegram refuses, delete the post by hand and then use “Only forget it in the bot”.",
+            "not apply. If the bot can't, the userbot (if you set one up, see /userbot) tries next. If both fail, delete "
+            "the post by hand and then use “Only forget it in the bot”.",
             [
                 [Button.inline("🗑 Delete from channel", f"dly:{post.id}:a")],
                 [Button.inline("🧹 Only forget it in the bot", f"dly:{post.id}:b")],
@@ -399,12 +402,16 @@ def register(ctx: Ctx) -> None:
     async def cb_delete_yes(event, parts):
         post, ch = await load_post(ctx, parts[0])
         if post.status == "sent" and parts[1] == "a":
-            res = await client.delete_messages(peer_of(ch), [post.message_id])
-            if not sum(getattr(r, "pts_count", 0) or 0 for r in res):
-                raise UserError(
-                    "Telegram did not delete that message (the bot may lack the Delete right, or the post is older than "
-                    "the 48 hours Telegram's documentation mentions). Delete it by hand in the channel, then use "
-                    "“Only forget it in the bot”."
+            fallback, deleter = await ctx.userbot.fallback_for(ch) if ctx.userbot is not None else (None, None)
+            try:
+                out = await delete_batch(client, peer_of(ch), [post.message_id], fallback)
+            finally:
+                if deleter is not None:
+                    await deleter.close()
+            if post.message_id not in out.gone:
+                why = delete_problem_text(
+                    ctx.userbot, bot_error=out.bot_error, fallback_error=out.fallback_error, tried=out.tried_userbot
                 )
+                raise UserError(f"Telegram did not delete that message. {why}\nDelete it by hand in the channel, then use “Only forget it in the bot”.")
         await db.delete_post(post.id)
         await show(event, "🗑 Done.", [[Button.inline("📚 My posts", "pl")]])

@@ -1,20 +1,18 @@
-"""/replace, /undo and /testedit (owner only)."""
+"""/replace and /undo (owner only)."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import secrets
 import time
 from dataclasses import dataclass, field
 
-from telethon import Button, errors, types
+from telethon import Button, errors
 
-from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, require_owner, say, show
+from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say, show
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
-from ..tgutil import build_markup, button_url, edit_raw, esc, explain_rpc, get_rights, peer_of, short, with_url
-from ..ui import CANCEL
+from ..tgutil import esc, explain_rpc, get_rights
 from .channels import parse_channel_ref
 
 log = logging.getLogger(__name__)
@@ -25,7 +23,6 @@ USAGE = (
     "post ids), <code>--posts</code> (also change t.me/old/123 post links), <code>--no-typed</code> (don't touch "
     "links typed in the text)."
 )
-TOKEN_TTL = 3600
 
 
 @dataclass
@@ -104,7 +101,7 @@ def summary_text(job: Job) -> str:
                 block += f"\n• {s.foreign} of them were not posted by this bot"
             fb = sum(1 for i in s.infos.values() if not i.mine and i.buttons)
             if fb:
-                block += f"\n• {fb} are button posts made by someone else - Telegram may refuse to edit those (check with /testedit)"
+                block += f"\n• {fb} are button posts made by someone else - Telegram may refuse to edit those; /repost can re-post them with the new links instead"
             cb = sum(1 for i in s.infos.values() if i.callbacks)
             if cb:
                 block += f"\n• {cb} carry other bots' buttons (e.g. reactions) - those stay as they are"
@@ -123,11 +120,6 @@ def summary_text(job: Job) -> str:
 def register(ctx: Ctx) -> None:
     client, db, cfg = ctx.client, ctx.db, ctx.cfg
     lock = ctx.lock
-
-    def purge_tokens() -> None:
-        now = time.monotonic()
-        for k in [k for k, v in ctx.pending.items() if not getattr(v, "running", False) and now - getattr(v, "created", now) > TOKEN_TTL]:
-            ctx.pending.pop(k, None)
 
     def make_updater(event):
         last = [0.0]
@@ -150,7 +142,7 @@ def register(ctx: Ctx) -> None:
     @client.on(cmd("replace", args=True))
     @guard(ctx, owner=True)
     async def h_replace(event):
-        purge_tokens()
+        purge_pending(ctx)
         raw = (event.pattern_match.group(1) or "").strip()
         if not raw:
             await say(event, USAGE)
@@ -275,7 +267,7 @@ def register(ctx: Ctx) -> None:
             lines.append(f"• <b>failed: {len(totals.failed)}</b> ({sample}{'…' if len(totals.failed) > 8 else ''})")
             names = {n for _, n in totals.failed}
             if names & {"MessageAuthorRequiredError", "InlineBotRequiredError", "ChatAdminRequiredError", "MessageIdInvalidError"}:
-                lines.append("  Telegram doesn't let this bot edit those posts (see /testedit and /selftest).")
+                lines.append("  Telegram doesn't let this bot edit those posts. Use /repost to post them again with the new links.")
         for title, name in stopped:
             lines.append(f"⚠️ Stopped early in <b>{esc(title)}</b>: Telegram refused 5 edits in a row ({esc(name)}).")
         kb = [[Button.inline("↩️ Undo this replace", f"ruc:{batch_id}")]] if totals.edited else None
@@ -330,213 +322,3 @@ def register(ctx: Ctx) -> None:
         if res.failed:
             text += f"\n⚠️ {len(res.failed)} could not be restored (" + ", ".join(f"#{m} {esc(n)}" for m, n in res.failed[:6]) + ")."
         await upd(text, force=True)
-
-
-    # ---------------------------------------------------------------- /selftest
-    async def ask_selftest(event, ch) -> None:
-        await say(
-            event,
-            f"🧪 <b>Self-test in {esc(ch.title)}</b>\n"
-            "The bot posts a short test message with one button (silently), changes the button link, reads it back "
-            "and deletes the message again. It takes a few seconds and shows whether editing buttons works "
-            "for posts made by this bot.",
-            [[Button.inline("🧪 Run the test", f"st:{ch.id}"), Button.inline("✖️ Cancel", "cx")]],
-        )
-
-    @client.on(cmd("selftest", args=True))
-    @guard(ctx, owner=True)
-    async def h_selftest(event):
-        ref = (event.pattern_match.group(1) or "").strip() or None
-        try:
-            chans = pick_channels(await db.list_channels(), ref)
-        except ValueError as e:
-            raise UserError(str(e))
-        if not chans:
-            raise UserError("No channels registered yet. Use /addchannel.")
-        if len(chans) == 1:
-            await ask_selftest(event, chans[0])
-            return
-        kb = [[Button.inline(f"📢 {short(c.title, 40)}", f"stc:{c.id}")] for c in chans] + CANCEL
-        await say(event, "Run the self-test in which channel?", kb)
-
-    @on_cb(ctx, "stc")
-    async def cb_selftest_pick(event, parts):
-        require_owner(ctx, event)
-        ch = await db.get_channel(int(parts[0]))
-        if ch is None:
-            raise UserError("That channel is not registered.")
-        await ask_selftest(event, ch)
-
-    @on_cb(ctx, "st")
-    async def cb_selftest(event, parts):
-        require_owner(ctx, event)
-        ch = await db.get_channel(int(parts[0]))
-        if ch is None:
-            raise UserError("That channel is not registered.")
-        peer = peer_of(ch)
-        first = build_markup([[{"t": "Test button", "u": "https://example.com/a"}]])
-        second = build_markup([[{"t": "Test button", "u": "https://example.com/b"}]])
-        lines = [f"🧪 <b>Self-test in {esc(ch.title)}</b>"]
-        edit_ok = False
-        sent = None
-        try:
-            sent = await client.send_message(
-                peer, "🧪 Edit test - this message deletes itself in a moment.", buttons=first, link_preview=False, silent=True
-            )
-            lines.append("✅ posted a test message")
-        except errors.RPCError as e:
-            lines.append(f"❌ could not post: {esc(explain_rpc(e))}")
-        if sent is not None:
-            try:
-                await edit_raw(client, peer, sent.id, markup=second)
-                got = (await client.get_messages(peer, ids=[sent.id]))[0]
-                urls = []
-                if got is not None and isinstance(got.reply_markup, types.ReplyInlineMarkup):
-                    urls = [button_url(b) for row in got.reply_markup.rows for b in row.buttons if button_url(b)]
-                edit_ok = urls == ["https://example.com/b"]
-                lines.append(
-                    "✅ changed the button link and read it back"
-                    if edit_ok
-                    else "⚠️ Telegram accepted the edit but the link did not change"
-                )
-            except errors.RPCError as e:
-                lines.append(f"❌ could not edit the button: {esc(explain_rpc(e))}")
-            try:
-                res = await client.delete_messages(peer, [sent.id])
-                gone = sum(getattr(r, "pts_count", 0) or 0 for r in res)
-                lines.append("✅ deleted the test message" if gone else "⚠️ could not delete it - please delete it by hand")
-            except errors.RPCError as e:
-                lines.append(f"⚠️ could not delete it ({esc(type(e).__name__)}) - please delete it by hand")
-        if edit_ok:
-            lines.append(
-                "\n<b>Editing buttons works for posts made by this bot.</b> If /testedit still fails on Channel Help "
-                "posts, Telegram doesn't let this bot change buttons that another bot added."
-            )
-        else:
-            lines.append(
-                "\n<b>Editing failed even for this bot's own post</b>, so check the bot's admin rights in the channel "
-                "(Post messages, Edit messages of others, Delete messages)."
-            )
-        await show(event, "\n".join(lines))
-
-    # ---------------------------------------------------------------- /testedit
-    link_rx = re.compile(
-        r"(?i)(?:https?://)?(?:t\.me|telegram\.me)/(?:c/(?P<cid>\d+)|(?P<user>[A-Za-z0-9_]{3,32}))/(?P<mid>\d+)"
-    )
-
-    @client.on(cmd("testedit", args=True))
-    @guard(ctx, owner=True)
-    async def h_testedit(event):
-        purge_tokens()
-        m = link_rx.search(event.pattern_match.group(1) or "")
-        if not m:
-            raise UserError("Usage: /testedit https://t.me/yourchannel/123  (a link to one post that has a link button)")
-        chans = await db.list_channels()
-        ch = None
-        for c in chans:
-            if (m.group("cid") and c.id == int(m.group("cid"))) or (
-                m.group("user") and (c.username or "").lower() == m.group("user").lower()
-            ):
-                ch = c
-        if ch is None:
-            raise UserError("That channel isn't registered. Use /addchannel first.")
-        mid = int(m.group("mid"))
-        msgs = await client.get_messages(peer_of(ch), ids=[mid])
-        msg = msgs[0] if msgs else None
-        if msg is None or isinstance(msg, (types.MessageEmpty, types.MessageService)):
-            raise UserError("I can't read that message - was it deleted?")
-        urls = []
-        if isinstance(msg.reply_markup, types.ReplyInlineMarkup):
-            urls = [button_url(b) for row in msg.reply_markup.rows for b in row.buttons if button_url(b)]
-        if not urls:
-            raise UserError("That post has no link buttons. Pick one that has a button with a link.")
-        rights = await get_rights(client, ch)
-        rtxt = "unknown" if rights is None else ("can edit others' posts" if rights.edit else "⚠️ NO “edit messages of others” right")
-        token = secrets.token_hex(4)
-        ctx.pending[token] = _TestJob(user=event.sender_id, ch=ch, mid=mid)
-        await say(
-            event,
-            f"🧪 <b>Edit test</b> for post {mid} in <b>{esc(ch.title)}</b>\n"
-            f"Posted by this bot: {'yes' if msg.out else 'no (someone else / another bot)'}\n"
-            f"Bot rights: {rtxt}\n"
-            f"First button link: <code>{esc(urls[0][:80])}</code>\n\n"
-            "The test adds <code>x=1</code> to that first link and immediately changes it back. "
-            "Visitors won't notice.",
-            [[Button.inline("🧪 Run the test", f"te:{token}"), Button.inline("✖️ Cancel", "cx")]],
-        )
-
-    @on_cb(ctx, "te")
-    async def cb_testedit(event, parts):
-        require_owner(ctx, event)
-        job = ctx.pending.pop(parts[0], None)
-        if not isinstance(job, _TestJob) or job.user != event.sender_id:
-            raise UserError("That test has expired. Run /testedit again.")
-        peer = peer_of(job.ch)
-        msgs = await client.get_messages(peer, ids=[job.mid])
-        msg = msgs[0]
-        if msg is None or not isinstance(msg.reply_markup, types.ReplyInlineMarkup):
-            raise UserError("The post changed or was deleted. Run /testedit again.")
-        original = msg.reply_markup
-        changed = False
-        rows = []
-        for row in original.rows:
-            btns = []
-            for b in row.buttons:
-                u = button_url(b)
-                if u and not changed:
-                    btns.append(with_url(b, u + ("&" if "?" in u else "?") + "x=1"))
-                    changed = True
-                else:
-                    btns.append(b)
-            rows.append(types.KeyboardButtonRow(btns))
-        try:
-            await edit_raw(client, peer, job.mid, markup=types.ReplyInlineMarkup(rows))
-        except errors.RPCError as e:
-            extra = ""
-            if type(e).__name__ == "MessageIdInvalidError":
-                extra = (
-                    "\n\nThe post does exist - I read it a moment ago - so this is not about a missing message. "
-                    "For edits Telegram uses this error when the bot isn't allowed to change the message, typically "
-                    "because the buttons were added by another bot.\n"
-                    "Run /selftest: it tries the same edit on a post made by this bot. If that works, your setup is fine "
-                    "and Telegram simply doesn't let this bot change those buttons."
-                )
-            await show(
-                event,
-                f"❌ <b>Telegram refused the edit</b> ({esc(type(e).__name__)})\n{esc(explain_rpc(e))}{extra}\n\n"
-                "So /replace can NOT change the buttons of this post with this bot.",
-            )
-            return
-        restored, last_err = False, None
-        for _ in range(3):
-            try:
-                await edit_raw(client, peer, job.mid, markup=original)
-                restored = True
-                break
-            except errors.MessageNotModifiedError:
-                restored = True
-                break
-            except errors.RPCError as e:
-                last_err = e
-                await asyncio.sleep(1.5)
-        if restored:
-            await show(
-                event,
-                "✅ <b>Test passed.</b> The bot can edit the buttons of that post, and the link was put back.\n"
-                "/replace will work on posts like this one.",
-            )
-        else:
-            orig_urls = "\n".join(esc(button_url(b)) for row in original.rows for b in row.buttons if button_url(b))
-            await show(
-                event,
-                f"⚠️ The edit worked, but putting the link back failed ({esc(type(last_err).__name__)}).\n"
-                "The first link still ends in x=1 - please fix it by hand. Original links:\n" + orig_urls,
-            )
-
-
-@dataclass
-class _TestJob:
-    user: int
-    ch: object
-    mid: int
-    created: float = field(default_factory=time.monotonic)
