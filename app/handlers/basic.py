@@ -1,7 +1,6 @@
-"""/start /help /cancel /export /userbot /testerror, plus the routers for free text and inline-button presses."""
+"""/start /help /cancel /export /userbot, plus the routers for free text and inline-button presses."""
 from __future__ import annotations
 
-import asyncio
 import io
 import json
 import logging
@@ -17,17 +16,23 @@ HELP = (
     "<b>Channel Post Bot</b>\n\n"
     "<b>Posts</b>\n"
     "/new - create a post (text or media, with buttons)\n"
-    "/posts - your posts and drafts: edit text, caption, media and buttons, or delete them\n"
+    "/posts - your posts and drafts: edit text, caption, media and buttons, or delete them (a button post also has “Mass replace links”)\n"
+    "/autopost 114 20 - post “Episodes 01 to 20”, “21 to 40” ... up to 114, each with a download button, then fill in the links\n"
     "/cancel - stop what you're doing\n\n"
     "<b>Channels</b>\n"
     "/addchannel - register a channel (the bot must be an admin there)\n"
     "/channels - list or remove channels\n\n"
     "<b>Owner tools</b>\n"
+    "/broadcast [time] - send one message to all channels; with a time (50m, 1h, 5d) it is deleted again from all channels and My posts afterwards\n"
     "/replace @old @new - swap the username inside t.me links (button links and hyperlinks) in all channels\n"
-    "/undo - undo the last /replace\n"
-    "/repost @old @new - copy every post of a channel in order (links swapped), then delete the old posts\n"
+    "/handleswap @old @new - change the username @old written in posts (text, captions, button names) to @new in all channels; links stay\n"
+    "/undo - undo the last /replace or /handleswap\n"
+    "/repost @old @new - copy every post of a channel in order (links swapped, replies, pins and links between posts kept), then delete the old posts\n"
+    "/fixlinks - point links at the reposted copies for a channel you reposted before\n"
+    "/shift @source @destination [from_id] [to_id] - copy posts from one channel into another (buttons kept, listed in My posts)\n"
+    "/sync - compare every channel with My posts right now (posts deleted, edited or added by others, leftover service messages); "
+    "/sync --clean also deletes the old service messages that are already in the channels' history\n"
     "/userbot - status of the helper account that deletes posts the bot is not allowed to delete\n"
-    "/testerror - send a test error to the error log chat\n"
     "/export - download a JSON backup of your posts"
 )
 
@@ -77,27 +82,6 @@ def register(ctx: Ctx) -> None:
             await ub.connect()
         kept = "stays an admin" if ub.keep_admin else "is made admin only while deleting"
         await say(event, f"🤖 <b>Userbot:</b> {esc(ub.describe())}\nIt {kept} (USERBOT_KEEP_ADMIN).")
-
-    @client.on(cmd("testerror", args=True))
-    @guard(ctx, owner=True)
-    async def h_testerror(event):
-        rep = getattr(ctx, "reporter", None)
-        if rep is None or not rep.enabled:
-            await say(event, "The error log is switched off (ERROR_LOG_CHAT_ID is 0 / off).")
-            return
-        mode = (event.pattern_match.group(1) or "").strip().lower()
-        if mode == "task":
-            async def boom():
-                raise RuntimeError("Test error from /testerror task")
-
-            asyncio.get_running_loop().create_task(boom())  # nobody awaits it, like a forgotten background task
-            await say(event, "A background task will fail in a moment - look in the error log chat.")
-            return
-        await say(event, "Raising a test error now - look in the error log chat. (Use <code>/testerror task</code> to test a background task.)")
-        try:
-            raise KeyError("test")
-        except KeyError as e:
-            raise RuntimeError("Test error from /testerror") from e
 
     @client.on(
         events.NewMessage(incoming=True, func=lambda e: e.is_private and not (e.raw_text or "").startswith("/"))

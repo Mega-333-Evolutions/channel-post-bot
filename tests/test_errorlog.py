@@ -292,7 +292,7 @@ def test_the_logging_handler_forwards_errors_with_their_traceback():
 
 
 def test_a_failing_handler_in_the_bot_reaches_the_log_chat_end_to_end(tmp_path):
-    """/testerror raises on purpose inside a real handler; guard() logs it; the log handler sends it."""
+    """A real handler fails; guard() logs it; the log handler sends it as a code block with the whole chain."""
 
     async def go():
         client = FakeSender()
@@ -303,17 +303,21 @@ def test_a_failing_handler_in_the_bot_reaches_the_log_chat_end_to_end(tmp_path):
         app = App(tmp_path)
         await app.start()
         app.ctx.reporter = rep
+
+        async def broken():
+            raise boom()
+
+        app.db.list_channels = broken  # /channels now fails the way a database outage would
         try:
-            await app.text("/testerror")
+            await app.text("/channels")
             await asyncio.sleep(0.05)
             await drain(rep)
         finally:
             logging.getLogger().removeHandler(handler)
-        assert "Raising a test error now" in norm(app.out.log[0][1])
-        assert "Something went wrong: RuntimeError" in norm(app.out.last_text)  # the owner is told too
+        assert "Something went wrong: RuntimeError" in norm(app.out.last_text)  # the user is told too
         text = client.texts[0]
-        assert text.startswith("Unhandled exception in handler h_testerror (user 1):\n\nTraceback")
-        assert "KeyError: 'test'" in text and "RuntimeError: Test error from /testerror" in text
+        assert text.startswith("Unhandled exception in handler h_channels (user 1):\n\nTraceback")
+        assert "KeyError: 'inner'" in text and "RuntimeError: outer" in text
         assert "The above exception was the direct cause of the following exception:" in text
         await app.db.close()
         await rep.stop()
@@ -321,42 +325,24 @@ def test_a_failing_handler_in_the_bot_reaches_the_log_chat_end_to_end(tmp_path):
     asyncio.run(go())
 
 
-def test_testerror_task_makes_a_background_task_fail(tmp_path):
+def test_a_forgotten_background_task_that_fails_reaches_the_log_chat(tmp_path):
     async def go():
         client = FakeSender()
         rep = reporter(client)
         rep.start()
         asyncio.get_running_loop().set_exception_handler(rep.loop_exception_handler)
-        app = App(tmp_path)
-        await app.start()
-        app.ctx.reporter = rep
-        await app.text("/testerror task")
-        assert "background task will fail" in norm(app.out.last_text)
+
+        async def fails():
+            raise RuntimeError("background failure")
+
+        asyncio.get_running_loop().create_task(fails())  # nobody awaits it
         await asyncio.sleep(0.1)
         gc.collect()
         await asyncio.sleep(0.05)
         await drain(rep)
         assert client.texts[0].startswith("Unhandled exception in background task <unnamed>:")
-        assert "RuntimeError: Test error from /testerror task" in client.texts[0]
-        await app.db.close()
+        assert "RuntimeError: background failure" in client.texts[0]
         await rep.stop()
-
-    asyncio.run(go())
-
-
-def test_testerror_is_for_the_owner_and_says_when_the_log_is_off(tmp_path):
-    async def go():
-        app = App(tmp_path, admins=frozenset({7}))
-        await app.start()
-        await app.text("/testerror")  # no reporter at all
-        assert "switched off" in norm(app.out.last_text)
-        app.ctx.reporter = reporter(FakeSender(), chat_id=None)
-        await app.text("/testerror")
-        assert "switched off" in norm(app.out.last_text)
-        app.uid = 7
-        await app.text("/testerror")
-        assert "private" in norm(app.out.last_text)
-        await app.db.close()
 
     asyncio.run(go())
 

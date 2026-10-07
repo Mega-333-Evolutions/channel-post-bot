@@ -13,8 +13,23 @@ from app.common import Ctx
 from app.config import Config, load_config
 from app.db import Database
 from app.errorlog import ErrorReporter, TelegramLogHandler
-from app.handlers import basic, channels, checkbtn, create, posts, replace, repost
+from app.expiry import Expirer
+from app.handlers import (
+    autopost,
+    basic,
+    broadcast,
+    channels,
+    checkbtn,
+    create,
+    masslinks,
+    posts,
+    replace,
+    repost,
+    shift,
+    sync,
+)
 from app.health import start_health_server
+from app.syncer import Syncer
 from app.userbot import Userbot
 
 log = logging.getLogger("bot")
@@ -22,13 +37,18 @@ log = logging.getLogger("bot")
 COMMANDS = [
     ("new", "Create a post"),
     ("posts", "My posts and drafts"),
+    ("autopost", "Post a series of episode download buttons"),
     ("addchannel", "Register a channel"),
     ("channels", "List channels"),
+    ("broadcast", "Send one message to all channels, optionally timed (owner)"),
     ("replace", "Swap a username in links (owner)"),
+    ("handleswap", "Swap a @username written in posts (owner)"),
     ("repost", "Copy a whole channel in order (owner)"),
+    ("fixlinks", "Point links at reposted posts (owner)"),
+    ("shift", "Copy posts from one channel to another (owner)"),
+    ("sync", "Compare channels with My posts now (owner)"),
     ("undo", "Undo the last replace (owner)"),
     ("userbot", "Status of the helper account that deletes old posts (owner)"),
-    ("testerror", "Send a test error to the log chat (owner)"),
     ("export", "Backup as JSON (owner)"),
     ("cancel", "Cancel what I'm doing"),
     ("help", "Show help"),
@@ -47,7 +67,7 @@ def build_client(cfg: Config) -> TelegramClient:
 
 
 def register_all(ctx: Ctx) -> None:
-    for module in (basic, channels, create, posts, checkbtn, replace, repost):
+    for module in (basic, channels, create, posts, masslinks, autopost, broadcast, checkbtn, replace, repost, shift, sync):
         module.register(ctx)
 
 
@@ -88,11 +108,14 @@ async def main() -> None:
     asyncio.get_running_loop().set_exception_handler(reporter.loop_exception_handler)
 
     db = None
+    ctx = None
     userbot = Userbot(client, cfg)
     try:
         db = Database(cfg.database_url, cfg.db_pool)
         await db.init()
         ctx = Ctx(cfg=cfg, db=db, client=client, userbot=userbot, reporter=reporter)
+        ctx.expirer = Expirer(ctx)
+        ctx.syncer = Syncer(ctx)
         register_all(ctx)
         await client.start(bot_token=cfg.bot_token)
         me = await client.get_me()
@@ -110,11 +133,17 @@ async def main() -> None:
             log.info("error log chat: off")
         if userbot.enabled:
             await userbot.connect()  # never fatal: the userbot is only needed for old posts
+        ctx.expirer.start()  # deletes timed broadcasts when their time is up
+        ctx.syncer.start()  # compares the channels with My posts now and then (and notices changes made meanwhile)
         await client.run_until_disconnected()
     except Exception as e:
         await reporter.report_fatal("The bot stopped because of an unhandled exception", e)
         raise
     finally:
+        if ctx is not None and ctx.syncer is not None:
+            await ctx.syncer.stop()
+        if ctx is not None and ctx.expirer is not None:
+            await ctx.expirer.stop()
         await userbot.close()
         if db is not None:
             await db.close()

@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from telethon import errors, functions, types
 
+from .handleswap import compute_handle_changes
 from .linkswap import compute_message_changes
 from .tgutil import (
     build_markup,
@@ -35,6 +36,16 @@ class ScanOptions:
     include_typed: bool = True
     include_posts: bool = False
     last: Optional[int] = None
+    mode: str = "links"  # "links": the username inside t.me links (/replace); "handles": '@name' written in a post (/handleswap)
+
+
+def compute_changes(m, opts: ScanOptions) -> tuple:
+    """What this run would change in message `m`: (MsgChange or None, skipped)."""
+    if opts.mode == "handles":
+        return compute_handle_changes(m, opts.old, opts.new)
+    return compute_message_changes(
+        m, opts.old, opts.new, include_typed=opts.include_typed, include_posts=opts.include_posts
+    )
 
 
 @dataclass
@@ -136,9 +147,7 @@ async def scan_channel(
             found = True
             if isinstance(m, types.MessageService):
                 continue
-            change, skipped = compute_message_changes(
-                m, opts.old, opts.new, include_typed=opts.include_typed, include_posts=opts.include_posts
-            )
+            change, skipped = compute_changes(m, opts)
             scan.skipped_post_links += skipped
             if not change:
                 continue
@@ -211,9 +220,7 @@ async def apply_channel(
                     res.missing += 1
                     continue
                 # re-check against the live message: it may have been edited since the scan
-                change, _ = compute_message_changes(
-                    m, opts.old, opts.new, include_typed=opts.include_typed, include_posts=opts.include_posts
-                )
+                change, _ = compute_changes(m, opts)
                 if not change:
                     res.unchanged += 1
                     continue

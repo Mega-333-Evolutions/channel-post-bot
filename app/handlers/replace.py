@@ -1,4 +1,4 @@
-"""/replace and /undo (owner only)."""
+"""/replace, /handleswap and /undo (owner only)."""
 from __future__ import annotations
 
 import logging
@@ -13,7 +13,7 @@ from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, p
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
 from ..tgutil import esc, explain_rpc, get_rights
-from .channels import parse_channel_ref
+from ..channelref import parse_channel_ref
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +25,15 @@ USAGE = (
 )
 
 
+USAGE_HANDLES = (
+    "Usage: <code>/handleswap @old @new</code>\n"
+    "Finds the posts that mention the username <code>@old</code> (in their text or caption, and in button names) in all "
+    "channels and changes it to <code>@new</code>. Only usernames change: links, hyperlinks and button links are left alone.\n"
+    "Options: <code>--channel @name</code> (only that channel), <code>--last 200</code> (only the newest 200 post ids)."
+)
+HANDLE_PREFIX = "hs"  # ids of /handleswap runs start with this, so /undo can word its question right
+
+
 @dataclass
 class Job:
     user: int
@@ -34,7 +43,7 @@ class Job:
     created: float = field(default_factory=time.monotonic)
 
 
-def parse_replace_args(raw: str) -> tuple:
+def parse_replace_args(raw: str, *, handles: bool = False) -> tuple:
     toks = (raw or "").split()
     flags = {"channel": None, "last": None, "posts": False, "typed": None}
     pos: list = []
@@ -49,10 +58,10 @@ def parse_replace_args(raw: str) -> tuple:
                 raise ValueError("--last needs a number, for example --last 200")
             flags["last"] = int(toks[i + 1])
             i += 2
-        elif t == "--posts":
+        elif t == "--posts" and not handles:
             flags["posts"] = True
             i += 1
-        elif t == "--no-typed":
+        elif t == "--no-typed" and not handles:
             flags["typed"] = False
             i += 1
         elif t.startswith("--"):
@@ -80,7 +89,43 @@ def pick_channels(chans: list, ref) -> list:
     return out
 
 
+def handles_summary(job: Job) -> str:
+    o = job.opts
+    lines = [f"🔎 <b>Scan finished</b> - swap the username <code>@{esc(o.old)}</code> → <code>@{esc(o.new)}</code>"]
+    total = 0
+    for s in job.scans:
+        head = f"\n<b>{esc(s.channel.title)}</b>"
+        if s.error:
+            lines.append(f"{head}\n⚠️ {esc(s.error)}")
+            continue
+        block = f"{head} - looked at post ids {s.first}-{s.scanned}"
+        if s.total == 0:
+            block += "\nNothing to change."
+        else:
+            t = sum(i.typed for i in s.infos.values())
+            b = sum(i.buttons for i in s.infos.values())
+            what = f"{t} mention(s) in the text" + (f", {b} in button names" if b else "")
+            block += f"\n{s.total} post(s) to change: {what}"
+            if s.foreign:
+                block += f"\n• {s.foreign} of them were not posted by this bot"
+            cb = sum(1 for i in s.infos.values() if i.callbacks)
+            if cb:
+                block += f"\n• {cb} carry other bots' buttons (e.g. reactions) - those stay as they are"
+        if s.skipped_post_links:
+            block += f"\n• left {s.skipped_post_links} mention(s) that are part of a link alone"
+        if s.not_editable:
+            block += f"\n⚠️ {s.not_editable} post(s) by others can't be edited: the bot lacks “Edit messages of others” here"
+        total += s.total
+        lines.append(block)
+    lines.append(f"\n<b>Total: {total} post(s).</b>")
+    if total:
+        lines.append("Nothing has been changed yet. Every edit is logged, so /undo can restore the old versions.")
+    return "\n".join(lines)
+
+
 def summary_text(job: Job) -> str:
+    if job.opts.mode == "handles":
+        return handles_summary(job)
     o = job.opts
     lines = [f"🔎 <b>Scan finished</b> - replace <code>@{esc(o.old)}</code> → <code>@{esc(o.new)}</code>"]
     total = 0
@@ -154,8 +199,6 @@ def register(ctx: Ctx) -> None:
             raise UserError(f"{e}\n\n" + re.sub(r"<[^>]+>", "", USAGE))
         if not chans:
             raise UserError("No channels registered yet. Use /addchannel.")
-        if lock.locked():
-            raise UserError("Another /replace or /undo is still running - wait for it to finish.")
         opts = ScanOptions(
             old=old,
             new=new,
@@ -163,6 +206,30 @@ def register(ctx: Ctx) -> None:
             include_posts=flags["posts"],
             last=flags["last"],
         )
+        await begin_scan(event, opts, chans)
+
+    # ---------------------------------------------------------------- /handleswap
+    @client.on(cmd("handleswap", args=True))
+    @guard(ctx, owner=True)
+    async def h_handleswap(event):
+        purge_pending(ctx)
+        raw = (event.pattern_match.group(1) or "").strip()
+        if not raw:
+            await say(event, USAGE_HANDLES)
+            return
+        try:
+            old, new, flags = parse_replace_args(raw, handles=True)
+            chans = pick_channels(await db.list_channels(), flags["channel"])
+        except ValueError as e:
+            raise UserError(f"{e}\n\n" + re.sub(r"<[^>]+>", "", USAGE_HANDLES))
+        if not chans:
+            raise UserError("No channels registered yet. Use /addchannel.")
+        await begin_scan(event, ScanOptions(old=old, new=new, last=flags["last"], mode="handles"), chans)
+
+    async def begin_scan(event, opts, chans) -> None:
+        """Read the channels, show what would change and wait for the owner's yes."""
+        if lock.locked():
+            raise UserError("Another /replace, /handleswap or /undo is still running - wait for it to finish.")
         async with lock:
             status = await say(event, f"🔍 Scanning {len(chans)} channel(s)…")
             last_edit = [0.0]
@@ -223,8 +290,8 @@ def register(ctx: Ctx) -> None:
             raise UserError("It is already running.")
         job.running = True
         upd = make_updater(event)
-        batch_id = secrets.token_hex(6)
         o = job.opts
+        batch_id = (HANDLE_PREFIX if o.mode == "handles" else "") + secrets.token_hex(6)
         totals = ApplyResult()
         stopped: list = []
         async with lock:
@@ -255,7 +322,8 @@ def register(ctx: Ctx) -> None:
                 if res.aborted:
                     stopped.append((s.channel.title, res.aborted))
         ctx.pending.pop(token, None)
-        lines = [f"✅ <b>Done</b> - <code>@{esc(o.old)}</code> → <code>@{esc(o.new)}</code>", f"• edited: <b>{totals.edited}</b>"]
+        what = "username swap " if o.mode == "handles" else ""
+        lines = [f"✅ <b>Done</b> - {what}<code>@{esc(o.old)}</code> → <code>@{esc(o.new)}</code>", f"• edited: <b>{totals.edited}</b>"]
         if totals.unchanged:
             lines.append(f"• already fine / changed meanwhile: {totals.unchanged}")
         if totals.missing:
@@ -267,10 +335,14 @@ def register(ctx: Ctx) -> None:
             lines.append(f"• <b>failed: {len(totals.failed)}</b> ({sample}{'…' if len(totals.failed) > 8 else ''})")
             names = {n for _, n in totals.failed}
             if names & {"MessageAuthorRequiredError", "InlineBotRequiredError", "ChatAdminRequiredError", "MessageIdInvalidError"}:
-                lines.append("  Telegram doesn't let this bot edit those posts. Use /repost to post them again with the new links.")
+                lines.append(
+                    "  Telegram doesn't let this bot edit those posts."
+                    + ("" if o.mode == "handles" else " Use /repost to post them again with the new links.")
+                )
         for title, name in stopped:
             lines.append(f"⚠️ Stopped early in <b>{esc(title)}</b>: Telegram refused 5 edits in a row ({esc(name)}).")
-        kb = [[Button.inline("↩️ Undo this replace", f"ruc:{batch_id}")]] if totals.edited else None
+        undo_label = "↩️ Undo this swap" if o.mode == "handles" else "↩️ Undo this replace"
+        kb = [[Button.inline(undo_label, f"ruc:{batch_id}")]] if totals.edited else None
         if kb:
             try:
                 await edit_callback_message(event, "\n".join(lines), kb)
@@ -282,9 +354,10 @@ def register(ctx: Ctx) -> None:
     # -------------------------------------------------------------------- /undo
     async def ask_undo(event, batch) -> None:
         n = await db.count_batch_changes(batch.id)
+        what = "username swap" if batch.id.startswith(HANDLE_PREFIX) else "replace"
         await say(
             event,
-            f"↩️ Undo the replace <code>@{esc(batch.old_username)}</code> → <code>@{esc(batch.new_username)}</code>?\n"
+            f"↩️ Undo the {what} <code>@{esc(batch.old_username)}</code> → <code>@{esc(batch.new_username)}</code>?\n"
             f"{n} post(s) will be put back exactly as they were before.",
             [[Button.inline("✅ Yes, undo", f"ru:{batch.id}"), Button.inline("✖️ No", "cx")]],
         )
@@ -294,7 +367,7 @@ def register(ctx: Ctx) -> None:
     async def h_undo(event):
         batch = await db.last_batch()
         if batch is None:
-            raise UserError("There is no /replace run to undo.")
+            raise UserError("There is nothing to undo - no /replace or /handleswap run yet.")
         await ask_undo(event, batch)
 
     @on_cb(ctx, "ruc")
@@ -309,7 +382,7 @@ def register(ctx: Ctx) -> None:
     async def cb_undo(event, parts):
         require_owner(ctx, event)
         if lock.locked():
-            raise UserError("Another /replace or /undo is still running.")
+            raise UserError("Another /replace, /handleswap or /undo is still running.")
         upd = make_updater(event)
         async with lock:
             await upd("⏳ Restoring…", force=True)

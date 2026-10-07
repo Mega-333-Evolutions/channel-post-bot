@@ -8,7 +8,7 @@ from telethon.tl.custom import Message
 from app.tgutil import make_url_button
 
 
-def make_msg(i, text="", entities=None, markup=None, out=False, media=None, grouped_id=None):
+def make_msg(i, text="", entities=None, markup=None, out=False, media=None, grouped_id=None, reply_to=None, pinned=False):
     return Message(
         id=i,
         peer_id=types.PeerChannel(1),
@@ -19,6 +19,8 @@ def make_msg(i, text="", entities=None, markup=None, out=False, media=None, grou
         reply_markup=markup,
         media=media,
         grouped_id=grouped_id,
+        reply_to=types.MessageReplyHeader(reply_to_msg_id=reply_to) if reply_to else None,
+        pinned=True if pinned else None,
     )
 
 
@@ -102,13 +104,18 @@ def _empty_rights(r):
 class FakeChannelClient:
     """Telegram's side of ONE channel (peer id 1) as seen by the bot, with switches for the odd things Telegram does."""
 
-    def __init__(self, msgs=None, *, username=None):
+    def __init__(self, msgs=None, *, username=None, cid=1, title="Test"):
+        self.cid = cid  # this simulation is the channel with this id; add_channel() puts more channels next to it
+        self.title = title
+        self.registry = {cid: self}
+        self.invite_hash = None  # a t.me/+hash invite link of this channel the bot "is in" (for CheckChatInvite)
         self.msgs = dict(msgs or {})
         self.username = username
         self.requests = []  # every request received, in order
         self.edits = []  # EditMessageRequests Telegram accepted
         self.delete_requests = []  # the id lists of channels.deleteMessages calls
         self._top = max(self.msgs, default=0)
+        self._pts = self._top  # the channel's event counter: new messages, edits, deletes and pins all move it
         self._gid = 7000
         self._media = {}
         for m in self.msgs.values():
@@ -131,9 +138,24 @@ class FakeChannelClient:
         self.require_approval = False
         self.users = {}  # user id -> types.User, for participant lists
         self.cant_delete_at_all = set()  # ids nobody can delete (userbot included)
+        self.pinned_order = []  # message ids in the order they were pinned
         self._n_invites = 0
 
     # ----------------------------------------------------------------------------------- helpers
+    def add_channel(self, other):
+        """Put another channel next to this one: requests that name it (by channel id) are answered by it."""
+        other.registry = self.registry
+        self.registry[other.cid] = other
+        self._media.update(other._media)
+        other._media = self._media  # a photo or file is known to the account, whichever channel it is sent to
+        return other
+
+    def _target(self, req):
+        """The channel a request is about (a forward is carried out by its destination)."""
+        peer = getattr(req, "to_peer", None) or getattr(req, "peer", None) or getattr(req, "channel", None)
+        cid = getattr(peer, "channel_id", None)
+        return self.registry.get(cid, self) if cid is not None else self
+
     def _remember_media(self, m):
         md = getattr(m, "media", None)
         if isinstance(md, types.MessageMediaPhoto) and md.photo:
@@ -162,11 +184,12 @@ class FakeChannelClient:
         else:
             m._hidden, m.reply_markup = None, markup
 
-    def _new(self, text, entities, markup, media=None, gid=None, invert=None, hide=False):
+    def _new(self, text, entities, markup, media=None, gid=None, invert=None, hide=False, reply_to=None):
         self._top += 1
+        self._pts += 1
         m = Message(
             id=self._top,
-            peer_id=types.PeerChannel(1),
+            peer_id=types.PeerChannel(self.cid),
             date=NOW,
             message=text,
             out=True,
@@ -174,6 +197,7 @@ class FakeChannelClient:
             media=media,
             grouped_id=gid,
             invert_media=invert,
+            reply_to=types.MessageReplyHeader(reply_to_msg_id=reply_to) if reply_to else None,
         )
         if self.hide_keyboard_on_create > 0 and markup is not None:
             hide = True
@@ -194,11 +218,15 @@ class FakeChannelClient:
 
     def _channel_obj(self):
         return types.Channel(
-            id=1, title="Test", photo=types.ChatPhotoEmpty(), date=NOW, access_hash=USER_HASH, username=self.username, broadcast=True
+            id=self.cid, title=self.title, photo=types.ChatPhotoEmpty(), date=NOW, access_hash=USER_HASH,
+            username=self.username, broadcast=True,
         )
 
     # --------------------------------------------------------------------------------- dispatcher
     async def __call__(self, req):
+        target = self._target(req)
+        if target is not self:
+            return await target(req)
         bytes(req)  # every request the bot builds must serialise
         self.requests.append(req)
         name = type(req).__name__
@@ -211,7 +239,11 @@ class FakeChannelClient:
         return handler(req)
 
     async def get_messages(self, peer, ids=None):
-        return [self.msgs.get(i) for i in ids]
+        chan = self.registry.get(getattr(peer, "channel_id", None), self)
+        err = chan.fail.get("GetMessagesRequest")  # reading a channel the bot may not read (a real client sends this request)
+        if err is not None:
+            raise err
+        return [chan.msgs.get(i) for i in ids]
 
     async def get_input_entity(self, peer):
         if isinstance(peer, int) and peer in self.known_users:
@@ -227,7 +259,7 @@ class FakeChannelClient:
         for ref in req.id:
             m = self.msgs.get(ref.id)
             if m is None:
-                out.append(types.MessageEmpty(id=ref.id, peer_id=types.PeerChannel(1)))
+                out.append(types.MessageEmpty(id=ref.id, peer_id=types.PeerChannel(self.cid)))
             elif isinstance(m, (types.MessageService, types.MessageEmpty)):
                 out.append(m)
             else:
@@ -235,7 +267,7 @@ class FakeChannelClient:
                     types.Message(
                         id=m.id, peer_id=m.peer_id, date=m.date, message=m.message, out=m.out, entities=m.entities,
                         reply_markup=m.reply_markup, media=m.media, grouped_id=m.grouped_id,
-                        invert_media=getattr(m, "invert_media", None),
+                        invert_media=getattr(m, "invert_media", None), reply_to=m.reply_to, pinned=m.pinned,
                     )
                 )
         return types.messages.ChannelMessages(
@@ -243,11 +275,12 @@ class FakeChannelClient:
         )
 
     def _do_ForwardMessagesRequest(self, req):
-        if self.restrict_forwards:
+        origin = self.registry.get(getattr(req.from_peer, "channel_id", None), self)
+        if origin.restrict_forwards:  # "Restrict saving content" is a setting of the channel the posts come from
             raise rpc("ChatForwardsRestrictedError")
         out, gids = [], {}
         for i in req.id:
-            src = self.msgs.get(i)
+            src = origin.msgs.get(i)
             if src is None:
                 continue
             gid = gids.setdefault(src.grouped_id, self._next_gid()) if src.grouped_id else None
@@ -265,17 +298,57 @@ class FakeChannelClient:
         self._gid += 1
         return self._gid
 
+    @staticmethod
+    def _reply_id(req):
+        r = getattr(req, "reply_to", None)
+        return r.reply_to_msg_id if r is not None else None
+
+    def _check_reply(self, req):
+        rid = self._reply_id(req)
+        if rid is not None and rid not in self.msgs:
+            raise rpc("MessageIdInvalidError")  # REPLY_MESSAGE_ID_INVALID
+        return rid
+
     def _do_SendMessageRequest(self, req):
-        return self._updates([self._new(req.message, req.entities, req.reply_markup, None, None, req.invert_media)])
+        rid = self._check_reply(req)
+        return self._updates([self._new(req.message, req.entities, req.reply_markup, None, None, req.invert_media, reply_to=rid)])
 
     def _do_SendMediaRequest(self, req):
         media = self._media_for(req.media)
-        return self._updates([self._new(req.message, req.entities, req.reply_markup, media, None, req.invert_media)])
+        rid = self._check_reply(req)
+        return self._updates([self._new(req.message, req.entities, req.reply_markup, media, None, req.invert_media, reply_to=rid)])
 
     def _do_SendMultiMediaRequest(self, req):
         gid = self._next_gid()
-        out = [self._new(s.message, s.entities, None, self._media_for(s.media), gid, req.invert_media) for s in req.multi_media]
+        rid = self._check_reply(req)
+        out = [
+            self._new(s.message, s.entities, None, self._media_for(s.media), gid, req.invert_media, reply_to=rid)
+            for s in req.multi_media
+        ]
         return self._updates(out)
+
+    def _do_UpdatePinnedMessageRequest(self, req):
+        """Pinning in a channel needs the "Edit messages of others" right; Telegram adds a "pinned" notice to the channel."""
+        if not self.rights.get("edit"):
+            raise rpc("ChatAdminRequiredError")
+        m = self.msgs.get(req.id)
+        if m is None or isinstance(m, types.MessageService):
+            raise rpc("MessageIdInvalidError")
+        if req.unpin:
+            m.pinned = None
+            return self._updates([])
+        if m.pinned:
+            raise rpc("MessageNotModifiedError")
+        m.pinned = True
+        self.pinned_order.append(req.id)
+        self._top += 1
+        self._pts += 2
+        note = types.MessageService(
+            id=self._top, peer_id=types.PeerChannel(self.cid), date=NOW, action=types.MessageActionPinMessage(),
+            reply_to=types.MessageReplyHeader(reply_to_msg_id=req.id),
+        )
+        self.msgs[note.id] = note
+        return self._updates([note])
 
     def _do_EditMessageRequest(self, req):
         m = self.msgs.get(req.id)
@@ -295,6 +368,7 @@ class FakeChannelClient:
         m.message, m.entities = text, (ents or None)
         self._set_markup(m, markup)
         self.edits.append(req)
+        self._pts += 1
         return self._updates([])
 
     def _do_DeleteMessagesRequest(self, req):
@@ -308,12 +382,13 @@ class FakeChannelClient:
                 continue
             del self.msgs[i]
             n += 1
-        return types.messages.AffectedMessages(pts=self._top, pts_count=n)
+        self._pts += n
+        return types.messages.AffectedMessages(pts=self._pts, pts_count=n)
 
     # ------------------------------------------------------------------------ channel / rights
     def _do_GetFullChannelRequest(self, req):
         inv = types.ChatInviteExported(link=self.primary_invite, admin_id=1, date=NOW) if self.primary_invite else None
-        return SimpleNamespace(full_chat=SimpleNamespace(pts=self._top, exported_invite=inv))
+        return SimpleNamespace(full_chat=SimpleNamespace(pts=max(self._pts, self._top), exported_invite=inv))
 
     def _do_GetParticipantRequest(self, req):
         r = self.rights

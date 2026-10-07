@@ -101,7 +101,7 @@ def test_normal_start_up(tmp_path, run_main):
     assert tg.calls == [("start", TOKEN), ("run", None)]
     assert tg.menu == [(c, d) for c, d in bot.COMMANDS]
     names = [c for c, _ in tg.menu]
-    assert "repost" in names and "userbot" in names and "testerror" in names
+    assert "repost" in names and "userbot" in names and "testerror" not in names
     assert "testedit" not in names and "selftest" not in names
     assert tg.handlers  # every module registered its handlers
     assert tg.sent == []  # nothing needed reporting

@@ -6,6 +6,7 @@ import re
 
 from telethon import Button, events, types
 
+from ..channelref import parse_channel_ref
 from ..common import Ctx, UserError, clear_state, cmd, guard, on_cb, on_text, require_owner, say, set_state, show
 from ..tgutil import esc, get_rights, short
 from ..ui import CANCEL
@@ -24,23 +25,6 @@ NEEDS_ACCESS = (
     "I can see the channel, but Telegram hasn't given me its access details yet. Post something in the "
     "channel while the bot is running (or send the @username if it's public), then forward a post again."
 )
-
-_REF_RX = re.compile(r"(?i)^(?:https?://)?(?:t\.me|telegram\.me)/(?:c/(\d+)|([A-Za-z0-9_]{3,32}))(?:/\d+)?/?$")
-
-
-def parse_channel_ref(text: str):
-    """@name / t.me link / numeric id -> username (str) or channel id (int); None if unrecognised."""
-    t = (text or "").strip()
-    m = _REF_RX.match(t)
-    if m:
-        return int(m.group(1)) if m.group(1) else m.group(2)
-    t = t.lstrip("@")
-    if re.fullmatch(r"-?\d+", t):
-        s = str(abs(int(t)))
-        return int(s[3:]) if s.startswith("100") and len(s) > 10 else int(s)
-    if re.fullmatch(r"[A-Za-z0-9_]{3,32}", t):
-        return t
-    return None
 
 
 def rights_line(r) -> str:
@@ -120,10 +104,9 @@ def register(ctx: Ctx) -> None:
         if not chans:
             raise UserError("No channels yet. Use /addchannel.")
         lines, kb = [], []
-        for ch in chans:
-            r = await get_rights(client, ch)
+        for n, ch in enumerate(chans, 1):
             name = esc(ch.title) + (f" (@{esc(ch.username)})" if ch.username else "")
-            lines.append(f"• <b>{name}</b>\n   {rights_line(r)}")
+            lines.append(f"{n}. <b>{name}</b>")
             if ctx.cfg.is_owner(event.sender_id):
                 kb.append([Button.inline(f"➖ Remove {short(ch.title, 22)}", f"chd:{ch.id}")])
         await say(event, "📢 <b>Your channels</b>\n\n" + "\n".join(lines), kb or None)

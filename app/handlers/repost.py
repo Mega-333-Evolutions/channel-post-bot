@@ -11,7 +11,8 @@ from telethon import Button, errors
 
 from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say
 from ..linkswap import normalize_username
-from ..repost_engine import RepostOptions, RepostPlan, delete_copies, plan_repost, run_repost
+from ..postlinks import resolve_chain
+from ..repost_engine import RepostOptions, RepostPlan, delete_copies, plan_repost, relink_copies, run_repost
 from ..tgutil import esc, get_rights, post_link, short
 from ..userbot import delete_problem_text
 
@@ -107,22 +108,70 @@ def plan_text(p: RepostPlan, o: RepostOptions, title: str, delay: float) -> str:
         )
     if p.dropped_posts:
         lines.append(f"• {p.dropped_posts} post(s) carry other bots' buttons (reactions...) - those are not copied")
+    if p.post_links:
+        lines.append(
+            f"• {p.post_links} link(s) in {p.post_link_posts} post(s) point at other posts of this channel: "
+            "they are pointed at the new copies (a link to a post that doesn't exist stays as it is)"
+        )
+    if p.replies:
+        lines.append(f"• {p.replies} post(s) answer another post: each copy answers the copy of that post")
+    if p.pinned:
+        lines.append(
+            f"• {p.pinned} pinned post(s): their copies are pinned at the end "
+            "(the bot needs the “Edit messages of others” right for that)"
+        )
     minutes = max(1, round(p.eta_seconds(delay) / 60))
     lines += [
         "",
-        "<b>How:</b> posts without buttons or links to change are copied by Telegram itself, so they stay exactly as "
-        "they are. Posts with buttons (or links to swap) are posted again with their text, formatting, media and "
-        "buttons in one go, and each one is read back to make sure its buttons are really there. Copies go to the end "
-        "of the channel silently, in the original order, and are registered in My posts.",
+        "<b>How:</b> posts without buttons, replies or links to change are copied by Telegram itself, so they stay "
+        "exactly as they are. Posts with buttons, links to change or a reply are posted again with their text, "
+        "formatting, media and buttons in one go, and each one is read back to make sure its buttons are really "
+        "there. Copies go to the end of the channel silently, in the original order, and are registered in My posts.",
         "",
-        "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes, pinned state and links to the "
-        "old posts.",
+        "<b>Not kept:</b> original dates, view counts, reactions, comments and poll votes.",
         f"Time: about {minutes} min. Please don't post in the channel meanwhile.",
         "<b>Nothing is deleted in this step.</b>",
     ]
     if p.partial:
         lines.append("Trial run: afterwards you can remove the copies again.")
     return "\n".join(lines)
+
+
+def finishing_notes(res) -> list:
+    """Lines about answers, links and pins for the end of a repost."""
+    notes = []
+    if res.replies:
+        notes.append(f"↩️ {res.replies} post(s) answer the copy of the post they answered.")
+    if res.reply_lost:
+        notes.append(f"{res.reply_lost} post(s) could only be copied without their reply (their media can't be rebuilt).")
+    if res.reply_dropped:
+        notes.append(f"{res.reply_dropped} post(s) answered a post that is not there any more, so they answer nothing.")
+    fin = res.final
+    if fin is not None:
+        if fin.relinked:
+            notes.append(f"🔗 {fin.links} link(s) in {fin.relinked} post(s) now point at the new copies.")
+        if fin.failed:
+            sample = ", ".join(f"#{i} {esc(n)}" for i, n in fin.failed[:5])
+            notes.append(f"{len(fin.failed)} post(s) could not get their links updated ({sample}) - /fixlinks tries again.")
+        if fin.pinned:
+            notes.append(f"📌 {fin.pinned} pinned post(s) are pinned again.")
+        if fin.pin_error:
+            notes.append(
+                f"📌 {fin.pin_wanted - fin.pinned} copy/copies could not be pinned ({esc(fin.pin_error)}). Give the bot the "
+                "“Edit messages of others” right, or pin them by hand."
+            )
+    if res.final_error:
+        notes.append(f"Links and pins could not be finished ({esc(res.final_error)}). /fixlinks repairs the links.")
+    return notes
+
+
+FIXLINKS_TEXT = (
+    "🔗 <b>Fix links to reposted posts</b>\n"
+    "After a repost, a link such as <code>t.me/channel/115</code> has to point at the copy of post 115, because the "
+    "old post is gone. /repost does that by itself now. Use this for a channel you reposted with an earlier version: "
+    "it looks at the copies and fixes every link that still points at a deleted original.\n\n"
+    "Which channel?"
+)
 
 
 def register(ctx: Ctx) -> None:
@@ -272,17 +321,17 @@ def register(ctx: Ctx) -> None:
         last = [0.0]
 
         async def prog(res):
-            if time.monotonic() - last[0] < 4:
+            if res.phase == "copy" and time.monotonic() - last[0] < 4:
                 return
             last[0] = time.monotonic()
             done = res.copied_units + res.skipped_done
             of = f"/{total}" if total else ""
+            if res.phase == "finish":
+                body = f"🔗 Copied {done}{of} posts. Now pointing links at the new copies and pinning…"
+            else:
+                body = f"⏳ Copying <b>{esc(ch.title)}</b>: {done}{of} posts…\nThe old posts stay untouched."
             try:
-                await edit_callback_message(
-                    event,
-                    f"⏳ Copying <b>{esc(ch.title)}</b>: {done}{of} posts…\nThe old posts stay untouched.",
-                    [[Button.inline("⏹ Stop", f"rps:{mig.id}")]],
-                )
+                await edit_callback_message(event, body, [[Button.inline("⏹ Stop", f"rps:{mig.id}")]])
             except errors.MessageNotModifiedError:
                 pass
             except Exception:
@@ -317,6 +366,7 @@ def register(ctx: Ctx) -> None:
                 )
         if res.aborted:
             notes.append(f"Stopped early because of {esc(res.aborted)}.")
+        notes += finishing_notes(res)
         await edit_callback_message(event, text + ("\n\n" + "\n".join(notes) if notes else ""), kb)
 
     @on_cb(ctx, "rpa")
@@ -500,3 +550,84 @@ def register(ctx: Ctx) -> None:
         mig, _ = await load(parts)
         await db.set_migration_status(mig.id, "closed")
         await edit_callback_message(event, "✅ Closed. Nothing else will be changed in that channel by this repost.")
+
+    # ------------------------------------------------------------------- /fixlinks
+    async def fix_scope(cid: int):
+        """The channel and the links to repair: posts whose original was deleted and whose copy exists."""
+        ch = await db.get_channel(cid)
+        if ch is None:
+            raise UserError("That channel is not registered any more.")
+        pairs = await db.migration_pairs(channel_id=ch.id, only_deleted_old=True)
+        return ch, pairs
+
+    @client.on(cmd("fixlinks"))
+    @guard(ctx, owner=True)
+    async def h_fixlinks(event):
+        chans = await db.list_channels()
+        if not chans:
+            raise UserError("No channels registered yet. Use /addchannel.")
+        kb = [[Button.inline(f"📢 {short(c.title, 40)}", f"fxch:{c.id}")] for c in chans]
+        kb.append([Button.inline("✖️ Cancel", "fxn")])
+        await say(event, FIXLINKS_TEXT, kb)
+
+    @on_cb(ctx, "fxn")
+    async def cb_fix_cancel(event, parts):
+        require_owner(ctx, event)
+        await edit_callback_message(event, "Cancelled - nothing was changed.")
+
+    @on_cb(ctx, "fxch")
+    async def cb_fix_scan(event, parts):
+        require_owner(ctx, event)
+        ch, pairs = await fix_scope(int(parts[0]))
+        if not pairs:
+            await edit_callback_message(
+                event,
+                f"Nothing to fix in <b>{esc(ch.title)}</b>: no repost with deleted originals is recorded for it.",
+            )
+            return
+        if ctx.lock.locked():
+            raise UserError("Another long job is still running.")
+        async with ctx.lock:
+            await edit_callback_message(event, f"🔍 Looking at {len(pairs)} copied post(s) of <b>{esc(ch.title)}</b>…")
+            res = await relink_copies(client, db, ch, resolve_chain(dict(pairs)), [n for _, n in pairs], dry_run=True)
+        if not res.relinked:
+            await edit_callback_message(
+                event,
+                f"✅ <b>{esc(ch.title)}</b>: {res.checked} copied post(s) checked - no link points at a deleted original.",
+            )
+            return
+        await edit_callback_message(
+            event,
+            f"🔗 <b>{esc(ch.title)}</b>: {res.links} link(s) in {res.relinked} post(s) still point at posts that were "
+            f"reposted and deleted. They will point at the copies instead. ({res.checked} copied post(s) checked)",
+            [[Button.inline(f"🔗 Fix {res.links} link(s)", f"fxgo:{ch.id}"), Button.inline("✖️ Cancel", "fxn")]],
+        )
+
+    @on_cb(ctx, "fxgo")
+    async def cb_fix_go(event, parts):
+        require_owner(ctx, event)
+        ch, pairs = await fix_scope(int(parts[0]))
+        if ctx.lock.locked():
+            raise UserError("Another long job is still running.")
+        last = [0.0]
+
+        async def prog(r):
+            if time.monotonic() - last[0] < 3:
+                return
+            last[0] = time.monotonic()
+            try:
+                await edit_callback_message(event, f"🔗 Fixing links in <b>{esc(ch.title)}</b>… {r.relinked} post(s) done")
+            except Exception:
+                pass
+
+        async with ctx.lock:
+            res = await relink_copies(
+                client, db, ch, resolve_chain(dict(pairs)), [n for _, n in pairs], delay=cfg.edit_delay, progress=prog
+            )
+        text = f"✅ <b>{esc(ch.title)}</b>: {res.links} link(s) in {res.relinked} post(s) now point at the copies."
+        if res.failed:
+            sample = ", ".join(f"#{i} {esc(n)}" for i, n in res.failed[:5])
+            text += f"\n⚠️ {len(res.failed)} post(s) failed ({sample}). Run /fixlinks again to retry them."
+        if res.aborted:
+            text += f"\nStopped early because of {esc(res.aborted)}."
+        await edit_callback_message(event, text)

@@ -1,6 +1,7 @@
 """Settings, read from environment variables (or a .env file)."""
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -55,6 +56,12 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _whole(name: str, default: int) -> int:
+    """A whole number from the environment; anything that is not a finite number gives the default."""
+    value = _float(name, float(default))
+    return int(value) if math.isfinite(value) else default
+
+
 @dataclass(frozen=True)
 class Config:
     api_id: int
@@ -73,6 +80,8 @@ class Config:
     error_log_chat_id: Optional[int] = None  # errors are sent to this chat; None = off
     userbot_session: str = ""  # session text of the helper account that deletes old posts
     userbot_keep_admin: bool = False  # keep the userbot an admin after a clean-up (default: take the right away)
+    delete_service_messages: bool = True  # remove "channel name changed", "pinned a message", video chat ... notices
+    sync_interval_minutes: int = 60  # how often every channel is compared with My posts (0 = never on its own)
 
     def is_owner(self, uid) -> bool:
         return uid in self.owners
@@ -115,4 +124,6 @@ def load_config() -> Config:
         error_log_chat_id=_chat_id("ERROR_LOG_CHAT_ID", DEFAULT_ERROR_LOG_CHAT_ID),
         userbot_session=(os.getenv("USERBOT_SESSION") or "").strip(),
         userbot_keep_admin=_bool("USERBOT_KEEP_ADMIN", False),
+        delete_service_messages=_bool("DELETE_SERVICE_MESSAGES", True),
+        sync_interval_minutes=max(0, _whole("SYNC_INTERVAL_MINUTES", 60)),
     )

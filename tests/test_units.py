@@ -9,7 +9,7 @@ from telethon.sessions import MemorySession
 from app import buttons as B
 from app.common import UserError
 from app.db import normalize_db_url
-from app.handlers.channels import parse_channel_ref
+from app.channelref import parse_channel_ref
 from app.handlers.panel import extract_content
 from app.handlers.replace import parse_replace_args
 from app.linkswap import apply_span_replacements, classify_url, normalize_username, swap_url

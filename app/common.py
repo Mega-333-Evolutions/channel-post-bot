@@ -35,6 +35,9 @@ class Ctx:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one long job (replace / repost) at a time
     userbot: Any = None  # app.userbot.Userbot or None
     reporter: Any = None  # app.errorlog.ErrorReporter or None
+    expirer: Any = None  # app.expiry.Expirer (timed deletions of broadcasts) or None
+    syncer: Any = None  # app.syncer.Syncer (keeps My posts in step with the channels) or None
+    sync_ignore: set = field(default_factory=set)  # (channel id, message id) of posts the owner made the bot forget
 
 
 def is_cb(event) -> bool:

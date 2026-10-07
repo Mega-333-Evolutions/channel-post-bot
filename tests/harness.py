@@ -117,9 +117,29 @@ class FakeTG(FakeChannelClient):
         self.deleted.append(list(ids))
         return [SimpleNamespace(pts_count=len(ids))]
 
+    async def get_entity(self, what):
+        """Public channels by @username, or any channel by PeerChannel - the ones put next to this one."""
+        for chan in self.registry.values():
+            if isinstance(what, str) and chan.username and chan.username.lower() == what.lstrip("@").lower():
+                return chan._channel_obj()
+            if isinstance(what, types.PeerChannel) and what.channel_id == chan.cid:
+                return chan._channel_obj()
+        raise ValueError(f"Cannot find any entity corresponding to {what!r}")
+
     async def __call__(self, req):
+        if isinstance(req, functions.messages.CheckChatInviteRequest):
+            for chan in self.registry.values():
+                if chan.invite_hash == req.hash:
+                    return types.ChatInviteAlready(chat=chan._channel_obj())
+            raise ValueError("INVITE_HASH_INVALID")
+        target = self._target(req)
+        if target is not self:
+            return await target(req)
         if isinstance(req, functions.messages.EditMessageRequest):
             self.edits.append(("raw", req.id, req))
+            err = self.fail.get("EditMessageRequest")
+            if err is not None:
+                raise err
             if req.id not in self.msgs:  # a post the simulation doesn't hold: just note the edit
                 return None
         if isinstance(req, functions.channels.DeleteMessagesRequest):
@@ -162,6 +182,12 @@ class App:
                 continue
             await cb(ev)
         return ev
+
+    async def raw(self, update):
+        """Hand a raw Telegram update (a new / edited / deleted channel message ...) to the handlers that listen for it."""
+        for builder, cb in self.tg.handlers:
+            if isinstance(builder, events.Raw) and builder.filter(update) is not None:
+                await cb(update)
 
     async def press(self, data):
         ev = FakeEvent(self.uid, self.out, data=data)

@@ -64,6 +64,12 @@ def missing_links(rows: list) -> int:
     return sum(1 for r in rows or [] for b in r if not b.get("u") and not b.get("raw"))
 
 
+def link_positions(rows: list) -> list:
+    """(row, column) of every button that has a link of its own. Other bots' buttons (reactions...) are left out:
+    they can't be edited."""
+    return [(r, c) for r, row in enumerate(rows or []) for c, b in enumerate(row) if b.get("u") and not b.get("raw")]
+
+
 def valid(rows: list, r: int, c: int) -> bool:
     return 0 <= r < len(rows) and 0 <= c < len(rows[r])
 

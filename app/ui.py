@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from telethon import Button
 
-from .buttons import count, grid_label, missing_links
+from .buttons import count, grid_label, link_positions, missing_links
 from .tgutil import esc, post_link, short
 
 CANCEL = [[Button.inline("✖️ Cancel", "cx")]]
@@ -34,7 +34,7 @@ def panel_text(p, ch, note=None) -> str:
     n, miss = count(p.buttons), missing_links(p.buttons)
     lines.append(f"Buttons: {n}" + (f" (⚠️ {miss} without a link)" if miss else ""))
     if p.source == "adopted":
-        lines.append("<i>Picked up from the channel by /replace.</i>")
+        lines.append("<i>Picked up from the channel - it was not made with this bot.</i>")
     snippet = short(p.text or "", 220) or "(no text)"
     lines += ["", f"<i>{esc(snippet)}</i>"]
     if note:
@@ -64,6 +64,8 @@ def panel_keyboard(p) -> list:
         extra.append(Button.inline("🚫 Remove media", f"rm:{pid}"))
     if extra:
         kb.append(extra)
+    if p.status == "sent" and p.message_id and link_positions(p.buttons):
+        kb.append([Button.inline("🔗 Mass replace links", f"mlp:{pid}")])
     if p.status == "draft":
         kb.append([Button.inline("👁 Preview", f"pv:{pid}"), Button.inline("🚀 Publish", f"pb:{pid}")])
         kb.append([Button.inline("🗑 Discard", f"dl:{pid}"), Button.inline("📚 My posts", "pc:d:0")])

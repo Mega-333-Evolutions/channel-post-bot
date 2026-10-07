@@ -138,6 +138,13 @@ def with_url(b, new_url: str):
     return nb
 
 
+def with_text(b, new_text: str):
+    """Copy of button `b` with another name; the link, colour ... are kept."""
+    nb = copy.copy(b)
+    nb.text = new_text
+    return nb
+
+
 def _style_dump(b) -> Optional[str]:
     st = getattr(b, "style", None)
     if st is None:

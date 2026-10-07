@@ -367,6 +367,7 @@ def register(ctx: Ctx) -> None:
             sent = await send_post(client, peer_of(ch), post)
         except errors.RPCError as e:
             raise UserError("❌ " + explain_rpc(e) + "\nThe post was NOT published.")
+        await db.release_slot(ch.id, sent.id, keep_pid=post.id)  # the sync may have picked the message up a moment ago
         post = await db.update_post(post.id, status="sent", message_id=sent.id, sent_at=utcnow())
         await show(
             event,
@@ -413,5 +414,7 @@ def register(ctx: Ctx) -> None:
                     ctx.userbot, bot_error=out.bot_error, fallback_error=out.fallback_error, tried=out.tried_userbot
                 )
                 raise UserError(f"Telegram did not delete that message. {why}\nDelete it by hand in the channel, then use “Only forget it in the bot”.")
+        if post.status == "sent" and post.message_id and parts[1] == "b":
+            ctx.sync_ignore.add((post.channel_id, post.message_id))  # forgotten on purpose: the sync must not bring it back
         await db.delete_post(post.id)
         await show(event, "🗑 Done.", [[Button.inline("📚 My posts", "pl")]])

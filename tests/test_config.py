@@ -21,7 +21,7 @@ REQUIRED = {"API_ID": "12345", "API_HASH": "abcdef0123456789", "BOT_TOKEN": "123
 def env_names() -> list:
     """Every environment variable app/config.py reads."""
     src = (ROOT / "app" / "config.py").read_text()
-    names = set(re.findall(r'(?:getenv|_ints|_bool|_chat_id|_float)\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    names = set(re.findall(r'(?:getenv|_ints|_bool|_chat_id|_float|_whole)\(\s*"([A-Z][A-Z0-9_]+)"', src))
     names |= set(re.findall(r'environ\[\s*"([A-Z][A-Z0-9_]+)"', src))
     return sorted(names)
 
@@ -113,6 +113,26 @@ def test_api_id_must_be_a_number(env):
     assert "API_ID must be a number" in str(e.value)
 
 
+def test_service_message_and_sync_settings(env):
+    cfg = load_config()
+    assert cfg.delete_service_messages is True and cfg.sync_interval_minutes == 60  # both are on unless somebody says otherwise
+    env.setenv("DELETE_SERVICE_MESSAGES", "false")
+    env.setenv("SYNC_INTERVAL_MINUTES", "15")
+    cfg = load_config()
+    assert cfg.delete_service_messages is False and cfg.sync_interval_minutes == 15
+    env.setenv("DELETE_SERVICE_MESSAGES", "yes")
+    assert load_config().delete_service_messages is True
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("0", 0), ("-5", 0), ("30", 30), ("2.9", 2), ("  45 ", 45), ("", 60), ("abc", 60), ("inf", 60), ("-inf", 60), ("nan", 60)],
+)
+def test_sync_interval_minutes_never_stops_the_bot_from_starting(env, raw, expected):
+    env.setenv("SYNC_INTERVAL_MINUTES", raw)
+    assert load_config().sync_interval_minutes == expected  # 0 = no automatic checks; nonsense = the default
+
+
 def test_edit_delay_has_a_floor(env):
     env.setenv("EDIT_DELAY", "0.1")
     assert load_config().edit_delay == 0.3
@@ -202,10 +222,12 @@ def test_helper_scripts_compile_and_the_userbot_one_stands_alone():
 def test_the_testing_commands_are_gone_everywhere():
     names = [c for c, _ in COMMANDS]
     assert "testedit" not in names and "selftest" not in names
-    assert {"new", "posts", "repost", "replace", "undo", "userbot", "testerror", "help"} <= set(names)
+    assert {"new", "posts", "repost", "replace", "undo", "userbot", "help"} <= set(names)
+    assert {"autopost", "broadcast", "handleswap", "fixlinks", "shift", "sync"} <= set(names)
+    assert "testerror" not in names
     for path in list((ROOT / "app").rglob("*.py")) + [ROOT / "bot.py"]:
         text = path.read_text().lower()
-        assert "testedit" not in text and "selftest" not in text, path
+        assert "testedit" not in text and "selftest" not in text and "testerror" not in text, path
 
 
 def test_every_menu_command_has_a_handler(tmp_path):
@@ -223,9 +245,12 @@ def test_every_menu_command_has_a_handler(tmp_path):
 def test_the_help_text_lists_the_commands_that_exist():
     from app.handlers.basic import HELP
 
-    for name in ("new", "posts", "repost", "replace", "undo", "userbot", "testerror", "export", "addchannel", "channels"):
+    for name in (
+        "new", "posts", "repost", "replace", "undo", "userbot", "export", "addchannel", "channels",
+        "autopost", "broadcast", "handleswap", "fixlinks", "shift", "sync",
+    ):
         assert f"/{name}" in HELP, name
-    assert "--channel" not in HELP
+    assert "--channel" not in HELP and "/testerror" not in HELP
 
 
 # ------------------------------------------------------------------------------------------ health port
