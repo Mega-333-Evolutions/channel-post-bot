@@ -34,8 +34,10 @@ class Syncer:
         self.pause = 0.25  # between two requests
         self.cache_ttl = 60.0  # how long "is this channel connected?" is remembered
         self.tell_every = 86400.0  # the same warning goes to the owners at most this often
+        self.tell_restricted_every = 7 * 86400.0  # ... a restriction by Telegram can last for weeks: once a week
         self.max_ids = 300  # more changed ids than this in one channel: look at the whole channel instead
         self.max_tries = 8  # a message that stays "too fresh" is given up after this many rounds
+        self.history_seconds = 150.0  # a timed check reads a channel's older posts for this long, then goes on next time
         self._busy = asyncio.Lock()  # one look at a time
         self._edits: dict = {}  # channel id -> message ids edited
         self._news: dict = {}  # channel id -> message ids that are new posts
@@ -110,15 +112,20 @@ class Syncer:
 
     def options(self, **kw) -> SyncOptions:
         ctx = self.ctx
-        base = dict(delete_services=ctx.cfg.delete_service_messages, ignore=ctx.sync_ignore, pause=self.pause)
+        base = dict(
+            delete_services=ctx.cfg.delete_service_messages,
+            history=ctx.cfg.import_old_posts,
+            ignore=ctx.sync_ignore,
+            pause=self.pause,
+        )
         base.update(kw)
         return SyncOptions(**base)
 
-    async def tell_owners(self, ch, key: str, text: str) -> None:
-        """A warning for the owners - the same one (per channel and kind) at most once a day."""
+    async def tell_owners(self, ch, key: str, text: str, every: Optional[float] = None) -> None:
+        """A warning for the owners - the same one (per channel and kind) at most once a day (or every `every` seconds)."""
         now = time.monotonic()
         k = (ch.id, key)
-        if now - self._told.get(k, -1e12) < self.tell_every:
+        if now - self._told.get(k, -1e12) < (self.tell_every if every is None else every):
             return
         self._told[k] = now
         for uid in sorted(self.ctx.cfg.owners):
@@ -137,6 +144,28 @@ class Syncer:
             )
         if rep.services_failed and rep.services_error in RIGHTS_ERRORS:
             await self.tell_owners(ch, "rights", self._rights_text(ch, rep.services_error))
+        if rep.restricted_channel:
+            log.info("channel %s is restricted by Telegram (%s): My posts left untouched", ch.id, rep.restricted_channel)
+            text = self._restricted_text(ch, rep.restricted_channel)
+            await self.tell_owners(ch, "restricted", text, every=self.tell_restricted_every)
+        elif rep.restricted:
+            log.info("channel %s: %s post(s) held back by Telegram (%s): left untouched", ch.id, len(rep.restricted), rep.restricted_why)
+            text = self._held_back_text(ch, len(rep.restricted), rep.restricted_why)
+            await self.tell_owners(ch, "held-back", text, every=self.tell_restricted_every)
+
+    @staticmethod
+    def _restricted_text(ch, why: str) -> str:
+        return (
+            f"🚫 Telegram has restricted <b>{esc(ch.title)}</b> ({esc(why)}). While that lasts I don't change anything in "
+            "My posts for this channel - the saved posts stay exactly as they are, whatever the channel shows now."
+        )
+
+    @staticmethod
+    def _held_back_text(ch, n: int, why: Optional[str]) -> str:
+        return (
+            f"🚫 Telegram holds back {n} post(s) of <b>{esc(ch.title)}</b> ({esc(why or 'restricted')}). "
+            "Their saved copies in My posts stay exactly as they are."
+        )
 
     @staticmethod
     def _rights_text(ch, why: Optional[str]) -> str:
@@ -147,9 +176,12 @@ class Syncer:
         )
 
     # ------------------------------------------------------------------------------------ full looks
-    async def run_all(self, chans: Optional[list] = None, *, explicit: bool = False, clean: bool = False, progress=None) -> list:
+    async def run_all(
+        self, chans: Optional[list] = None, *, explicit: bool = False, history: Optional[bool] = None, progress=None
+    ) -> list:
         """Look at the connected channels one after the other. `explicit` (the /sync command): the caller holds the
-        one-long-job lock and everything is read; the timed check gives way to any long job instead."""
+        one-long-job lock and everything is read; the timed check gives way to any long job instead. `history`: True
+        reads the channels' older posts even if IMPORT_OLD_POSTS is off (/sync --history)."""
         ctx = self.ctx
         if chans is None:
             chans = await ctx.db.list_channels()
@@ -158,9 +190,6 @@ class Syncer:
         for ch in chans:
             if busy():
                 break
-            fallback = deleter = None
-            if clean and ctx.userbot is not None:
-                fallback, deleter = await ctx.userbot.fallback_for(ch)
 
             async def prog(rep, ch=ch):
                 if progress is not None:
@@ -168,16 +197,14 @@ class Syncer:
 
             try:
                 async with self._busy:
-                    opts = self.options(deep=explicit, clean=clean, fallback=fallback)
+                    extra = {} if history is None else {"history": history}
+                    opts = self.options(deep=explicit, history_seconds=None if explicit else self.history_seconds, **extra)
                     rep = await sync_channel(ctx.client, ctx.db, ch, opts, busy=busy, progress=prog)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.exception("looking at channel %s failed", ch.id)
                 rep = SyncReport(channel=ch, error=f"{type(e).__name__}: {str(e)[:120]}")
-            finally:
-                if deleter is not None:
-                    await deleter.close()
             await self._after(ch, rep)
             reports.append(rep)
         return reports
@@ -263,7 +290,7 @@ class Syncer:
             if ch is None:
                 continue
             e_ids, n_ids = set(edits.get(cid, ())), set(news.get(cid, ()))
-            opts = self.options(grace=self.rt_grace)
+            opts = self.options(grace=self.rt_grace, history=False)  # live: the older posts wait for the timed check
             try:
                 async with self._busy:
                     if len(e_ids | n_ids) > self.max_ids:  # a burst: one look at the whole channel is cheaper

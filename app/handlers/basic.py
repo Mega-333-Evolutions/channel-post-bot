@@ -1,4 +1,4 @@
-"""/start /help /cancel /export /userbot, plus the routers for free text and inline-button presses."""
+"""/start /help /cancel /export /userbot, plus the routers for free text and inline-button presses (/import is in backup.py)."""
 from __future__ import annotations
 
 import io
@@ -7,7 +7,8 @@ import logging
 
 from telethon import events
 
-from ..common import Ctx, cmd, clear_state, discard_temp, guard, say, show
+from ..common import Ctx, UserError, cmd, clear_state, discard_temp, guard, say, show
+from ..picker import PAGE_CB
 from ..tgutil import esc
 
 log = logging.getLogger(__name__)
@@ -28,12 +29,12 @@ HELP = (
     "/handleswap @old @new - change the username @old written in posts (text, captions, button names) to @new in all channels; links stay\n"
     "/undo - undo the last /replace or /handleswap\n"
     "/repost @old @new - copy every post of a channel in order (links swapped, replies, pins and links between posts kept), then delete the old posts\n"
-    "/fixlinks - point links at the reposted copies for a channel you reposted before\n"
-    "/shift @source @destination [from_id] [to_id] - copy posts from one channel into another (buttons kept, listed in My posts)\n"
-    "/sync - compare every channel with My posts right now (posts deleted, edited or added by others, leftover service messages); "
-    "/sync --clean also deletes the old service messages that are already in the channels' history\n"
+    "/shift @source @destination [from_id] [to_id] [-c] [-all] - copy posts from one channel into another (buttons kept, listed in My posts); "
+    "-c: links to the source's posts in all your channels are changed to the copies; -all: the destination also gets the source's name, description and photo\n"
+    "/sync - compare every channel with My posts right now (posts deleted, edited or added by others, the older posts from before the bot was added; service messages are deleted)\n"
     "/userbot - status of the helper account that deletes posts the bot is not allowed to delete\n"
-    "/export - download a JSON backup of your posts"
+    "/export - download a JSON backup of your channels and posts\n"
+    "/import - put a backup made by /export back (only adds: nothing that exists is changed or deleted)"
 )
 
 
@@ -59,7 +60,11 @@ def register(ctx: Ctx) -> None:
         data = await db.export_all()
         buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8"))
         buf.name = "channel-posts-export.json"
-        await event.respond(f"📦 Backup: {len(data['channels'])} channel(s), {len(data['posts'])} post(s).", file=buf)
+        await event.respond(
+            f"📦 Backup: {len(data['channels'])} channel(s), {len(data['posts'])} post(s). "
+            "To put it back (on this bot or a new one), send /import and then this file.",
+            file=buf,
+        )
 
     @client.on(cmd("userbot"))
     @guard(ctx, owner=True)
@@ -123,5 +128,14 @@ def register(ctx: Ctx) -> None:
         clear_state(ctx, uid)
         await show(event, "Cancelled.")
 
+    async def cb_channel_page(event, parts):
+        """◀ ▶ under a channel chooser: draw the same chooser again on another page."""
+        kind, arg, page = parts[0], parts[1], int(parts[2])
+        draw = ctx.pickers.get(kind)
+        if draw is None:
+            raise UserError("This list is no longer active. Start the command again.")
+        await draw(event, arg, page)
+
     ctx.callbacks["noop"] = cb_noop
     ctx.callbacks["cx"] = cb_cancel
+    ctx.callbacks[PAGE_CB] = cb_channel_page

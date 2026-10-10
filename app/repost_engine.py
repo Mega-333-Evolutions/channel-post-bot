@@ -16,10 +16,16 @@ What a plain copy would lose is put back as well:
   * a link to another post of the channel (t.me/name/115) is pointed at the copy of that post - at once when the
     copy already exists, afterwards (finalize_repost) for posts that are copied later;
   * a post that was pinned has its copy pinned at the end.
+
+A post that TELEGRAM holds back (a copyright strike shows "This message couldn't be displayed on your device due to
+copyright infringement" instead of the post) is never copied as it looks now - that would copy the notice. /shift
+rebuilds such a post from what My posts saved of it (text, formatting, buttons, media); /repost leaves it alone.
+A post that has no saved copy is skipped and reported.
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
@@ -27,15 +33,19 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from telethon import errors, functions, types, utils
 
 from .buttons_sync import ButtonsNotShown, ensure_markup, link_urls
+from .crosslinks import CrossResult, relink_after_repost
 from .linkswap import compute_message_changes, url_only_markup
 from .postlinks import PostLinks, relink_message
-from .replace_engine import CHUNK, FALLBACK_EMPTY_BATCHES, fetch_messages, get_top_id, is_skippable, preview_flag
+from .replace_engine import CHUNK, FALLBACK_EMPTY_BATCHES, fetch_messages, is_skippable, preview_flag
+from .restrictions import is_placeholder_text, message_restriction, norm_text, probe_channel
 from .tgutil import (
+    FATAL,
     build_markup,
     classify_media,
     de_entities,
     edit_raw,
     flood_retry,
+    media_from_ref,
     media_ref,
     peer_of,
     ser_entities,
@@ -45,14 +55,6 @@ from .tgutil import (
 log = logging.getLogger(__name__)
 
 ABORT_AFTER = 8  # consecutive posts that could not be copied -> stop
-FATAL = {
-    "ChatAdminRequiredError",
-    "ChatWriteForbiddenError",
-    "ChannelPrivateError",
-    "UserBannedInChannelError",
-    "ChannelInvalidError",
-    "ChatRestrictedError",
-}
 
 
 @dataclass
@@ -163,6 +165,99 @@ def new_messages_from(result) -> list:
     return out
 
 
+# ------------------------------------------------------ posts Telegram holds back (copyright strike ...)
+SavedLookup = Callable[[list], Awaitable[dict]]  # message ids -> {message id: the saved post of My posts}
+
+
+def saved_lookup(db, channel_id: int) -> SavedLookup:
+    """How the copy loop and the plan look up what My posts saved of the posts of one channel."""
+
+    async def lookup(ids: list) -> dict:
+        return {p.message_id: p for p in await db.posts_at(channel_id, ids)}
+
+    return lookup
+
+
+def held_back_reason(unit: list, rows: dict) -> Optional[str]:
+    """What Telegram says when it holds this post back (a copyright strike ...), else None.
+
+    "Held back" means that what Telegram hands out is its notice - or nothing - instead of the post: copying that would
+    copy the notice. A post that carries Telegram's restriction mark but is handed out as it is (its text, its media)
+    is an ordinary post for a copy, and so is a text that the saved copy has too (the owner's own wording)."""
+    for m in unit:
+        row = rows.get(m.id)
+        saved_text = row.text if row is not None else None
+        why = message_restriction(m, saved_text)
+        if not why:
+            continue
+        live = m.message or ""
+        notice = is_placeholder_text(live) and (saved_text is None or norm_text(live) != norm_text(saved_text))
+        nothing = not live.strip() and getattr(m, "media", None) is None
+        if notice or nothing:
+            return why
+    return None
+
+
+def stand_in(m, row):
+    """A copy of the live message `m` that shows what My posts saved for it - text, formatting, buttons, media. It takes
+    the place of a post Telegram holds back (the live message keeps what Telegram still tells: id, album, reply)."""
+    s = copy.copy(m)
+    s.message = row.text or ""
+    s.entities = de_entities(row.entities)
+    s.reply_markup = build_markup(row.buttons)
+    s.media = None
+    s.saved_ref = None  # the saved media reference (resend_saved may need it again without its file reference)
+    if row.media_file_id:
+        try:
+            s.media = media_from_ref(row.media_file_id)
+            s.saved_ref = row.media_file_id
+        except ValueError:  # a reference that can't be read: the post goes out without media
+            log.warning("the saved media of post %s can't be read", m.id)
+    if s.media is None and row.link_preview:
+        s.media = types.MessageMediaWebPage(webpage=types.WebPageEmpty(id=0))
+    return s
+
+
+def stand_ins(unit: list, rows: dict) -> Optional[list]:
+    """The saved copies that stand in for a held-back post, or None when My posts does not have all of them (or one
+    of them has nothing to post)."""
+    out = []
+    for m in unit:
+        row = rows.get(m.id)
+        if row is None or not ((row.text or "").strip() or row.media_file_id):
+            return None
+        out.append(stand_in(m, row))
+    return out
+
+
+def saved_message(row, channel_id: int):
+    """A post built from its saved copy alone, for a channel that can't be read at all. Only the saved parts exist: no
+    album, no reply, no pin."""
+    base = types.Message(
+        id=row.message_id, peer_id=types.PeerChannel(channel_id), date=row.sent_at or row.created_at, message=""
+    )
+    return stand_in(base, row)
+
+
+def saved_rows_between(rows: list, first: Optional[int], last: Optional[int]) -> list:
+    """The saved posts (oldest first, one per message id) that have something to post, between two message ids."""
+    out, seen = [], set()
+    for row in sorted(rows, key=lambda r: (r.message_id or 0, r.id)):
+        mid = row.message_id
+        if mid is None or mid in seen or (first and mid < first) or (last and mid > last):
+            continue
+        if (row.text or "").strip() or row.media_file_id:
+            seen.add(mid)
+            out.append(row)
+    return out
+
+
+async def saved_units(db, channel_id: int, first: int, last: int) -> AsyncIterator[list]:
+    """The saved posts of a channel between two message ids, oldest first - each one a unit of its own."""
+    for row in saved_rows_between(await db.sent_posts_from(channel_id, first), first, last):
+        yield [saved_message(row, channel_id)]
+
+
 # ------------------------------------------------------------------------------- planning
 @dataclass
 class RepostPlan:
@@ -187,11 +282,63 @@ class RepostPlan:
     post_links: int = 0
     pinned: int = 0  # pinned posts (their copies get pinned)
     replies: int = 0  # posts that answer another post
+    held_saved: int = 0  # posts Telegram holds back that are copied from what My posts saved of them (counted in units)
+    held_skipped: int = 0  # posts Telegram holds back that can't be copied (not counted in units)
+    held_why: Optional[str] = None  # what Telegram says about them
+    channel_restricted: Optional[str] = None  # what Telegram says when it restricts the whole channel
+    from_db: bool = False  # the channel can't be read: the plan (and the copy) is made from My posts alone
+    unreadable: Optional[str] = None  # ... because of this
     partial: bool = False
     error: Optional[str] = None
 
     def eta_seconds(self, delay: float) -> int:
         return int(self.units * (delay + 1.0))
+
+
+def tally(plan: RepostPlan, m, opts: RepostOptions, links: PostLinks) -> None:
+    """Count one message (as it will be copied) into the plan."""
+    plan.messages += 1
+    media = m.media
+    if media is None or isinstance(media, types.MessageMediaWebPage):
+        plan.text += 1
+    elif isinstance(media, (types.MessageMediaPhoto, types.MessageMediaDocument)):
+        plan.media += 1
+    elif isinstance(media, types.MessageMediaPoll):
+        plan.polls += 1
+    else:
+        plan.other += 1
+    f = final_state(m, opts, links)
+    if f.n_buttons or f.n_links or f.n_typed:
+        plan.link_posts += 1
+        plan.n_buttons += f.n_buttons
+        plan.n_links += f.n_links
+        plan.n_typed += f.n_typed
+    if f.dropped:
+        plan.dropped_posts += 1
+    if f.n_post_links:
+        plan.post_link_posts += 1
+        plan.post_links += f.n_post_links
+    if getattr(m, "pinned", False):
+        plan.pinned += 1
+    if reply_parent(m) is not None:
+        plan.replies += 1
+
+
+def plan_from_saved(ch, rows: list, opts: RepostOptions, *, first_id=None, last_id=None, unreadable=None) -> RepostPlan:
+    """The plan of a copy made from My posts alone (the channel can't be read): one post per saved message."""
+    plan = RepostPlan(channel=ch, partial=bool(first_id or last_id), from_db=True, unreadable=unreadable)
+    links = PostLinks.for_channel(ch)
+    chosen = saved_rows_between(rows, first_id, last_id)
+    for row in chosen:
+        plan.units += 1
+        tally(plan, saved_message(row, ch.id), opts, links)
+    if chosen:
+        plan.first, plan.last = chosen[0].message_id, chosen[-1].message_id
+        plan.scanned = plan.last
+    else:
+        plan.first, plan.last = first_id or 1, last_id or 0
+        plan.error = "There is nothing to copy."
+    return plan
 
 
 async def find_last_id(client, peer, top: int) -> Optional[int]:
@@ -217,11 +364,19 @@ async def plan_repost(
     progress: Optional[Callable[[RepostPlan], Awaitable[None]]] = None,
     first_id: Optional[int] = None,
     last_id: Optional[int] = None,
+    saved: Optional[SavedLookup] = None,
+    use_saved: bool = False,
 ) -> RepostPlan:
-    """Read the channel and count what a copy would do. first_id / last_id limit the range (used by /shift)."""
+    """Read the channel and count what a copy would do. first_id / last_id limit the range (used by /shift).
+    `saved` looks up My posts' copies of the channel's posts; with `use_saved` a post Telegram holds back is counted as
+    the saved post it will be copied from (/shift), without it such a post is left out (/repost)."""
     peer = peer_of(ch)
     plan = RepostPlan(channel=ch, partial=bool(opts.last))
-    top = await get_top_id(client, peer)
+    try:
+        top, plan.channel_restricted, _ = await probe_channel(client, peer)
+    except Exception as e:  # the counter is only a help: without it the ids are read until nothing more turns up
+        log.info("could not read channel counter: %s", e)
+        top = None
     first = 1
     if opts.last:
         if top is None:
@@ -246,6 +401,7 @@ async def plan_repost(
             break
         hi = a + CHUNK - 1 if top is None else min(a + CHUNK - 1, top)
         found = False
+        rows = await saved(list(range(a, hi + 1))) if saved else {}
         for m in await fetch_messages(client, peer, list(range(a, hi + 1))):
             if m is None or isinstance(m, types.MessageEmpty):
                 continue
@@ -255,36 +411,23 @@ async def plan_repost(
                 plan.service += 1
                 continue
             gid = getattr(m, "grouped_id", None)
-            if gid is None or gid != prev_gid:
+            new_unit = gid is None or gid != prev_gid
+            row = rows.get(m.id)
+            why = held_back_reason([m], rows)
+            if why:
+                plan.held_why = plan.held_why or why
+                if not (use_saved and stand_ins([m], rows) is not None):
+                    plan.held_skipped += 1 if new_unit else 0  # nothing to copy it from
+                    prev_gid = gid
+                    continue
+                plan.held_saved += 1 if new_unit else 0
+                m = stand_in(m, row)  # counted as the saved post it will be copied from
+            if new_unit:
                 plan.units += 1
                 if gid is not None:
                     plan.albums += 1
             prev_gid = gid
-            plan.messages += 1
-            media = m.media
-            if media is None or isinstance(media, types.MessageMediaWebPage):
-                plan.text += 1
-            elif isinstance(media, (types.MessageMediaPhoto, types.MessageMediaDocument)):
-                plan.media += 1
-            elif isinstance(media, types.MessageMediaPoll):
-                plan.polls += 1
-            else:
-                plan.other += 1
-            f = final_state(m, opts, links)
-            if f.n_buttons or f.n_links or f.n_typed:
-                plan.link_posts += 1
-                plan.n_buttons += f.n_buttons
-                plan.n_links += f.n_links
-                plan.n_typed += f.n_typed
-            if f.dropped:
-                plan.dropped_posts += 1
-            if f.n_post_links:
-                plan.post_link_posts += 1
-                plan.post_links += f.n_post_links
-            if getattr(m, "pinned", False):
-                plan.pinned += 1
-            if reply_parent(m) is not None:
-                plan.replies += 1
+            tally(plan, m, opts, links)
         plan.scanned = hi
         if top is None:
             empty_run = 0 if found else empty_run + 1
@@ -296,6 +439,11 @@ async def plan_repost(
     plan.last = max_seen
     if not plan.units:
         plan.error = "There is nothing to copy."
+        if plan.held_skipped:
+            plan.error = (
+                "Telegram holds back every post in this range (it shows a notice instead of the post) and My posts has "
+                "no saved copy of them, so there is nothing to copy."
+            )
     return plan
 
 
@@ -416,6 +564,8 @@ class _State:
     repaired: int = 0  # new posts whose buttons had to be set again after posting
     replies: int = 0  # new posts created as an answer to the copy of the post the original answered
     reply_lost: int = 0  # answers that could only be copied without the reply
+    from_saved: int = 0  # posts Telegram holds back that were rebuilt from their saved copy in My posts
+    media_lost: list = field(default_factory=list)  # old ids of those that had to go out without their media
 
 
 def is_pure(src, f: Final, reply_to: Optional[int] = None) -> bool:
@@ -424,11 +574,69 @@ def is_pure(src, f: Final, reply_to: Optional[int] = None) -> bool:
     return not f.text_changed and src.reply_markup is None and not reply_to
 
 
+def _has_media(unit: list) -> bool:
+    return any(m.media is not None and not isinstance(m.media, types.MessageMediaWebPage) for m in unit)
+
+
+def _without_reference(unit: list) -> list:
+    """The same saved posts with the file reference of their media left out (it may have expired)."""
+    out = []
+    for m in unit:
+        b = copy.copy(m)
+        if getattr(m, "saved_ref", None):
+            b.media = media_from_ref(m.saved_ref, blank_reference=True)
+        out.append(b)
+    return out
+
+
+async def resend_saved(client, dst_peer, unit: list, finals: list, st: _State, reply_to: Optional[int] = None) -> list:
+    """Create the copies of posts that Telegram holds back, from the saved posts that stand in for them (stand_in).
+    Their media is sent from the saved reference: when Telegram says the reference is out of date it is tried without
+    it, and a single post whose text is saved goes out without its media when Telegram still refuses the file
+    (a file taken down for copyright is refused) - counted in st.media_lost."""
+    failure: Optional[BaseException] = None
+    for attempt in (unit, None):
+        if attempt is None:
+            if failure is None or not _has_media(unit):
+                break
+            attempt = _without_reference(unit)
+        try:
+            return await resend_unit(client, dst_peer, attempt, finals, reply_to)
+        except (TypeError, ValueError, errors.RPCError) as e:
+            if isinstance(e, errors.RPCError) and type(e).__name__ in FATAL:
+                raise
+            failure = failure or e
+            if not _has_media(unit):
+                raise
+    if len(unit) == 1 and (finals[0].text or "").strip():
+        unit[0].media = None  # what goes out now has no media, and neither has its entry in My posts
+        news = await resend_unit(client, dst_peer, unit, finals, reply_to)
+        st.media_lost.append(unit[0].id)
+        return news
+    raise failure  # type: ignore[misc]
+
+
 async def copy_unit(
-    client, peer, unit: list, finals: list, st: _State, reply_to: Optional[int] = None, dst_peer=None
+    client,
+    peer,
+    unit: list,
+    finals: list,
+    st: _State,
+    reply_to: Optional[int] = None,
+    dst_peer=None,
+    *,
+    from_saved: bool = False,
 ) -> list:
-    """Create the copy of one post (or album) at the end of `dst_peer` (default: the same channel `peer`)."""
+    """Create the copy of one post (or album) at the end of `dst_peer` (default: the same channel `peer`).
+    `from_saved`: the posts in `unit` are saved copies standing in for posts Telegram holds back - never forwarded."""
     dst = dst_peer if dst_peer is not None else peer
+    if from_saved:
+        news = await resend_saved(client, dst, unit, finals, st, reply_to)
+        st.rebuilt += 1
+        st.from_saved += 1
+        if reply_to:
+            st.replies += 1
+        return news
     pure = all(is_pure(m, f, reply_to) for m, f in zip(unit, finals))
     if st.mode == "forward" and pure:
         try:
@@ -513,13 +721,23 @@ class RepostResult:
     replies: int = 0  # copies created as an answer to the copy of the post the original answered
     reply_lost: int = 0  # answers that could only be copied without the reply
     reply_dropped: int = 0  # answers to a post that no longer exists (nothing to answer)
+    from_saved: int = 0  # posts Telegram holds back that were copied from their saved copy in My posts
+    media_lost: list = field(default_factory=list)  # ... of which these (old ids) went out without their media
+    held_back: list = field(default_factory=list)  # posts Telegram holds back that were not copied (first old id)
+    held_why: Optional[str] = None  # what Telegram says about them
+    used_saved: bool = False  # the run could take held-back posts from My posts (/shift)
+    from_db: bool = False  # the channel can't be read: every post was copied from My posts alone
     aborted: Optional[str] = None
     stopped: bool = False
     first_new: Optional[int] = None
     last_new: Optional[int] = None
-    phase: str = "copy"  # copy | finish
+    phase: str = "copy"  # copy | finish | profile | links
     final: Optional[FinalizeResult] = None
     final_error: Optional[str] = None
+    cross: Optional[CrossResult] = None  # links to the old posts in ALL connected channels, pointed at the copies
+    cross_error: Optional[str] = None
+    profile: Any = None  # /shift -all: what happened to the name, description and photo (profile_copy.ProfileResult)
+    profile_error: Optional[str] = None
 
 
 def _rows(unit: list, finals: list, news: list) -> list:
@@ -557,6 +775,10 @@ class CopyJob:
     done: set  # old ids that already have a copy
     idmap: dict
     record: Callable[[list], Awaitable[None]]  # saves [{old_id, new_id, post}] (and registers the posts)
+    saved: Optional[SavedLookup] = None  # what My posts saved of the source's posts
+    use_saved: bool = False  # a post Telegram holds back is rebuilt from its saved copy (otherwise it is left out)
+    units: Optional[Callable[[], AsyncIterator[list]]] = None  # where the posts come from (default: read the channel)
+    from_db: bool = False  # `units` are saved posts: they are all rebuilt, none is read from Telegram
 
 
 async def copy_loop(
@@ -572,8 +794,9 @@ async def copy_loop(
     Safe to run again to continue: posts in `job.done` are skipped."""
     src, dst = job.src_peer, job.dst_peer
     seen: set = set()  # old ids read in this run (a reply to one of them needs its copy)
-    res, st, streak = RepostResult(), _State(), 0
-    async for unit in iter_units(client, src, job.first_id, job.last_id):
+    res, st, streak = RepostResult(used_saved=job.use_saved or job.from_db, from_db=job.from_db), _State(), 0
+    units = job.units() if job.units is not None else iter_units(client, src, job.first_id, job.last_id)
+    async for unit in units:
         if should_stop and should_stop():
             res.stopped = True
             break
@@ -582,10 +805,21 @@ async def copy_loop(
         if all(i in job.done for i in ids):
             res.skipped_done += 1
             continue
+        rows = await job.saved(ids) if (job.saved and not job.from_db) else {}
+        why = None if job.from_db else held_back_reason(unit, rows)
+        from_saved = job.from_db  # saved posts already
+        if why:  # Telegram shows a notice instead of this post: the notice must not become the copy
+            res.held_why = res.held_why or why
+            standing = stand_ins(unit, rows) if job.use_saved else None
+            if standing is None:
+                log.info("post %s is held back by Telegram (%s) and has no saved copy to take its place", ids[0], why)
+                res.held_back.append(ids[0])
+                continue
+            unit, from_saved = standing, True
         finals = [final_state(m, job.opts, job.links) for m in unit]
         try:
             reply_to = new_parent(unit[0], job.idmap, seen)
-            news = await copy_unit(client, src, unit, finals, st, reply_to, dst)
+            news = await copy_unit(client, src, unit, finals, st, reply_to, dst, from_saved=from_saved)
             await settle_buttons(client, dst, finals, news, st, pause=settle_pause)
         except Exception as e:  # one bad post must not stop the others
             name = type(e).__name__
@@ -620,6 +854,7 @@ async def copy_loop(
         await asyncio.sleep(delay)
     res.forwarded, res.rebuilt, res.repaired = st.forwarded, st.rebuilt, st.repaired
     res.replies, res.reply_lost = st.replies, st.reply_lost
+    res.from_saved, res.media_lost = st.from_saved, st.media_lost
     return res
 
 
@@ -638,7 +873,8 @@ async def run_repost(
     """Copy the posts of migration `mig` (ids first_id..last_id) in order; safe to run again to continue.
 
     When every post is copied (not stopped, no fatal error) the finishing touches follow: links to posts that were
-    copied later are pointed at their copies, and the copies of pinned posts are pinned."""
+    copied later are pointed at their copies, the copies of pinned posts are pinned, and then every connected channel
+    is searched for links to the old posts (crosslinks.relink_after_repost)."""
     opts = RepostOptions(
         old=mig.old_username, new=mig.new_username, include_typed=mig.include_typed, include_posts=mig.include_posts
     )
@@ -654,6 +890,7 @@ async def run_repost(
         done=await db.migration_done_old_ids(mig.id),
         idmap=idmap,
         record=lambda rows: db.record_repost(mig.id, ch.id, rows, user_id),
+        saved=saved_lookup(db, ch.id),  # a post Telegram holds back is left alone (and so is not deleted)
     )
     res = await copy_loop(client, job, delay=delay, progress=progress, should_stop=should_stop, settle_pause=settle_pause)
     if not res.stopped and not res.aborted:
@@ -667,6 +904,24 @@ async def run_repost(
         except Exception as e:  # the copies are fine; only the finishing touches failed
             log.exception("finishing the repost (links, pins) failed")
             res.final_error = type(e).__name__
+        if not (res.final is not None and res.final.stopped):
+            res.phase = "links"
+            res.cross = CrossResult()
+
+            async def watch(_cross) -> None:
+                if progress:
+                    await progress(res)
+
+            if progress:
+                await progress(res)
+            try:
+                await relink_after_repost(
+                    client, db, ch, mig, delay=delay, settle_pause=settle_pause, progress=watch,
+                    should_stop=should_stop, result=res.cross,
+                )
+            except Exception as e:  # the copies are fine; only the links in the other channels were not updated
+                log.exception("pointing the links of the other channels at the copies failed")
+                res.cross_error = type(e).__name__
     return res
 
 

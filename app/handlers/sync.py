@@ -24,30 +24,32 @@ log = logging.getLogger(__name__)
 USAGE = (
     "Usage: <code>/sync</code>\n"
     "Compares every channel with My posts right now: posts that were deleted or edited in the channel by someone else "
-    "are updated here, new posts that were not made with this bot are added, and service messages (“pinned a "
-    "message”, “channel photo changed” ...) that appeared meanwhile are deleted.\n"
-    "Options: <code>--channel @name</code> (only that channel), <code>--clean</code> (also delete the service messages "
-    "that are already in the channel's history; the helper account, if you set one up, deletes the old ones the bot may not)."
+    "are updated here (a post deleted in the channel leaves My posts), new posts that were not made with this bot are "
+    "added, and service messages (“pinned a message”, “channel photo changed” ...) that appeared meanwhile are deleted. "
+    "The posts that were in a channel before the bot was added are read into My posts too (a long channel takes a few "
+    "checks; <code>/sync</code> goes on where the last one stopped).\n"
+    "Options: <code>--channel @name</code> (only that channel), <code>--history</code> (read the channel's older posts "
+    "again and add the ones that are missing; posts you made the bot forget stay forgotten)."
 )
 
 
 def parse_sync_args(raw: str) -> tuple:
-    """(channel reference or None, clean) - ValueError with a message for anything else."""
+    """(channel reference or None for every channel, read the older posts again) - ValueError for anything else."""
     toks = (raw or "").split()
     ref: Optional[str] = None
-    clean = False
+    history = False
     i = 0
     while i < len(toks):
         t = toks[i]
         if t == "--channel" and i + 1 < len(toks):
             ref = toks[i + 1]
             i += 2
-        elif t == "--clean":
-            clean = True
+        elif t == "--history":
+            history = True
             i += 1
         else:
             raise ValueError(f"I don't know “{t}”.")
-    return ref, clean
+    return ref, history
 
 
 def ids_text(ids, limit: int = 8) -> str:
@@ -60,12 +62,17 @@ def channel_block(rep: SyncReport) -> str:
     lines = [f"<b>{esc(rep.channel.title)}</b>"]
     if rep.error:
         return "\n".join(lines + [f"⚠️ {esc(rep.error)}"])
+    if rep.restricted_channel:
+        return "\n".join(
+            lines
+            + [
+                f"🚫 Telegram has restricted this channel ({esc(rep.restricted_channel)}). Nothing was changed in My posts - "
+                "the saved posts stay exactly as they are, whatever the channel shows now."
+            ]
+        )
     nothing = True
     if rep.first_look:
-        lines.append(
-            "👀 First look at this channel. From now on, posts made, edited or deleted outside this bot are recorded "
-            "here (posts from before are not imported)."
-        )
+        lines.append("👀 First look at this channel. From now on, posts made, edited or deleted outside this bot are recorded here.")
     if rep.checked:
         lines.append(f"✓ {rep.checked} saved post(s) compared with the channel")
     if rep.deleted:
@@ -77,6 +84,26 @@ def channel_block(rep: SyncReport) -> str:
     if rep.adopted:
         nothing = False
         lines.append(f"➕ {len(rep.adopted)} new post(s) made outside the bot → added to My posts (message {ids_text(rep.adopted)})")
+    if rep.history_top:
+        if rep.imported:
+            nothing = False
+        skipped = f" ({rep.history_unsupported} of a kind My posts can't hold - poll, sticker ... - skipped)" if rep.history_unsupported else ""
+        if rep.history_done:
+            if rep.imported:
+                lines.append(f"📥 {rep.imported} older post(s), sent before the bot was added → added to My posts{skipped}")
+            else:
+                lines.append(f"📥 The older posts were looked through: nothing to add{skipped}")
+        else:
+            lines.append(
+                f"📥 Older posts: {rep.imported} added so far, read up to message {rep.history_to} of {rep.history_top}{skipped} - "
+                "the next check goes on, or send /sync again to go on right away"
+            )
+    if rep.restricted:
+        nothing = False
+        lines.append(
+            f"🚫 {len(rep.restricted)} post(s) are held back by Telegram ({esc(rep.restricted_why or 'restricted')}) - "
+            f"left exactly as saved in My posts (message {ids_text(rep.restricted)})"
+        )
     if rep.refreshed:
         lines.append(f"• {rep.refreshed} saved post(s) tidied up (spaces at the ends of the text)")
     if rep.services_deleted:
@@ -111,8 +138,8 @@ def channel_block(rep: SyncReport) -> str:
     return "\n".join(lines)
 
 
-def report_text(reports: list, *, clean: bool = False) -> str:
-    head = "🔄 <b>Sync finished</b>" + (" (with the service-message clean-up)" if clean else "")
+def report_text(reports: list) -> str:
+    head = "🔄 <b>Sync finished</b>"
     if not reports:
         return head + "\nNothing to look at."
     return head + "\n\n" + "\n\n".join(channel_block(r) for r in reports)
@@ -135,7 +162,7 @@ def register(ctx: Ctx) -> None:
     async def h_sync(event):
         raw = (event.pattern_match.group(1) or "").strip()
         try:
-            ref, clean = parse_sync_args(raw)
+            ref, history = parse_sync_args(raw)
             chans = pick_channels(await db.list_channels(), ref)
         except ValueError as e:
             raise UserError(f"{e}\n\n" + re.sub(r"<[^>]+>", "", USAGE))
@@ -144,6 +171,9 @@ def register(ctx: Ctx) -> None:
         if ctx.lock.locked():
             raise UserError("Another long job (replace, repost, shift ...) is still running - try again when it has finished.")
         async with ctx.lock:
+            if history:
+                for ch in chans:
+                    await db.reset_history(ch.id)
             status = await say(event, f"🔄 Looking at {len(chans)} channel(s)…")
             last = [0.0]
 
@@ -157,8 +187,8 @@ def register(ctx: Ctx) -> None:
                 except Exception:
                     pass
 
-            reports = await sy.run_all(chans, explicit=True, clean=clean, progress=prog)
-        await say(event, report_text(reports, clean=clean))
+            reports = await sy.run_all(chans, explicit=True, history=True if history else None, progress=prog)
+        await say(event, report_text(reports))
 
     # ------------------------------------------------------------------- what Telegram tells while we run
     @client.on(events.Raw(types.UpdateNewChannelMessage))

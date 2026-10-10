@@ -1,7 +1,6 @@
-"""The live side of the sync (what Telegram's updates say), the timed check, service-message clean-up and /sync."""
+"""The live side of the sync (what Telegram's updates say), the timed check, service-message deletion and /sync."""
 import asyncio
 import datetime
-from types import SimpleNamespace
 
 from telethon import errors, types
 
@@ -515,51 +514,6 @@ def test_sync_holds_the_long_job_lock_and_refuses_a_second_run(tmp_path):
         gate.set()
         await asyncio.wait_for(first, 5)
         assert seen and all(seen) and not app.ctx.lock.locked()
-        await app.db.close()
-
-    run(go())
-
-
-def test_sync_clean_removes_the_old_notices_from_the_history(tmp_path):
-    async def go():
-        app = await make_app(tmp_path, posts=three())
-        for i in (4, 5, 6):
-            app.tg.msgs[i] = notice(i)
-        app.tg._top = app.tg._pts = 6
-        await app.text("/sync")  # a plain look does not go through the history
-        assert {4, 5, 6} <= set(app.tg.msgs)
-        await app.text("/sync --clean")
-        text = norm(app.out.last_text)
-        assert "service-message clean-up" in text and "3 service message(s) deleted" in text
-        assert sorted(app.tg.msgs) == [1, 2, 3]
-        await app.db.close()
-
-    run(go())
-
-
-def test_sync_clean_asks_the_userbot_for_what_the_bot_may_not_delete(tmp_path):
-    async def go():
-        app = await make_app(tmp_path, posts=three())
-        app.tg.msgs[4] = notice(4)
-        app.tg._top = app.tg._pts = 4
-        app.tg.undeletable.add(4)
-        log = SimpleNamespace(asked=[], closed=0)
-
-        async def delete(ids):
-            log.asked.append(list(ids))
-            app.tg.msgs.pop(4, None)
-
-        async def close():
-            log.closed += 1
-
-        async def fallback_for(ch):
-            return delete, SimpleNamespace(close=close)
-
-        app.ctx.userbot = SimpleNamespace(fallback_for=fallback_for)
-        await app.text("/sync")
-        assert log.asked == [] and 4 in app.tg.msgs  # a plain look never calls the userbot
-        await app.text("/sync --clean")
-        assert log.asked == [[4]] and log.closed == 1 and "1 service message(s) deleted" in norm(app.out.last_text)
         await app.db.close()
 
     run(go())

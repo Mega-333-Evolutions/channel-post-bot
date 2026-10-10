@@ -82,6 +82,7 @@ class Config:
     userbot_keep_admin: bool = False  # keep the userbot an admin after a clean-up (default: take the right away)
     delete_service_messages: bool = True  # remove "channel name changed", "pinned a message", video chat ... notices
     sync_interval_minutes: int = 60  # how often every channel is compared with My posts (0 = never on its own)
+    import_old_posts: bool = True  # read the posts that were in a channel before the bot was added into My posts
 
     def is_owner(self, uid) -> bool:
         return uid in self.owners
@@ -126,4 +127,5 @@ def load_config() -> Config:
         userbot_keep_admin=_bool("USERBOT_KEEP_ADMIN", False),
         delete_service_messages=_bool("DELETE_SERVICE_MESSAGES", True),
         sync_interval_minutes=max(0, _whole("SYNC_INTERVAL_MINUTES", 60)),
+        import_old_posts=_bool("IMPORT_OLD_POSTS", True),
     )

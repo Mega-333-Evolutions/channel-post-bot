@@ -5,6 +5,7 @@ import logging
 
 from telethon import Button, errors
 
+from .. import picker
 from ..buttons import (
     MAX_ROW,
     add_button,
@@ -33,7 +34,7 @@ from ..common import (
 )
 from ..db import utcnow
 from ..repost_engine import delete_batch
-from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link, ser_entities, short
+from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link, ser_entities
 from ..ui import CANCEL, post_label
 from ..userbot import delete_problem_text
 from .panel import (
@@ -55,11 +56,18 @@ def register(ctx: Ctx) -> None:
         return UPDATED if post.status == "sent" else "✅ Saved."
 
     # ------------------------------------------------------------------ lists
-    async def channel_chooser(event) -> None:
+    async def channel_chooser(event, arg: str = "", page: int = 0) -> None:
         chans = await db.list_channels()
-        kb = [[Button.inline(f"📢 {short(c.title, 40)}", f"pc:{c.id}:0")] for c in chans]
-        kb.append([Button.inline("💾 Drafts (all channels)", "pc:d:0")])
-        await show(event, "📚 <b>My posts</b> - pick a channel:", kb)
+        drafts = [[Button.inline("💾 Drafts (all channels)", "pc:d:0")]]
+        if not chans:
+            await show(event, "📚 <b>My posts</b>\n\nNo channels yet. Add one with /addchannel.", drafts)
+            return
+        text, kb = picker.render(
+            chans, page, head="📚 <b>My posts</b> - pick a channel:", kind="ps", choose=lambda c: f"pc:{c.id}:0", extra_rows=drafts
+        )
+        await show(event, text, kb)
+
+    ctx.pickers["ps"] = channel_chooser
 
     @client.on(cmd("posts"))
     @guard(ctx)
@@ -416,5 +424,6 @@ def register(ctx: Ctx) -> None:
                 raise UserError(f"Telegram did not delete that message. {why}\nDelete it by hand in the channel, then use “Only forget it in the bot”.")
         if post.status == "sent" and post.message_id and parts[1] == "b":
             ctx.sync_ignore.add((post.channel_id, post.message_id))  # forgotten on purpose: the sync must not bring it back
+            await db.ignore_post(post.channel_id, post.message_id)  # ... not even after a restart
         await db.delete_post(post.id)
         await show(event, "🗑 Done.", [[Button.inline("📚 My posts", "pl")]])

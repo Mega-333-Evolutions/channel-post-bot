@@ -124,6 +124,14 @@ def test_service_message_and_sync_settings(env):
     assert load_config().delete_service_messages is True
 
 
+def test_the_older_posts_of_a_channel_are_imported_unless_somebody_says_otherwise(env):
+    assert load_config().import_old_posts is True
+    env.setenv("IMPORT_OLD_POSTS", "false")
+    assert load_config().import_old_posts is False
+    env.setenv("IMPORT_OLD_POSTS", "")
+    assert load_config().import_old_posts is True
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [("0", 0), ("-5", 0), ("30", 30), ("2.9", 2), ("  45 ", 45), ("", 60), ("abc", 60), ("inf", 60), ("-inf", 60), ("nan", 60)],
@@ -223,7 +231,8 @@ def test_the_testing_commands_are_gone_everywhere():
     names = [c for c, _ in COMMANDS]
     assert "testedit" not in names and "selftest" not in names
     assert {"new", "posts", "repost", "replace", "undo", "userbot", "help"} <= set(names)
-    assert {"autopost", "broadcast", "handleswap", "fixlinks", "shift", "sync"} <= set(names)
+    assert {"autopost", "broadcast", "handleswap", "shift", "sync", "export", "import"} <= set(names)
+    assert "fixlinks" not in names
     assert "testerror" not in names
     for path in list((ROOT / "app").rglob("*.py")) + [ROOT / "bot.py"]:
         text = path.read_text().lower()
@@ -246,11 +255,11 @@ def test_the_help_text_lists_the_commands_that_exist():
     from app.handlers.basic import HELP
 
     for name in (
-        "new", "posts", "repost", "replace", "undo", "userbot", "export", "addchannel", "channels",
-        "autopost", "broadcast", "handleswap", "fixlinks", "shift", "sync",
+        "new", "posts", "repost", "replace", "undo", "userbot", "export", "import", "addchannel", "channels",
+        "autopost", "broadcast", "handleswap", "shift", "sync",
     ):
         assert f"/{name}" in HELP, name
-    assert "--channel" not in HELP and "/testerror" not in HELP
+    assert "--channel" not in HELP and "/testerror" not in HELP and "/fixlinks" not in HELP and "--clean" not in HELP
 
 
 # ------------------------------------------------------------------------------------------ health port

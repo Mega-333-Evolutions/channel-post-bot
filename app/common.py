@@ -32,6 +32,7 @@ class Ctx:
     seen_channels: dict = field(default_factory=dict)  # channel id -> Channel entity seen in updates
     text_handlers: dict = field(default_factory=dict)  # mode -> async fn(event, state)
     callbacks: dict = field(default_factory=dict)  # prefix -> async fn(event, parts)
+    pickers: dict = field(default_factory=dict)  # channel chooser kind -> async fn(event, arg, page) that draws it again
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one long job (replace / repost) at a time
     userbot: Any = None  # app.userbot.Userbot or None
     reporter: Any = None  # app.errorlog.ErrorReporter or None

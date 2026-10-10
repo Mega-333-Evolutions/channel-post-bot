@@ -5,6 +5,7 @@ import logging
 
 from telethon import Button
 
+from .. import picker
 from ..buttons import norm_url, parse_buttons_text, set_field
 from ..common import Ctx, UserError, clear_state, cmd, discard_temp, guard, on_cb, on_text, say, set_state, show
 from ..suggest import make_suggestion
@@ -82,8 +83,18 @@ def register(ctx: Ctx) -> None:
         if len(chans) == 1:
             await start_for_channel(event, chans[0].id)
             return
-        kb = [[Button.inline(f"📢 {short(c.title, 40)}", f"nc:{c.id}")] for c in chans] + CANCEL
-        await say(event, "Which channel is this post for?", kb)
+        await show_picker(event, "", 0)
+
+    async def show_picker(event, arg: str, page: int) -> None:
+        chans = await db.list_channels()
+        if not chans:
+            raise UserError("No channels yet. Register one with /addchannel first.")
+        text, kb = picker.render(
+            chans, page, head="📢 <b>Which channel is this post for?</b>", kind="nc", choose=lambda c: f"nc:{c.id}", extra_rows=CANCEL
+        )
+        await show(event, text, kb)
+
+    ctx.pickers["nc"] = show_picker
 
     @on_cb(ctx, "nc")
     async def cb_channel(event, parts):

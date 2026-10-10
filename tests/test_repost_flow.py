@@ -70,16 +70,18 @@ def test_the_old_channel_option_is_explained_not_obeyed(tmp_path):
     asyncio.run(run())
 
 
-def test_connected_channels_are_offered_as_buttons(tmp_path):
+def test_connected_channels_are_offered_as_a_numbered_list(tmp_path):
     async def run():
         app = await make_app(tmp_path)
         await app.db.save_channel(2, 6, "Second channel", None, 1)
         await app.text(f"/repost @{OLD} @{NEW}")
         text = norm(app.out.last_text)
         assert "Which channel" in text and f"@{OLD}" in text and f"@{NEW}" in text
-        labels = [row[0] for row in app.out.last_buttons()]
-        assert labels == ["📢 Second channel", "📢 Test", "✖️ Cancel"]  # by title, like /channels
-        assert app.out.callback_data("Second").startswith("rpch:")
+        assert "1. Second channel" in text and "2. Test" in text  # the names are in the message, A to Z
+        assert app.out.last_buttons() == [["1", "2"], ["✖️ Cancel"]]  # the buttons only carry the numbers
+        first, second = app.out.callback_exact("1"), app.out.callback_exact("2")
+        assert first.startswith("rpch:") and first.endswith(":2")  # number 1 is "Second channel", channel 2
+        assert second.startswith("rpch:") and second.endswith(":1")
         assert app.tg.requests == []  # choosing is free: nothing is read before a button is pressed
         await app.db.close()
 

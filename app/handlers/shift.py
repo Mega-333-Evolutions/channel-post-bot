@@ -12,11 +12,13 @@ from telethon import Button, errors
 
 from ..channelref import ChannelRef, resolve_channel
 from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say
-from ..repost_engine import RepostOptions, RepostPlan, plan_repost
-from ..shift_engine import delete_shift_copies, run_shift
+from ..crosslinks import CrossResult, progress_text, relink_after_shift, report_lines, restore_after_shift_undo
+from ..profile_copy import profile_lines
+from ..repost_engine import RepostOptions, RepostPlan, RepostResult, plan_repost, saved_lookup
+from ..shift_engine import delete_shift_copies, plan_from_my_posts, run_shift, shift_profile, source_of
 from ..tgutil import esc, explain_rpc, get_rights, post_link
 from ..userbot import delete_problem_text
-from .repost import finishing_notes
+from .repost import finishing_notes, held_plan_lines
 
 log = logging.getLogger(__name__)
 
@@ -28,8 +30,24 @@ USAGE = (
     "(the bot must be a member). The bot must be an admin of the destination (Post messages).\n\n"
     "<code>/shift @source @destination</code> - every post\n"
     "<code>/shift @source @destination 15 20</code> - only the posts with message ids 15 to 20\n"
-    "<code>/shift @source @destination 15</code> - only post 15"
+    "<code>/shift @source @destination 15</code> - only post 15\n\n"
+    "A post that Telegram holds back in the source (a copyright strike: it shows “This message couldn't be displayed on "
+    "your device due to copyright infringement” instead of the post) is copied from what My posts saved of it. A post "
+    "without a saved copy is skipped.\n\n"
+    "Two extras, each optional, in any order, with or without a range:\n"
+    "<code>-c</code> - afterwards every link to a post of the source - in ANY of your connected channels - is pointed "
+    "at the copy in the destination\n"
+    "<code>-all</code> - afterwards the destination gets the source's name, description and profile photo\n"
+    "<code>/shift @source @destination -c -all</code> does both."
 )
+
+
+@dataclass
+class ShiftFlags:
+    """The two optional extras of /shift."""
+
+    links: bool = False  # -c: links to the source's posts, in all connected channels, follow the copies
+    profile: bool = False  # -all: the destination gets the source's name, description and profile photo
 
 
 @dataclass
@@ -41,15 +59,33 @@ class ShiftJob:
     dst: ChannelRef
     plan: RepostPlan
     already: int = 0  # posts of the range that an earlier shift copied into this destination
+    flags: ShiftFlags = field(default_factory=ShiftFlags)
     running: bool = False
     stop: bool = False
     shift_id: str = ""
     created: float = field(default_factory=time.monotonic)
 
 
+_OPTION = re.compile(r"^-{1,2}([A-Za-z][A-Za-z0-9_]*)$")
+
+
 def parse_shift_args(raw: str) -> tuple:
-    """-> (source text, destination text, first id or None, last id or None)"""
-    toks = (raw or "").split()
+    """-> (source text, destination text, first id or None, last id or None, ShiftFlags).
+
+    -c and -all can stand anywhere, in any order ("- all" with a space is understood too); a channel id such as
+    -1001234567890 is not an option."""
+    text = re.sub(r"(?<!\S)(-{1,2})\s+(all|c)(?!\S)", r"\1\2", raw or "", flags=re.I)
+    flags, toks = ShiftFlags(), []
+    for t in text.split():
+        m = _OPTION.match(t)
+        if m is None:
+            toks.append(t)
+        elif m.group(1).lower() == "c":
+            flags.links = True
+        elif m.group(1).lower() == "all":
+            flags.profile = True
+        else:
+            raise ValueError(f"Unknown option {t}. The options are -c and -all.")
     if len(toks) < 2 or len(toks) > 4:
         raise ValueError("Give the source and the destination channel, and optionally the first and the last message id.")
     nums: list = []
@@ -62,10 +98,13 @@ def parse_shift_args(raw: str) -> tuple:
         first = last = nums[0]
     elif len(nums) == 2:
         first, last = min(nums), max(nums)
-    return toks[0], toks[1], first, last
+    return toks[0], toks[1], first, last, flags
 
 
-def plan_text(p: RepostPlan, src: ChannelRef, dst: ChannelRef, already: int, delay: float) -> str:
+def plan_text(
+    p: RepostPlan, src: ChannelRef, dst: ChannelRef, already: int, delay: float, flags: Optional[ShiftFlags] = None,
+    others: int = 0, info_right: bool = True,
+) -> str:
     kinds = f"{p.text} text, {p.media} media"
     if p.polls:
         kinds += f", {p.polls} poll(s)"
@@ -82,6 +121,7 @@ def plan_text(p: RepostPlan, src: ChannelRef, dst: ChannelRef, already: int, del
         lines.append("• polls are copied without their votes")
     if p.dropped_posts:
         lines.append(f"• {p.dropped_posts} post(s) carry other bots' buttons (reactions...) - those are not copied")
+    lines += held_plan_lines(p, src.title, shift=True)
     if p.post_links:
         lines.append(
             f"• {p.post_links} link(s) in {p.post_link_posts} post(s) point at other posts of {esc(src.title)}: those that "
@@ -93,15 +133,53 @@ def plan_text(p: RepostPlan, src: ChannelRef, dst: ChannelRef, already: int, del
         lines.append(
             f"• ⚠️ {already} of these posts were already shifted into {esc(dst.title)} before: they would be copied again"
         )
+    flags = flags or ShiftFlags()
+    if p.from_db:
+        lines.insert(
+            2,
+            f"⚠️ <b>I can't read {esc(src.title)}</b>: {esc(p.unreadable or 'Telegram refuses')}. My posts has the saved "
+            "posts of it, so they are copied from there.",
+        )
+    if flags.links:
+        where = f"your {others} other connected channel(s)" if others else "your connected channels"
+        lines.append(
+            f"• 🔗 <b>-c</b>: afterwards every link to a post of {esc(src.title)} - a hyperlink, a typed link or a "
+            f"button - in {where} is pointed at the copy in {esc(dst.title)} (links to posts that are not shifted stay "
+            f"as they are). {esc(src.title)} itself is not changed."
+        )
+    if flags.profile:
+        lines.append(
+            f"• 🖼 <b>-all</b>: afterwards {esc(dst.title)} gets the name, description and profile photo of "
+            f"{esc(src.title)}. Its own are replaced - undo does not bring them back. A part the source does not have "
+            "is left as it is."
+        )
+        if not info_right:
+            lines.append(
+                f"• ⚠️ The bot does not have the “Change channel info” admin right in {esc(dst.title)} yet - give it "
+                "before the copying is finished, or use the “copy again” button afterwards."
+            )
     minutes = max(1, round(p.eta_seconds(delay) / 60))
+    if p.from_db:
+        how = (
+            "<b>How:</b> every post is posted again from what My posts saved of it - its text, formatting, buttons and "
+            "media (a file that Telegram refuses goes out without it) - and every button is read back to make sure it "
+            "is there. Copies go to the end of the destination silently, in the original order, and are registered in "
+            "My posts."
+        )
+        kept = "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes, pins, replies and albums (every picture of an album becomes a post of its own)."
+    else:
+        how = (
+            "<b>How:</b> posts are copied by Telegram itself where possible (exactly as they are); posts with buttons or "
+            "replies are posted again with their text, formatting, media and buttons in one go, and every button is read "
+            "back to make sure it is there. Copies go to the end of the destination silently, in the original order, and "
+            "are registered in My posts."
+        )
+        kept = "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes and pins."
     lines += [
         "",
-        "<b>How:</b> posts are copied by Telegram itself where possible (exactly as they are); posts with buttons or "
-        "replies are posted again with their text, formatting, media and buttons in one go, and every button is read "
-        "back to make sure it is there. Copies go to the end of the destination silently, in the original order, and "
-        "are registered in My posts.",
+        how,
         "",
-        "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes and pins.",
+        kept,
         f"Time: about {minutes} min. <b>Nothing is changed in {esc(src.title)}.</b>",
     ]
     return "\n".join(lines)
@@ -122,13 +200,19 @@ def register(ctx: Ctx) -> None:
         if dst and c["first_new"]:
             first_copy = f'\n<a href="{post_link(dst, c["first_new"])}">First copy</a>'
         undo = [Button.inline("↩️ Undo - remove the copies", f"sfu:{sh.id}")]
+        marks = await db.marks_of(sh.id)
+        extras = []
+        if "relink" in marks:
+            extras.append([Button.inline("🔗 Update links again", f"sfl:{sh.id}")])
+        if "profile" in marks and "profile_done" not in marks:
+            extras.append([Button.inline("🖼 Copy name, description, photo again", f"sfp:{sh.id}")])
         if sh.status == "copied":
             text = (
                 f"✅ {route}: <b>{c['copied']} message(s) copied</b> (source ids {sh.first_id}-{sh.last_id}) and "
                 f"registered in My posts.{first_copy}\nThe source was not changed. Look at the end of the destination; "
                 "if something is wrong, undo removes just these copies."
             )
-            kb = [undo]
+            kb = extras + [undo]
         elif sh.status == "copies_deleted":
             text = f"↩️ {route}: the copies were removed again."
             kb = []
@@ -161,7 +245,7 @@ def register(ctx: Ctx) -> None:
                 await say(event, USAGE)
             return
         try:
-            src_text, dst_text, first, last = parse_shift_args(raw)
+            src_text, dst_text, first, last, flags = parse_shift_args(raw)
         except ValueError as e:
             raise UserError(f"{e}\n\n" + re.sub(r"<[^>]+>", "", USAGE).replace("&lt;", "<").replace("&gt;", ">"))
         src = await resolve_channel(ctx, src_text)
@@ -192,20 +276,32 @@ def register(ctx: Ctx) -> None:
 
         try:
             async with ctx.lock:
-                plan = await plan_repost(client, src, RepostOptions(), progress=prog, first_id=first, last_id=last)
+                plan = await plan_repost(
+                    client, src, RepostOptions(), progress=prog, first_id=first, last_id=last,
+                    saved=saved_lookup(db, src.id), use_saved=True,
+                )
         except errors.RPCError as e:
-            raise UserError(
-                f"I can't read {src.title}: {explain_rpc(e)}\nThe bot has to be a member of the source channel "
-                "(an admin is best; it only reads)."
-            )
+            why = explain_rpc(e)
+            # a channel that can't be read any more (banned, private ...) may still be in My posts: copy it from there
+            plan = await plan_from_my_posts(db, src, first, last, unreadable=why)
+            if plan is None:
+                raise UserError(
+                    f"I can't read {src.title}: {why}\nThe bot has to be a member of the source channel "
+                    "(an admin is best; it only reads). My posts has no saved posts of it to copy from instead."
+                )
         if plan.error:
             await note.edit(f"⚠️ {esc(plan.error)}")
             return
         already = len(await db.shifted_ids(src.id, dst.id, plan.first, plan.last))
+        others = 0
+        if flags.links:  # the channels the links are looked for in: all connected ones, the source itself excluded
+            known = {c.id for c in await db.list_channels()} | {dst.id}
+            others = len(known - {src.id})
+        info_right = rights is None or bool(getattr(rights, "change_info", True))
         token = secrets.token_hex(4)
-        ctx.pending[token] = ShiftJob(user=event.sender_id, src=src, dst=dst, plan=plan, already=already)
+        ctx.pending[token] = ShiftJob(user=event.sender_id, src=src, dst=dst, plan=plan, already=already, flags=flags)
         kb = [[Button.inline("▶️ Start copying", f"sfa:{token}"), Button.inline("✖️ Cancel", f"sfn:{token}")]]
-        await note.edit(plan_text(plan, src, dst, already, cfg.edit_delay), buttons=kb)
+        await note.edit(plan_text(plan, src, dst, already, cfg.edit_delay, flags, others, info_right), buttons=kb)
 
     @on_cb(ctx, "sfn")
     async def cb_cancel(event, parts):
@@ -227,12 +323,16 @@ def register(ctx: Ctx) -> None:
         names = f"<b>{esc(sh.src_title)}</b> → <b>{esc(dst.title)}</b>"
 
         async def prog(res):
-            if res.phase == "copy" and time.monotonic() - last[0] < 4:
+            if res.phase in ("copy", "links") and time.monotonic() - last[0] < 4:
                 return
             last[0] = time.monotonic()
             done = res.copied_units + res.skipped_done
             of = f"/{total}" if total else ""
-            if res.phase == "finish":
+            if res.phase == "links" and res.cross is not None:
+                body = f"✅ Copied {done}{of} posts.\n" + progress_text(res.cross, title="Pointing links of your channels at the copies")
+            elif res.phase == "profile":
+                body = f"🖼 Copied {done}{of} posts. Now copying the name, description and photo of {esc(sh.src_title)}…"
+            elif res.phase == "finish":
                 body = f"🔗 Copied {done}{of} posts. Now pointing links at the new copies…"
             else:
                 body = f"⏳ Shifting {names}: {done}{of} posts…\nThe source stays untouched."
@@ -251,7 +351,7 @@ def register(ctx: Ctx) -> None:
                 )
         finally:
             job.running = False
-        status = "stopped" if res.stopped else ("incomplete" if (res.failed or res.aborted) else "copied")
+        status = "stopped" if res.stopped else ("incomplete" if (res.failed or res.aborted or res.held_back) else "copied")
         await db.set_shift_status(sid, status)
         sh = await db.get_shift(sid)
         text, kb = await view_for(sh)
@@ -293,6 +393,12 @@ def register(ctx: Ctx) -> None:
         sid = secrets.token_hex(6)
         p = job.plan
         await db.create_shift(sid, src=job.src, dst_channel_id=job.dst.id, first_id=p.first, last_id=p.last, user_id=event.sender_id)
+        if job.flags.links:
+            await db.set_mark(sid, "relink")
+        if job.flags.profile:
+            await db.set_mark(sid, "profile")
+        if p.from_db:  # the source can't be read: continuing the shift goes on from My posts as well
+            await db.set_mark(sid, "fromdb")
         ctx.pending.pop(parts[0], None)
         await run_copy(event, sid, job)
 
@@ -312,9 +418,80 @@ def register(ctx: Ctx) -> None:
         job = ctx.pending.get(f"job:{parts[0]}")
         if isinstance(job, ShiftJob) and job.running:
             job.stop = True
-            await event.respond("⏹ Stopping after the post that is being copied…")
+            await event.respond("⏹ Stopping after the post that is being worked on…")
         else:
             await event.respond("Nothing is running.")
+
+    # ------------------------------------------------------------ the extras again
+    @on_cb(ctx, "sfl")
+    async def cb_links(event, parts):
+        """-c once more: look through every connected channel for links to the source's posts."""
+        require_owner(ctx, event)
+        sh, dst = await load(parts)
+        if sh.status != "copied":
+            raise UserError("Links can be updated once everything is copied.")
+        if ctx.lock.locked():
+            raise UserError("A long job is already running.")
+        job = ShiftJob(user=event.sender_id, src=None, dst=None, plan=None, running=True, shift_id=sh.id)  # type: ignore[arg-type]
+        ctx.pending[f"job:{sh.id}"] = job
+        cross, last = CrossResult(), [0.0]
+
+        async def prog(c):
+            if time.monotonic() - last[0] < 4:
+                return
+            last[0] = time.monotonic()
+            try:
+                await edit_callback_message(
+                    event, progress_text(c, title="Pointing links at the copies"), [[Button.inline("⏹ Stop", f"sfs:{sh.id}")]]
+                )
+            except errors.MessageNotModifiedError:
+                pass
+            except Exception:
+                log.debug("progress update failed", exc_info=True)
+
+        error = None
+        try:
+            async with ctx.lock:
+                await edit_callback_message(event, "🔗 Looking for links to the source's posts in your channels…")
+                await relink_after_shift(
+                    client, db, sh, source_of(sh), dst, delay=cfg.edit_delay, progress=prog,
+                    should_stop=lambda: job.stop, result=cross,
+                )
+        except Exception as e:  # the copies are fine; only the links were not (all) updated
+            log.exception("pointing the links at the shifted posts failed")
+            error = type(e).__name__
+        finally:
+            job.running = False
+            ctx.pending.pop(f"job:{sh.id}", None)
+        notes = report_lines(cross, what=f"the copies in {esc(dst.title)}")
+        if error:
+            notes.append(f"Links could not be updated ({esc(error)}).")
+        if not notes:
+            notes.append("🔗 There is nothing to change.")
+        text, kb = await view_for(sh)
+        await edit_callback_message(event, text + "\n\n" + "\n".join(notes), kb)
+
+    @on_cb(ctx, "sfp")
+    async def cb_profile(event, parts):
+        """-all once more: the name, description and photo of the source."""
+        require_owner(ctx, event)
+        sh, dst = await load(parts)
+        if "profile" not in await db.marks_of(sh.id):
+            raise UserError("This shift was not started with -all.")
+        if sh.status not in ("copied", "stopped", "incomplete"):
+            raise UserError("There is nothing to copy it to any more.")
+        if ctx.lock.locked():
+            raise UserError("A long job is already running.")
+        holder = RepostResult()
+        async with ctx.lock:
+            await edit_callback_message(event, f"🖼 Copying the name, description and photo of {esc(sh.src_title)}…")
+            await shift_profile(client, db, sh, dst, event.sender_id, holder)
+        dst = await db.get_channel(sh.dst_channel_id) or dst  # it may have a new name now
+        notes = profile_lines(holder.profile, dst.title) if holder.profile is not None else []
+        if holder.profile_error:
+            notes.append(f"The name, description and photo could not be copied ({esc(holder.profile_error)}).")
+        text, kb = await view_for(sh)
+        await edit_callback_message(event, text + "\n\n" + "\n".join(notes), kb)
 
     # ------------------------------------------------------------------ undo
     async def load(parts):
@@ -353,22 +530,41 @@ def register(ctx: Ctx) -> None:
         if ctx.lock.locked():
             raise UserError("A long job is already running.")
         fallback, deleter = await ctx.userbot.fallback_for(dst) if ctx.userbot is not None else (None, None)
+        back, last = CrossResult(), [0.0]
+
+        async def prog(c):
+            if time.monotonic() - last[0] < 4:
+                return
+            last[0] = time.monotonic()
+            try:
+                await edit_callback_message(event, progress_text(c, title="Pointing links back at the source's posts"))
+            except Exception:
+                log.debug("progress update failed", exc_info=True)
+
         try:
             async with ctx.lock:
+                try:  # links that were pointed at the copies would be left without a post: point them back first
+                    await restore_after_shift_undo(client, db, sh, source_of(sh), dst, delay=cfg.edit_delay, progress=prog, result=back)
+                except Exception:
+                    log.exception("pointing the links back at the source's posts failed")
+                    back.stopped = True
                 res = await delete_shift_copies(client, db, dst, sh, delay=0.5, fallback=fallback)
         finally:
             if deleter is not None:
                 await deleter.close()
+        link_notes = report_lines(back, back=True)
+        link_text = ("\n" + "\n".join(link_notes)) if link_notes else ""
         if res.remaining == 0 and not res.error:
             await db.set_shift_status(sh.id, "copies_deleted")
             await edit_callback_message(
-                event, f"↩️ Done. {res.deleted} copied message(s) removed from {esc(dst.title)}; the source was not touched."
+                event,
+                f"↩️ Done. {res.deleted} copied message(s) removed from {esc(dst.title)}; the source was not touched.{link_text}",
             )
         else:
             why = esc(delete_problem_text(ctx.userbot, bot_error=res.error, fallback_error=res.fallback_error, tried=res.tried_userbot))
             await edit_callback_message(
                 event,
-                f"⚠️ Removed {res.deleted}, {res.remaining} copy/copies are still there. {why}",
+                f"⚠️ Removed {res.deleted}, {res.remaining} copy/copies are still there. {why}{link_text}",
                 [[Button.inline("🔁 Try again", f"sfuy:{sh.id}")]],
             )
 

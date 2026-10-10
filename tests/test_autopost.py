@@ -99,7 +99,7 @@ def test_the_whole_autopost_flow(tmp_path):
         await app.text("/autopost 114 20")
         shown = norm(app.out.last_text)
         assert "6 post(s)" in shown and "01–20 · 21–40 · 41–60 · 61–80 · 81–100 · 101–114" in shown
-        assert "Which channel" in shown and "Anime Channel" in str(app.out.last_buttons())
+        assert "Which channel" in shown and "1. Anime Channel" in shown and app.out.last_buttons()[0] == ["1"]
 
         await app.press(app.out.callback_data("Anime Channel"))
         posted = [e for e in app.tg.sent if e[0] == "text" and e[1].channel_id == 1]

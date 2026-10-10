@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from telethon import Button, errors
 
+from .. import picker
 from ..autopost import (
     MAX_POSTS,
     PLACEHOLDER_LINK,
@@ -36,9 +37,10 @@ from ..common import (
     purge_pending,
     say,
     send_post,
+    show,
 )
 from ..db import utcnow
-from ..tgutil import esc, explain_rpc, flood_retry, get_rights, peer_of, short
+from ..tgutil import esc, explain_rpc, flood_retry, get_rights, peer_of
 from .masslinks import begin_queue
 
 log = logging.getLogger(__name__)
@@ -123,19 +125,36 @@ def register(ctx: Ctx) -> None:
         clear_state(ctx, uid)
         token = secrets.token_hex(4)
         ctx.pending[token] = AutoChoice(user=uid, total=total, interval=interval, ranges=ranges)
-        first = ranges[0]
-        kb = [[Button.inline(f"📢 {short(c.title, 40)}", f"apc:{token}:{c.id}")] for c in chans]
-        kb.append([Button.inline("✖️ Cancel", f"apx:{token}")])
-        await say(
-            event,
-            f"📋 <b>Autopost</b>: {len(ranges)} post(s) for {total} episodes (every {interval})\n"
-            f"{ranges_summary(ranges)}\n\n"
+        await show_picker(event, token, 0)
+
+    async def show_picker(event, token: str, page: int) -> None:
+        choice = ctx.pending.get(token)
+        if not isinstance(choice, AutoChoice) or choice.user != event.sender_id:
+            raise UserError("That list has expired. Run /autopost again.")
+        chans = await db.list_channels()
+        if not chans:
+            raise UserError("No channels yet. Register one with /addchannel first.")
+        first = choice.ranges[0]
+        head = (
+            f"📋 <b>Autopost</b>: {len(choice.ranges)} post(s) for {choice.total} episodes (every {choice.interval})\n"
+            f"{ranges_summary(choice.ranges)}\n\n"
             f"Each post says “{esc(title_of(*first))}” with the button “{esc(button_label(*first))}”. The buttons get "
             f"the link {esc(PLACEHOLDER_LINK)} for now; when everything is posted I ask you for the real link of "
             "each button, one after the other.\n\n"
-            "📢 <b>Which channel should I post them in?</b>",
-            kb,
+            "📢 <b>Which channel should I post them in?</b>"
         )
+        text, kb = picker.render(
+            chans,
+            page,
+            head=head,
+            kind="ap",
+            arg=token,
+            choose=lambda c: f"apc:{token}:{c.id}",
+            extra_rows=[[Button.inline("✖️ Cancel", f"apx:{token}")]],
+        )
+        await show(event, text, kb)
+
+    ctx.pickers["ap"] = show_picker
 
     @on_cb(ctx, "apc")
     async def cb_pick(event, parts):

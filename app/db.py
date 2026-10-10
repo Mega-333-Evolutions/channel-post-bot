@@ -194,6 +194,43 @@ class ChannelSync(Base):
     last_deep: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # last look at every id
 
 
+class ChannelHistory(Base):
+    """How far the older posts of a channel (the ones sent before the bot was there) have been read into My posts."""
+
+    __tablename__ = "channel_history"
+
+    channel_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    top: Mapped[int] = mapped_column(BigInteger, default=0)  # the newest message id that counts as "older"
+    next_id: Mapped[int] = mapped_column(BigInteger, default=1)  # where the reading goes on
+    imported: Mapped[int] = mapped_column(Integer, default=0)  # older posts added to My posts so far
+    done: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class IgnoredPost(Base):
+    """A post the owner made the bot forget: it stays in the channel, but the sync never takes it over again."""
+
+    __tablename__ = "ignored_posts"
+    __table_args__ = (UniqueConstraint("channel_id", "message_id", name="uq_ignored_channel_msg"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class JobMark(Base):
+    """A fact about a /repost or /shift run that has to outlive a restart, e.g. that links in other channels were
+    pointed at its copies (so that Undo points them back), or which extras a shift was asked for."""
+
+    __tablename__ = "job_marks"
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    mark: Mapped[str] = mapped_column(String(24), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """A datetime from the database as an aware UTC one (SQLite hands back naive values)."""
     if dt is None:
@@ -399,15 +436,19 @@ class Database:
             return (await s.execute(q)).scalar_one_or_none()
 
     async def forget_posts(self, channel_id: int, message_ids: list) -> int:
-        """Remove the saved posts of these channel messages (they were deleted in the channel)."""
+        """Remove the saved posts of these channel messages (they were deleted in the channel) and what hangs on them:
+        a timed deletion that is not needed any more, a "forgotten on purpose" mark. Returns how many posts went."""
         if not message_ids:
             return 0
+        ids = list(message_ids)
         async with self.Session() as s:
-            rows = (
-                await s.execute(select(Post).where(Post.channel_id == channel_id, Post.message_id.in_(list(message_ids))))
-            ).scalars().all()
+            rows = (await s.execute(select(Post).where(Post.channel_id == channel_id, Post.message_id.in_(ids)))).scalars().all()
             for p in rows:
                 await s.delete(p)
+            for model in (ScheduledDelete, IgnoredPost):
+                extra = await s.execute(select(model).where(model.channel_id == channel_id, model.message_id.in_(ids)))
+                for r in extra.scalars().all():
+                    await s.delete(r)
             await s.commit()
             return len(rows)
 
@@ -486,6 +527,117 @@ class Database:
                 await s.rollback()
                 return None, False
             return p, True
+
+    async def adopt_many(self, channel_id: int, items: list) -> list:
+        """items: [(message id, post fields, sent_at)] - save the posts somebody else made, many at once. Returns the
+        message ids that were new (the bot already had a post at the others)."""
+        if not items:
+            return []
+        ids = [i[0] for i in items]
+        async with self.Session() as s:
+            have = set(
+                (await s.execute(select(Post.message_id).where(Post.channel_id == channel_id, Post.message_id.in_(ids)))).scalars()
+            )
+            fresh = [i for i in items if i[0] not in have]
+            if not fresh:
+                return []
+            s.add_all(
+                [
+                    Post(channel_id=channel_id, message_id=mid, status="sent", source="adopted", created_by=0,
+                         sent_at=at or utcnow(), **fields)
+                    for mid, fields, at in fresh
+                ]
+            )
+            try:
+                await s.commit()
+                return [i[0] for i in fresh]
+            except IntegrityError:  # somebody saved one of them a moment ago: one by one then
+                await s.rollback()
+        made = []
+        for mid, fields, at in fresh:
+            _, created = await self.adopt_message(channel_id, mid, fields, sent_at=at)
+            if created:
+                made.append(mid)
+        return made
+
+    # ------------------------------------------------------------- the channel's older posts
+    async def get_history(self, channel_id: int) -> Optional[ChannelHistory]:
+        async with self.Session() as s:
+            return await s.get(ChannelHistory, channel_id)
+
+    async def start_history(self, channel_id: int, top: int) -> ChannelHistory:
+        """Note that the older posts of a channel (message ids 1 to `top`) are to be read in. Does nothing when that
+        has begun already."""
+        async with self.Session() as s:
+            row = await s.get(ChannelHistory, channel_id)
+            if row is not None:
+                return row
+            row = ChannelHistory(channel_id=channel_id, top=max(0, top), next_id=1, imported=0)
+            if top < 1:  # an empty channel: nothing to read
+                row.done, row.finished_at = True, utcnow()
+            s.add(row)
+            try:
+                await s.commit()
+            except IntegrityError:
+                await s.rollback()
+                row = await s.get(ChannelHistory, channel_id)
+            return row
+
+    async def save_history(self, channel_id: int, *, next_id: int, imported: int = 0, done: bool = False) -> None:
+        async with self.Session() as s:
+            row = await s.get(ChannelHistory, channel_id)
+            if row is None:
+                return
+            row.next_id = max(row.next_id, next_id)
+            row.imported += imported
+            if done and not row.done:
+                row.done, row.finished_at = True, utcnow()
+            await s.commit()
+
+    async def reset_history(self, channel_id: int) -> None:
+        """Read the channel's older posts again at the next look (the posts the bot already has are skipped)."""
+        async with self.Session() as s:
+            row = await s.get(ChannelHistory, channel_id)
+            if row is not None:
+                await s.delete(row)
+                await s.commit()
+
+    # ------------------------------------------------------------ posts forgotten on purpose
+    async def ignore_post(self, channel_id: int, message_id: int) -> None:
+        async with self.Session() as s:
+            q = select(IgnoredPost).where(IgnoredPost.channel_id == channel_id, IgnoredPost.message_id == message_id)
+            if (await s.execute(q)).scalar_one_or_none() is not None:
+                return
+            s.add(IgnoredPost(channel_id=channel_id, message_id=message_id))
+            try:
+                await s.commit()
+            except IntegrityError:
+                await s.rollback()
+
+    async def ignored_ids(self, channel_id: int) -> set:
+        async with self.Session() as s:
+            q = select(IgnoredPost.message_id).where(IgnoredPost.channel_id == channel_id)
+            return {int(r) for r in (await s.execute(q)).scalars()}
+
+    # ------------------------------------------------------------ facts about a repost / shift run
+    async def set_mark(self, job_id: str, mark: str) -> None:
+        async with self.Session() as s:
+            if await s.get(JobMark, (job_id, mark)) is not None:
+                return
+            s.add(JobMark(job_id=job_id, mark=mark))
+            try:
+                await s.commit()
+            except IntegrityError:
+                await s.rollback()
+
+    async def has_mark(self, job_id: str, mark: str) -> bool:
+        async with self.Session() as s:
+            return await s.get(JobMark, (job_id, mark)) is not None
+
+    async def marks_of(self, job_id: str) -> set:
+        async with self.Session() as s:
+            q = select(JobMark.mark).where(JobMark.job_id == job_id)
+            return set((await s.execute(q)).scalars())
 
     async def sync_update_post(self, pid: int, expected: Optional[datetime], fields: dict) -> bool:
         """Save what the channel shows - but only if the saved post is still exactly as it was when it was read
@@ -688,12 +840,10 @@ class Database:
             await s.commit()
 
     async def migration_pairs(
-        self, mid: Optional[str] = None, channel_id: Optional[int] = None, alive_only: bool = True,
-        only_deleted_old: bool = False,
+        self, mid: Optional[str] = None, channel_id: Optional[int] = None, alive_only: bool = True
     ) -> list:
         """[(old id, new id)] of the copies of one repost (`mid`) or of every repost of a channel, oldest repost first.
-        alive_only: leave out copies that were removed again (undo). only_deleted_old: only posts whose original
-        has been deleted (links to those are dead)."""
+        alive_only: leave out copies that were removed again (undo)."""
         async with self.Session() as s:
             q = select(MigrationItem.old_id, MigrationItem.new_id).join(Migration, Migration.id == MigrationItem.migration_id)
             if mid is not None:
@@ -702,8 +852,6 @@ class Database:
                 q = q.where(Migration.channel_id == channel_id)
             if alive_only:
                 q = q.where(MigrationItem.new_deleted.is_(False))
-            if only_deleted_old:
-                q = q.where(MigrationItem.old_deleted.is_(True))
             q = q.order_by(Migration.created_at, MigrationItem.id)
             return [(a, b) for a, b in (await s.execute(q)).all()]
 
@@ -854,10 +1002,12 @@ class Database:
         async with self.Session() as s:
             chans = list((await s.execute(select(Channel))).scalars())
             posts = list((await s.execute(select(Post).order_by(Post.id))).scalars())
+            marks = (await s.execute(select(IgnoredPost.channel_id, IgnoredPost.message_id).order_by(IgnoredPost.id))).all()
             return {
                 "exported_at": utcnow().isoformat(),
                 "channels": [
                     clean({c.name: getattr(ch, c.name) for c in ch.__table__.columns}) for ch in chans
                 ],
                 "posts": [clean(p.as_dict()) for p in posts],
+                "ignored": [{"channel_id": int(c), "message_id": int(m)} for c, m in marks],  # posts forgotten on purpose
             }

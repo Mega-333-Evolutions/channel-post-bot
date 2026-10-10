@@ -70,14 +70,35 @@ class Outbox:
         b = self.log[-1][2]
         return [[getattr(x, "text", None) for x in row] for row in (b or [])]
 
+    def _data_of(self, btn):
+        t = btn.type if hasattr(btn, "type") else btn
+        return t.data.decode()
+
     def callback_data(self, label_part):
-        """Data of the first inline button (in the last message) whose label contains `label_part`."""
+        """Data of the first inline button (in the last message) whose label contains `label_part`.
+
+        A channel chooser writes the names in the message and puts only numbers on its buttons: when no button has
+        the label, `label_part` is looked for in the numbered list and the button with that number is taken - what a
+        person does when they find the channel in the list and tap its number."""
         for row in self.log[-1][2] or []:
             for btn in row:
                 if label_part in btn.text:
-                    t = btn.type if hasattr(btn, "type") else btn
-                    return t.data.decode()
+                    return self._data_of(btn)
+        listed = re.search(rf"(?m)^(\d+)\. [^\n]*{re.escape(label_part)}", norm(self.last_text))
+        if listed:
+            for row in self.log[-1][2] or []:
+                for btn in row:
+                    if btn.text == listed.group(1):
+                        return self._data_of(btn)
         raise AssertionError(f"no button {label_part!r} in {self.last_buttons()}")
+
+    def callback_exact(self, label):
+        """Data of the button whose label is exactly `label` (the number buttons of a chooser, ◀ ▶ ...)."""
+        for row in self.log[-1][2] or []:
+            for btn in row:
+                if btn.text == label:
+                    return self._data_of(btn)
+        raise AssertionError(f"no button {label!r} in {self.last_buttons()}")
 
 
 class FakeTG(FakeChannelClient):

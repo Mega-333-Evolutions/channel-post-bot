@@ -222,7 +222,7 @@ def test_pinning_needs_a_right_the_bot_may_lack(tmp_path):
 
 
 def test_links_in_copies_made_earlier_can_be_fixed_afterwards(tmp_path):
-    """A finished repost whose originals are gone: the copies still point at the old ids (what /fixlinks repairs)."""
+    """A finished repost whose originals are gone: the copies still point at the old ids (the links in the copies are pointed at the new ids afterwards)."""
 
     async def go():
         db = await fresh_db(db_url_for(tmp_path))
@@ -330,60 +330,3 @@ async def finished_repost(app, deleted_originals=True):
     if deleted_originals:
         await app.db.mark_migration_deleted("m9", 1, "old", [1, 2, 3])
     return text
-
-
-def test_fixlinks_repairs_a_repost_that_was_made_without_it(tmp_path):
-    from .harness import norm
-    from .test_repost_flow import make_app
-
-    async def go():
-        app = await make_app(tmp_path, {1: make_msg(1, "x")})
-        await finished_repost(app)
-        await app.text("/fixlinks")
-        assert "Fix links to reposted posts" in norm(app.out.last_text) and "Which channel" in norm(app.out.last_text)
-        await app.press(app.out.callback_data("Test"))
-        scan = norm(app.out.last_text)
-        assert "3 link(s) in 1 post(s) still point at posts that were reposted and deleted" in scan
-        assert app.tg.edits == [] or all(e[0] != "raw" for e in app.tg.edits)  # looking changes nothing
-        assert app.tg.msgs[12].message.endswith("/3 and https://t.me/testch/2")
-        await app.press(app.out.callback_data("Fix 3 link"))
-        assert "3 link(s) in 1 post(s) now point at the copies" in norm(app.out.last_text)
-        assert app.tg.msgs[12].message == f"Part one: https://t.me/{CH}/13 and https://t.me/{CH}/12"
-        assert button_url(app.tg.msgs[12].reply_markup.rows[0].buttons[0]) == f"https://t.me/{CH}/11"
-        # a second run finds nothing
-        await app.text("/fixlinks")
-        await app.press(app.out.callback_data("Test"))
-        assert "no link points at a deleted original" in norm(app.out.last_text)
-        await app.db.close()
-
-    asyncio.run(go())
-
-
-def test_fixlinks_leaves_a_repost_alone_while_its_originals_still_exist(tmp_path):
-    from .harness import norm
-    from .test_repost_flow import make_app
-
-    async def go():
-        app = await make_app(tmp_path, {1: make_msg(1, "x")})
-        await finished_repost(app, deleted_originals=False)
-        await app.text("/fixlinks")
-        await app.press(app.out.callback_data("Test"))
-        assert "no repost with deleted originals is recorded" in norm(app.out.last_text)
-        await app.db.close()
-
-    asyncio.run(go())
-
-
-def test_fixlinks_is_for_the_owner_only(tmp_path):
-    from .test_repost_flow import make_app
-
-    async def go():
-        app = await make_app(tmp_path, {1: make_msg(1, "x")}, admins=frozenset({7}))
-        app.uid = 7
-        before = len(app.out.log)
-        await app.text("/fixlinks")
-        assert "private" in str(app.out.log[before:][-1][1]).lower() or len(app.out.log) == before + 1
-        assert "Which channel" not in str(app.out.last_text)
-        await app.db.close()
-
-    asyncio.run(go())

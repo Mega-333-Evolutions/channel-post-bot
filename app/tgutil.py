@@ -15,6 +15,16 @@ from telethon.extensions import BinaryReader
 log = logging.getLogger(__name__)
 esc = html.escape
 
+# Telegram refusals that do not go away with the next message: the bot has no access (or no right) in that channel
+FATAL = {
+    "ChatAdminRequiredError",
+    "ChatWriteForbiddenError",
+    "ChannelPrivateError",
+    "UserBannedInChannelError",
+    "ChannelInvalidError",
+    "ChatRestrictedError",
+}
+
 # ----------------------------------------------------------------------------- entities
 _SIMPLE = {
     "bold": types.MessageEntityBold,
@@ -356,8 +366,11 @@ async def get_rights(client, ch):
             delete=has("delete_messages"),
             invite=has("invite_users"),
             add_admins=has("add_admins"),
+            change_info=has("change_info"),
         )
-    return SimpleNamespace(admin=False, post=False, edit=False, delete=False, invite=False, add_admins=False)
+    return SimpleNamespace(
+        admin=False, post=False, edit=False, delete=False, invite=False, add_admins=False, change_info=False
+    )
 
 
 _HINTS = {

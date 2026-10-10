@@ -65,13 +65,47 @@ def run(coro):
 
 # ------------------------------------------------------------------------------------- the command line
 def test_arguments_are_read_as_source_destination_and_an_optional_range():
-    assert parse_shift_args("@a @b") == ("@a", "@b", None, None)
-    assert parse_shift_args("@a @b 15 20") == ("@a", "@b", 15, 20)
-    assert parse_shift_args("@a @b 20 15") == ("@a", "@b", 15, 20)  # either order
-    assert parse_shift_args("@a @b 15") == ("@a", "@b", 15, 15)  # one id = just that post
-    assert parse_shift_args("https://t.me/+AbCdEfGhIj -1001234567890") == ("https://t.me/+AbCdEfGhIj", "-1001234567890", None, None)
-    for bad in ("", "@a", "@a @b x", "@a @b 0", "@a @b 1 2 3", "@a @b -5"):
+    def read(raw):
+        *four, flags = parse_shift_args(raw)
+        assert (flags.links, flags.profile) == (False, False)  # no extras unless they are asked for
+        return tuple(four)
+
+    assert read("@a @b") == ("@a", "@b", None, None)
+    assert read("@a @b 15 20") == ("@a", "@b", 15, 20)
+    assert read("@a @b 20 15") == ("@a", "@b", 15, 20)  # either order
+    assert read("@a @b 15") == ("@a", "@b", 15, 15)  # one id = just that post
+    assert read("https://t.me/+AbCdEfGhIj -1001234567890") == ("https://t.me/+AbCdEfGhIj", "-1001234567890", None, None)
+    for bad in ("", "@a", "@a @b x", "@a @b 0", "@a @b 1 2 3", "@a @b -5", "-c", "-c -all", "@a -c", "@a @b -c x"):
         with pytest.raises(ValueError):
+            parse_shift_args(bad)
+
+
+def test_the_two_extras_can_be_given_separately_together_in_any_order_or_not_at_all():
+    def read(raw):
+        src, dst, first, last, flags = parse_shift_args(raw)
+        assert (src, dst) == ("@old", "@new")
+        return (first, last), (flags.links, flags.profile)
+
+    assert read("@old @new") == ((None, None), (False, False))
+    assert read("@old @new -c") == ((None, None), (True, False))
+    assert read("@old @new -all") == ((None, None), (False, True))
+    assert read("@old @new -c -all") == ((None, None), (True, True))
+    assert read("@old @new -all -c") == ((None, None), (True, True))
+    assert read("@old @new - all") == ((None, None), (False, True))  # typed with a space
+    assert read("@old @new - c - all") == ((None, None), (True, True))
+    assert read("@old @new -ALL -C") == ((None, None), (True, True))  # case does not matter
+    assert read("@old @new --all --c") == ((None, None), (True, True))  # a double dash is understood too
+    assert read("@old @new 15 20 -c") == ((15, 20), (True, False))  # with a range
+    assert read("-c @old @new -all 15 20") == ((15, 20), (True, True))  # in front, or between the other words
+    assert read("@old -c @new 15 -all 20") == ((15, 20), (True, True))
+    assert read("@old @new -c -c") == ((None, None), (True, False))  # twice is the same as once
+
+
+def test_a_channel_id_is_not_mistaken_for_an_option_and_unknown_options_are_refused():
+    src, dst, first, last, flags = parse_shift_args("-1001234567890 -1009876543210 -c")
+    assert (src, dst, flags.links) == ("-1001234567890", "-1009876543210", True)
+    for bad in ("@a @b -x", "@a @b --everything", "@a @b -call"):
+        with pytest.raises(ValueError, match="Unknown option"):
             parse_shift_args(bad)
 
 

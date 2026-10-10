@@ -144,7 +144,7 @@ def test_what_the_bot_can_hold():
 
 
 # ================================================================================================= the first look
-def test_the_first_look_only_notes_where_the_channel_stands(tmp_path):
+def test_the_first_look_notes_where_the_channel_stands_and_reads_in_the_older_posts(tmp_path):
     async def go():
         msgs = three()
         chan, db, ch = await world(tmp_path, msgs, save=False)  # nothing saved: the channel has history only
@@ -153,10 +153,16 @@ def test_the_first_look_only_notes_where_the_channel_stands(tmp_path):
         chan._top = chan._pts = 5
         rep = await sync_channel(chan, db, ch, opts())
         assert rep.first_look and rep.error is None
-        assert rep.adopted == [] and rep.deleted == [] and rep.edited == []  # the history is not imported
-        assert await db.list_posts(1, None, 0, 50) == ([], 0)
+        assert rep.adopted == [] and rep.deleted == [] and rep.edited == []  # these are not "new posts" ...
+        assert rep.imported == 5 and rep.history_done  # ... they are the posts from before the bot was added
+        posts, total = await db.list_posts(1, None, 0, 50)
+        assert total == 5 and {p.source for p in posts} == {"adopted"} and {p.status for p in posts} == {"sent"}
         state = await db.get_sync(1)
         assert (state.last_top, state.last_pts, state.deferred) == (5, 5, 0)
+        hist = await db.get_history(1)
+        assert (hist.top, hist.next_id, hist.imported, hist.done) == (5, 6, 5, True)
+        again = await sync_channel(chan, db, ch, opts())  # nothing is read twice
+        assert again.imported == 0 and again.history_top == 0 and again.changed is False
         await db.close()
 
     run(go())
@@ -490,39 +496,6 @@ def test_a_service_message_the_bot_may_not_delete_is_counted(tmp_path):
         chan.undeletable.add(4)
         rep = await sync_channel(chan, db, ch, opts())
         assert (rep.services_deleted, rep.services_failed) == (0, 1) and rep.services_error
-        await db.close()
-
-    run(go())
-
-
-def test_clean_sweeps_the_whole_history_for_old_service_messages(tmp_path):
-    async def go():
-        msgs = {1: old_msg(1, "a"), 2: service_msg(2), 3: old_msg(3, "b"), 4: service_msg(4), 5: old_msg(5, "c")}
-        chan, db, ch = await world(tmp_path, {i: m for i, m in msgs.items() if not isinstance(m, types.MessageService)})
-        for i in (2, 4):
-            chan.msgs[i] = msgs[i]
-        rep = await sync_channel(chan, db, ch, opts(clean=True))
-        assert rep.services_deleted == 2 and sorted(chan.msgs) == [1, 3, 5]
-        assert len(await db.sent_posts(1)) == 3  # My posts untouched
-        await db.close()
-
-    run(go())
-
-
-def test_clean_hands_what_the_bot_cannot_delete_to_the_userbot(tmp_path):
-    async def go():
-        chan, db, ch = await world(tmp_path, {1: old_msg(1, "a")})
-        chan.msgs[2] = service_msg(2)
-        chan._top = chan._pts = 2
-        chan.undeletable.add(2)
-        asked = []
-
-        async def userbot_delete(ids):
-            asked.append(list(ids))
-            chan.msgs.pop(2, None)
-
-        rep = await sync_channel(chan, db, ch, opts(clean=True, fallback=userbot_delete))
-        assert asked == [[2]] and rep.services_deleted == 1 and rep.services_failed == 0
         await db.close()
 
     run(go())

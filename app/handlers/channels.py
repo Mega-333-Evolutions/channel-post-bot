@@ -6,9 +6,10 @@ import re
 
 from telethon import Button, events, types
 
+from .. import picker
 from ..channelref import parse_channel_ref
 from ..common import Ctx, UserError, clear_state, cmd, guard, on_cb, on_text, require_owner, say, set_state, show
-from ..tgutil import esc, get_rights, short
+from ..tgutil import esc, get_rights
 from ..ui import CANCEL
 
 log = logging.getLogger(__name__)
@@ -97,22 +98,50 @@ def register(ctx: Ctx) -> None:
             f"✅ Added <b>{esc(ent.title or '')}</b>\n{rights_line(rights)}{warn}\n\nCreate a post with /new.",
         )
 
-    @client.on(cmd("channels"))
-    @guard(ctx)
-    async def h_channels(event):
+    async def show_channels(event, arg: str = "", page: int = 0) -> None:
+        """The list of channels; the owner's number buttons choose one to remove."""
         chans = await db.list_channels()
         if not chans:
             raise UserError("No channels yet. Use /addchannel.")
-        lines, kb = [], []
-        for n, ch in enumerate(chans, 1):
-            name = esc(ch.title) + (f" (@{esc(ch.username)})" if ch.username else "")
-            lines.append(f"{n}. <b>{name}</b>")
-            if ctx.cfg.is_owner(event.sender_id):
-                kb.append([Button.inline(f"➖ Remove {short(ch.title, 22)}", f"chd:{ch.id}")])
-        await say(event, "📢 <b>Your channels</b>\n\n" + "\n".join(lines), kb or None)
+        owner = ctx.cfg.is_owner(event.sender_id)
+        text, kb = picker.render(
+            chans,
+            page,
+            head="📢 <b>Your channels</b>",
+            kind="ch",
+            choose=(lambda c: f"chd:{c.id}") if owner else None,
+            with_username=True,
+            hint="To take a channel out of the bot, tap its number.",
+        )
+        await show(event, text, kb or None)
+
+    ctx.pickers["ch"] = show_channels
+
+    @client.on(cmd("channels"))
+    @guard(ctx)
+    async def h_channels(event):
+        await show_channels(event)
 
     @on_cb(ctx, "chd")
     async def cb_remove_channel(event, parts):
+        """A number was tapped: ask before the channel is taken out of the bot."""
+        require_owner(ctx, event)
+        ch = await db.get_channel(int(parts[0]))
+        if ch is None or not ch.active:
+            await show_channels(event)
+            return
+        kb = [[Button.inline("✅ Yes, remove it", f"chy:{ch.id}"), Button.inline("🔙 Back", f"{picker.PAGE_CB}:ch::0")]]
+        await show(
+            event,
+            f"➖ Take <b>{esc(ch.title)}</b> out of the bot?\n"
+            "Its saved posts are kept, and you can add it again with /addchannel.",
+            kb,
+        )
+
+    @on_cb(ctx, "chy")
+    async def cb_remove_channel_yes(event, parts):
         require_owner(ctx, event)
         await db.set_channel_active(int(parts[0]), False)
+        if ctx.syncer is not None:
+            ctx.syncer.forget_cache()
         await show(event, "Channel removed from the bot. Its saved posts are kept; add it again with /addchannel.")

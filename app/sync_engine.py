@@ -3,8 +3,10 @@
 What a look at a channel does
   * every post the bot has saved is read back from Telegram: a post that is gone is removed here, a post that was edited
     gets its saved copy updated (text, formatting, buttons, media);
-  * messages that appeared since the last look are saved as new posts (source "adopted"). The very first look only
-    notes where the channel stands: this follows changes, it does not import the old posts;
+  * messages that appeared since the last look are saved as new posts (source "adopted");
+  * the posts that were in the channel BEFORE the bot was added are read into My posts too, oldest first, up to the
+    newest message that existed at the first look. Where the reading stopped is saved, so a long channel takes a few
+    looks. Posts the owner told the bot to forget are skipped for good;
   * service messages ("channel name changed", "pinned a message", video chat ...) found on the way are deleted.
 
 Safety rules
@@ -13,21 +15,28 @@ Safety rules
   * a saved copy is only changed if nobody changed it since it was read (optimistic check in the database);
   * buttons that are missing in the channel are never removed from the saved copy (Telegram sometimes hides a keyboard
     for a while - the saved buttons are what "Check buttons" restores from);
-  * if EVERY saved post of a channel looks deleted, nothing is removed: more likely the bot lost access.
+  * if EVERY saved post of a channel looks deleted, nothing is removed: more likely the bot lost access (unless the
+    channel's event counter moved by at least that many events, which is what really deleting them looks like);
+  * what TELEGRAM does to a channel is not an admin's edit: a channel it restricts (a copyright strike turns every post
+    into "This message couldn't be displayed on your device due to copyright infringement"), a single post it holds
+    back, a notice shown instead of a post, or many posts that suddenly all show one and the same text are left exactly
+    as saved - nothing is edited, removed or added for them.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 
-from telethon import errors, functions, types
+from telethon import errors, types
 
 from .db import as_utc, utcnow
 from .replace_engine import fetch_messages
 from .repost_engine import delete_batch
-from .tgutil import classify_media, explain_rpc, flood_retry, media_from_ref, media_info, peer_of, ser_entities, ser_markup
+from .restrictions import message_restriction, norm_text, probe_channel
+from .tgutil import classify_media, explain_rpc, media_from_ref, media_info, peer_of, ser_entities, ser_markup
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +46,7 @@ PAUSE = 0.25  # between two requests of a scan
 SLACK_CAP = 300  # a quick look reads this many ids beyond the most likely end of the new messages
 DEEP_EVERY = 24 * 3600  # the automatic looks read every possible id at least this often
 MIN_FOR_ANOMALY = 5
+MASS_SAME = 5  # this many posts that suddenly show the very same new text are not edits by a person
 MAX_PROBE = 300  # requests spent finding the newest message the first time (30 000 ids)
 
 
@@ -44,13 +54,13 @@ MAX_PROBE = 300  # requests spent finding the newest message the first time (30 
 @dataclass
 class SyncOptions:
     deep: bool = False  # read every possible id for new messages, not only the likely ones
-    clean: bool = False  # also sweep the whole history for old service messages
     delete_services: bool = True
     adopt: bool = True  # save new posts of others
+    history: bool = True  # also read the posts from before the bot was added into My posts
+    history_seconds: Optional[float] = None  # ... for at most this long per look (None: as long as it takes)
     grace: float = GRACE
     pause: float = PAUSE
     ignore: Any = field(default_factory=set)  # (channel id, message id) of posts the owner told the bot to forget
-    fallback: Optional[Callable[[list], Awaitable[Any]]] = None  # deletes with the userbot (only used by `clean`)
 
 
 @dataclass
@@ -62,11 +72,19 @@ class SyncReport:
     edited: list = field(default_factory=list)  # message ids whose saved copy was brought up to date
     refreshed: int = 0  # saved copies corrected for trifles (a trailing space ...)
     adopted: list = field(default_factory=list)  # message ids of new posts that were saved
+    imported: int = 0  # older posts (from before the bot was added) that were added to My posts
+    history_unsupported: int = 0  # older messages My posts can't hold (polls, stickers ...)
+    history_top: int = 0  # the newest message that counts as older (0: the older posts were not looked at)
+    history_to: int = 0  # the older posts have been read up to this message id
+    history_done: bool = False  # ... and that was all of them
     unsupported: int = 0  # new messages of a kind My posts can't show (polls, stickers ...)
     buttons_missing: list = field(default_factory=list)  # saved buttons that the channel shows no keyboard for
     services_deleted: int = 0
     services_failed: int = 0
     services_error: Optional[str] = None  # name of the refusal
+    restricted: list = field(default_factory=list)  # message ids Telegram holds back (copyright ...): left as saved
+    restricted_why: Optional[str] = None  # what Telegram says about them
+    restricted_channel: Optional[str] = None  # the whole channel is restricted: nothing was looked at
     young: list = field(default_factory=list)  # saved posts the bot touched a moment ago: judge them later
     young_new: list = field(default_factory=list)  # new messages that appeared a moment ago: save them later
     changed_meanwhile: int = 0  # saved posts that were changed through the bot while we looked (left alone)
@@ -78,7 +96,7 @@ class SyncReport:
 
     @property
     def changed(self) -> bool:
-        return bool(self.deleted or self.edited or self.adopted or self.services_deleted)
+        return bool(self.deleted or self.edited or self.adopted or self.imported or self.services_deleted)
 
 
 # ------------------------------------------------------------------------------------- comparing a post
@@ -130,6 +148,30 @@ def adopt_fields(m) -> dict:
     return f
 
 
+# ------------------------------------------------------------------- what Telegram itself does to a channel
+MASS_NOTE = "many posts suddenly show one and the same text - that is Telegram's notice, not an edit"
+
+
+def split_mass_text(edits: list) -> tuple:
+    """(edits to save, edits to hold back). Five or more saved posts that had five different texts and now all show the
+    very same text at once: nobody edits like that - Telegram does it to a channel it restricts."""
+    groups: dict = {}
+    for item in edits:
+        new = norm_text(item[1].fields.get("text"))
+        if new:
+            groups.setdefault(new, []).append(item)
+    bad: set = set()
+    for items in groups.values():
+        if len(items) >= MASS_SAME and len({norm_text(p.text) for p, _ in items}) >= MASS_SAME:
+            bad.update(id(i) for i in items)
+    return [i for i in edits if id(i) not in bad], [i for i in edits if id(i) in bad]
+
+
+def hold_back(rep: "SyncReport", ids, why: Optional[str]) -> None:
+    rep.restricted.extend(ids)
+    rep.restricted_why = rep.restricted_why or why
+
+
 @dataclass
 class Diff:
     fields: dict = field(default_factory=dict)  # what to save
@@ -160,18 +202,6 @@ def diff_post(p, m) -> Diff:
 
 
 # --------------------------------------------------------------------------------------- talking to Telegram
-async def channel_pts(client, peer) -> tuple:
-    """(the channel's event counter, None) or (None, why not). The counter is never lower than the newest message id."""
-    try:
-        full = await flood_retry(lambda: client(functions.channels.GetFullChannelRequest(peer)))
-    except errors.RPCError as e:
-        return None, explain_rpc(e)
-    pts = getattr(getattr(full, "full_chat", None), "pts", None)
-    if pts is None:
-        return None, "Telegram did not say how far the channel has come."
-    return int(pts), None
-
-
 def is_gone(m) -> bool:
     return m is None or isinstance(m, types.MessageEmpty)
 
@@ -193,17 +223,17 @@ async def find_top(client, peer, pts: int, floor: int, *, pause: float = PAUSE) 
     return max(floor, hi)
 
 
-async def delete_services(client, peer, ids: list, rep: SyncReport, opts: SyncOptions) -> None:
-    """Delete service messages (bot first; `opts.fallback` for what it may not delete) and count what happened."""
+async def delete_services(client, peer, ids: list, rep: SyncReport) -> None:
+    """Delete service messages and count what happened (the bot only: Telegram may refuse the old ones)."""
     ids = sorted(set(ids))
     for i in range(0, len(ids), CHUNK):
         part = ids[i : i + CHUNK]
-        out = await delete_batch(client, peer, part, opts.fallback)
+        out = await delete_batch(client, peer, part)
         rep.services_deleted += len(out.gone)
         left = len(part) - len(out.gone)
         if left:
             rep.services_failed += left
-            rep.services_error = rep.services_error or out.bot_error or out.fallback_error or "NotDeleted"
+            rep.services_error = rep.services_error or out.bot_error or "NotDeleted"
 
 
 # ------------------------------------------------------------------------------------- the three steps
@@ -227,11 +257,15 @@ async def _adopt(db, ch, rep: SyncReport, fresh: list, opts: SyncOptions, busy, 
     ids = [m.id for m in fresh]
     for i in range(0, len(ids), 500):
         known |= {p.message_id for p in await db.posts_at(ch.id, ids[i : i + 500])}
+    forgotten = await db.ignored_ids(ch.id) if fresh else set()
     todo = []
     for m in fresh:
-        if m.id in known or (ch.id, m.id) in opts.ignore:
+        if m.id in known or m.id in forgotten or (ch.id, m.id) in opts.ignore:
             continue
-        if age(m.date, now) < opts.grace:
+        why = message_restriction(m)
+        if why:  # Telegram holds it back: what it shows now is not what the post says
+            hold_back(rep, [m.id], why)
+        elif age(m.date, now) < opts.grace:
             rep.young_new.append(m.id)
         elif not message_supported(m):
             rep.unsupported += 1
@@ -246,8 +280,9 @@ async def _adopt(db, ch, rep: SyncReport, fresh: list, opts: SyncOptions, busy, 
             rep.adopted.append(m.id)
 
 
-async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, busy, progress) -> None:
-    """Every saved post against the channel."""
+async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, busy, progress, moved=None) -> None:
+    """Every saved post against the channel. `moved`: how far the channel's event counter has come since the last look
+    (None: unknown) - deleting posts is an event each, which tells "everything was deleted" from "I can't see anything"."""
     rep.phase = "comparing the saved posts"
     peer = peer_of(ch)
     posts = await db.sent_posts(ch.id)  # the saved copies are read BEFORE the channel is, never after
@@ -275,6 +310,10 @@ async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, bus
             elif isinstance(m, types.MessageService):
                 continue  # not a post any more (cannot happen: ids are never reused)
             else:
+                why = message_restriction(m, p.text)
+                if why:  # Telegram's doing, not an admin's: the saved copy stays exactly as it is
+                    hold_back(rep, [mid], why)
+                    continue
                 d = diff_post(p, m)
                 if d.buttons_missing:
                     rep.buttons_missing.append(mid)
@@ -284,8 +323,12 @@ async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, bus
         if progress:
             await progress(rep)
         await asyncio.sleep(opts.pause)
+    edits, held = split_mass_text(edits)
+    if held:
+        hold_back(rep, [p.message_id for p, _ in held], MASS_NOTE)
     if gone:
-        if len(ids) >= MIN_FOR_ANOMALY and len(gone) == len(ids):
+        really = moved is not None and moved >= len(gone)  # at least one event for each post that vanished
+        if len(ids) >= MIN_FOR_ANOMALY and len(gone) == len(ids) and not really:
             rep.anomaly = (
                 f"All {len(ids)} saved posts look deleted, so none was removed here - "
                 "check that the bot is still an admin of the channel."
@@ -295,27 +338,6 @@ async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, bus
             await db.forget_posts(ch.id, gone_ids)
             rep.deleted.extend(gone_ids)
     await _save_edits(db, rep, edits, busy)
-
-
-async def _sweep_services(client, ch, rep: SyncReport, opts: SyncOptions, pts: int, busy, progress) -> None:
-    """The whole history, once: every service message that is still there goes."""
-    rep.phase = "removing old service messages"
-    peer = peer_of(ch)
-    a = 1
-    while a <= pts:
-        if busy():
-            rep.busy = True
-            return
-        hi = min(a + CHUNK - 1, pts)
-        msgs = await fetch_messages(client, peer, list(range(a, hi + 1)))
-        ids = [m.id for m in msgs if isinstance(m, types.MessageService)]
-        if ids:
-            await delete_services(client, peer, ids, rep, opts)
-        rep.scanned_to = hi
-        if progress:
-            await progress(rep)
-        a = hi + 1
-        await asyncio.sleep(opts.pause)
 
 
 async def _look_for_new(client, db, ch, rep: SyncReport, opts: SyncOptions, state, pts: int, busy, progress) -> None:
@@ -362,7 +384,7 @@ async def _look_for_new(client, db, ch, rep: SyncReport, opts: SyncOptions, stat
         await asyncio.sleep(opts.pause)
     services_ids = [m.id for m in services]
     if opts.delete_services and services_ids:
-        await delete_services(client, peer, services_ids, rep, opts)
+        await delete_services(client, peer, services_ids, rep)
     if opts.adopt and fresh:
         await _adopt(db, ch, rep, fresh, opts, busy, now)
         if rep.busy:
@@ -375,23 +397,88 @@ async def _look_for_new(client, db, ch, rep: SyncReport, opts: SyncOptions, stat
     )
 
 
+async def _import_history(client, db, ch, rep: SyncReport, opts: SyncOptions, busy, progress, state=None) -> None:
+    """The posts that were in the channel before the bot was added are read into My posts: from message 1 up to the newest
+    message that existed at the first look (what came after is the business of _look_for_new). The place where the
+    reading stopped is saved - a long channel takes a few looks, and a restart loses nothing. `state`: where the look
+    before this one stopped (None at the very first look: the mark that look has just set is used)."""
+    hist = await db.get_history(ch.id)
+    if hist is None:
+        base = state if state is not None else await db.get_sync(ch.id)
+        if base is None:
+            return
+        hist = await db.start_history(ch.id, base.last_top)
+    if hist.done:
+        return
+    rep.phase = "reading the older posts"
+    peer = peer_of(ch)
+    began = time.monotonic()
+    forgotten = await db.ignored_ids(ch.id)
+    rep.history_top = hist.top
+    a = hist.next_id
+    rep.history_to = a - 1
+    while a <= hist.top:
+        if busy():
+            rep.busy = True
+            return
+        if opts.history_seconds is not None and time.monotonic() - began > opts.history_seconds:
+            return  # the next look goes on from here
+        hi = min(a + CHUNK - 1, hist.top)
+        msgs = await fetch_messages(client, peer, list(range(a, hi + 1)))
+        now = utcnow()
+        stop = None
+        todo = []
+        for m in msgs:
+            if is_gone(m) or isinstance(m, types.MessageService):
+                continue
+            if age(m.date, now) < opts.grace:  # the bot may still be saving it: the next look reads it
+                stop = m.id
+                break
+            if m.id in forgotten or (ch.id, m.id) in opts.ignore:
+                continue
+            why = message_restriction(m)
+            if why:
+                hold_back(rep, [m.id], why)
+            elif not message_supported(m):
+                rep.history_unsupported += 1
+            else:
+                todo.append(m)
+        known = {p.message_id for p in await db.posts_at(ch.id, [m.id for m in todo])}
+        made = await db.adopt_many(ch.id, [(m.id, adopt_fields(m), m.date) for m in todo if m.id not in known])
+        rep.imported += len(made)
+        a = hi + 1 if stop is None else stop
+        rep.history_done = stop is None and a > hist.top
+        await db.save_history(ch.id, next_id=a, imported=len(made), done=rep.history_done)
+        rep.history_to = rep.scanned_to = a - 1
+        if stop is not None:
+            return
+        if progress:
+            await progress(rep)
+        await asyncio.sleep(opts.pause)
+    rep.history_done = True  # (also the case when the channel had nothing to read)
+
+
 # ----------------------------------------------------------------------------------------- entry points
 async def sync_channel(client, db, ch, opts: Optional[SyncOptions] = None, *, busy=None, progress=None) -> SyncReport:
     """One full look at a channel (see the module text). Never raises Telegram's refusals: they end up in `report.error`."""
     opts = opts or SyncOptions()
     busy = busy or (lambda: False)
     rep = SyncReport(channel=ch)
-    pts, err = await channel_pts(client, peer_of(ch))
+    pts, restricted, err = await probe_channel(client, peer_of(ch))
     if pts is None:
         rep.error = err
         return rep
+    if restricted:  # Telegram restricted the channel (a copyright strike ...): My posts stay untouched
+        rep.restricted_channel = restricted
+        return rep
     try:
         state = await db.get_sync(ch.id)
-        await _compare_saved(client, db, ch, rep, opts, busy, progress)
-        if opts.clean and not rep.busy:
-            await _sweep_services(client, ch, rep, opts, pts, busy, progress)
+        moved = None if state is None else max(0, pts - state.last_pts)
+        await _compare_saved(client, db, ch, rep, opts, busy, progress, moved)
         if not rep.busy:
             await _look_for_new(client, db, ch, rep, opts, state, pts, busy, progress)
+        if not rep.busy and opts.history:
+            await _import_history(client, db, ch, rep, opts, busy, progress, state)
     except errors.RPCError as e:
         rep.error = explain_rpc(e)
     return rep
@@ -425,6 +512,10 @@ async def sync_ids(client, db, ch, ids, opts: Optional[SyncOptions] = None, *, a
                 elif isinstance(m, types.MessageService):
                     services.append(mid)
                 elif row is not None:
+                    why = message_restriction(m, row.text)
+                    if why:  # Telegram's doing, not an admin's: the saved copy stays exactly as it is
+                        hold_back(rep, [mid], why)
+                        continue
                     if recent:
                         rep.young.append(mid)
                         continue
@@ -436,7 +527,10 @@ async def sync_ids(client, db, ch, ids, opts: Optional[SyncOptions] = None, *, a
                 elif mid in adopt_set:
                     fresh.append(m)
         if opts.delete_services and services:
-            await delete_services(client, peer, services, rep, opts)
+            await delete_services(client, peer, services, rep)
+        edits, held = split_mass_text(edits)
+        if held:
+            hold_back(rep, [p.message_id for p, _ in held], MASS_NOTE)
         if gone:
             gone_ids = [p.message_id for p in gone]
             await db.forget_posts(ch.id, gone_ids)

@@ -16,6 +16,7 @@ from app.errorlog import ErrorReporter, TelegramLogHandler
 from app.expiry import Expirer
 from app.handlers import (
     autopost,
+    backup,
     basic,
     broadcast,
     channels,
@@ -44,12 +45,12 @@ COMMANDS = [
     ("replace", "Swap a username in links (owner)"),
     ("handleswap", "Swap a @username written in posts (owner)"),
     ("repost", "Copy a whole channel in order (owner)"),
-    ("fixlinks", "Point links at reposted posts (owner)"),
     ("shift", "Copy posts from one channel to another (owner)"),
     ("sync", "Compare channels with My posts now (owner)"),
     ("undo", "Undo the last replace (owner)"),
     ("userbot", "Status of the helper account that deletes old posts (owner)"),
     ("export", "Backup as JSON (owner)"),
+    ("import", "Restore a backup made by /export (owner)"),
     ("cancel", "Cancel what I'm doing"),
     ("help", "Show help"),
 ]
@@ -67,7 +68,7 @@ def build_client(cfg: Config) -> TelegramClient:
 
 
 def register_all(ctx: Ctx) -> None:
-    for module in (basic, channels, create, posts, masslinks, autopost, broadcast, checkbtn, replace, repost, shift, sync):
+    for module in (basic, backup, channels, create, posts, masslinks, autopost, broadcast, checkbtn, replace, repost, shift, sync):
         module.register(ctx)
 
 

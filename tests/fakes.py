@@ -138,6 +138,12 @@ class FakeChannelClient:
         self.require_approval = False
         self.users = {}  # user id -> types.User, for participant lists
         self.cant_delete_at_all = set()  # ids nobody can delete (userbot included)
+        self.restriction = None  # text: Telegram restricts the whole channel (a copyright strike)
+        self.about = ""  # the channel's description
+        self.photo_id = None  # the channel's profile photo (its bytes are in _photo_data)
+        self._photo_data = {}  # photo id -> bytes; shared by all channels next to each other
+        self._uploads = {}  # uploaded file id -> bytes; shared as well
+        self._counter = [9000]  # ids for photos and uploads; shared
         self.pinned_order = []  # message ids in the order they were pinned
         self._n_invites = 0
 
@@ -148,7 +154,34 @@ class FakeChannelClient:
         self.registry[other.cid] = other
         self._media.update(other._media)
         other._media = self._media  # a photo or file is known to the account, whichever channel it is sent to
+        self._photo_data.update(other._photo_data)
+        other._photo_data, other._uploads, other._counter = self._photo_data, self._uploads, self._counter
         return other
+
+    def set_photo(self, data: bytes) -> int:
+        """Give the channel a profile photo (what it looks like is the bytes)."""
+        self._counter[0] += 1
+        self.photo_id = self._counter[0]
+        self._photo_data[self.photo_id] = data
+        return self.photo_id
+
+    def photo_bytes(self):
+        return self._photo_data.get(self.photo_id) if self.photo_id else None
+
+    def _chat_photo(self):
+        if not self.photo_id:
+            return types.PhotoEmpty(0)
+        return types.Photo(self.photo_id, 1, b"ref", NOW, [types.PhotoSize("x", 100, 100, 999)], 2)
+
+    async def download_media(self, media, file=None):
+        if isinstance(media, types.Photo) and media.id in self._photo_data:
+            return self._photo_data[media.id]
+        raise ValueError("this fake can only download a channel's profile photo")
+
+    async def upload_file(self, data, file_name=None):
+        self._counter[0] += 1
+        self._uploads[self._counter[0]] = bytes(data)
+        return types.InputFile(id=self._counter[0], parts=1, name=file_name or "file", md5_checksum="")
 
     def _target(self, req):
         """The channel a request is about (a forward is carried out by its destination)."""
@@ -217,9 +250,15 @@ class FakeChannelClient:
         )
 
     def _channel_obj(self):
+        extra = {}
+        if self.restriction:
+            extra = dict(
+                restricted=True,
+                restriction_reason=[types.RestrictionReason(platform="all", reason="copyright", text=self.restriction)],
+            )
         return types.Channel(
             id=self.cid, title=self.title, photo=types.ChatPhotoEmpty(), date=NOW, access_hash=USER_HASH,
-            username=self.username, broadcast=True,
+            username=self.username, broadcast=True, **extra,
         )
 
     # --------------------------------------------------------------------------------- dispatcher
@@ -268,6 +307,7 @@ class FakeChannelClient:
                         id=m.id, peer_id=m.peer_id, date=m.date, message=m.message, out=m.out, entities=m.entities,
                         reply_markup=m.reply_markup, media=m.media, grouped_id=m.grouped_id,
                         invert_media=getattr(m, "invert_media", None), reply_to=m.reply_to, pinned=m.pinned,
+                        restriction_reason=getattr(m, "restriction_reason", None),
                     )
                 )
         return types.messages.ChannelMessages(
@@ -354,6 +394,10 @@ class FakeChannelClient:
         m = self.msgs.get(req.id)
         if m is None:
             raise rpc("MessageIdInvalidError")
+        if not getattr(m, "out", False) and not self.rights.get("edit"):  # somebody else's post needs that right
+            raise rpc("MessageAuthorRequiredError")
+        if getattr(m, "via_other_bot", False):  # buttons or a post made through another bot: only that bot may edit
+            raise rpc("MessageIdInvalidError")
         if req.message is None:  # markup-only edit
             text, ents = m.message, list(m.entities or [])
             markup = req.reply_markup if req.reply_markup is not None else self._effective(m)
@@ -388,7 +432,44 @@ class FakeChannelClient:
     # ------------------------------------------------------------------------ channel / rights
     def _do_GetFullChannelRequest(self, req):
         inv = types.ChatInviteExported(link=self.primary_invite, admin_id=1, date=NOW) if self.primary_invite else None
-        return SimpleNamespace(full_chat=SimpleNamespace(pts=max(self._pts, self._top), exported_invite=inv))
+        return SimpleNamespace(
+            full_chat=SimpleNamespace(
+                pts=max(self._pts, self._top), exported_invite=inv, about=self.about, chat_photo=self._chat_photo()
+            ),
+            chats=[self._channel_obj()],
+        )
+
+    def _notice(self, action):
+        """The service message Telegram puts into a channel when its name or photo changes."""
+        self._top += 1
+        self._pts += 1
+        note = types.MessageService(id=self._top, peer_id=types.PeerChannel(self.cid), date=NOW, action=action)
+        self.msgs[note.id] = note
+        return note
+
+    def _need_info_right(self):
+        if not self.rights.get("change_info", True):
+            raise rpc("ChatAdminRequiredError")
+
+    def _do_EditTitleRequest(self, req):
+        self._need_info_right()
+        if req.title == self.title:
+            raise rpc("ChatNotModifiedError")
+        self.title = req.title
+        return self._updates([self._notice(types.MessageActionChatEditTitle(req.title))])
+
+    def _do_EditChatAboutRequest(self, req):
+        self._need_info_right()
+        if req.about == self.about:
+            raise rpc("ChatAboutNotModifiedError")
+        self.about = req.about
+        return True
+
+    def _do_EditPhotoRequest(self, req):
+        self._need_info_right()
+        data = self._uploads[req.photo.file.id]
+        self.set_photo(data)
+        return self._updates([self._notice(types.MessageActionChatEditPhoto(self._chat_photo()))])
 
     def _do_GetParticipantRequest(self, req):
         r = self.rights
@@ -398,7 +479,7 @@ class FakeChannelClient:
             return SimpleNamespace(participant=types.ChannelParticipant(user_id=1, date=NOW))
         rights = types.ChatAdminRights(
             post_messages=r.get("post"), edit_messages=r.get("edit"), delete_messages=r.get("delete"),
-            invite_users=r.get("invite"), add_admins=r.get("add_admins"),
+            invite_users=r.get("invite"), add_admins=r.get("add_admins"), change_info=r.get("change_info", True),
         )
         return SimpleNamespace(participant=types.ChannelParticipantAdmin(user_id=1, promoted_by=1, date=NOW, admin_rights=rights))
 

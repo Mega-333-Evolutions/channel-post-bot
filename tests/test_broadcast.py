@@ -460,7 +460,8 @@ def test_a_channel_taken_out_of_the_bot_is_reported_not_retried_forever(tmp_path
     async def go():
         app = await make_app(tmp_path, channels=1)
         now = await timed_broadcast(app)
-        await app.db.forget_posts(1, [p.message_id for p in await app.db.sent_posts(1)])  # a real database refuses to drop a channel its posts still point at
+        for post in await app.db.sent_posts(1):  # a real database refuses to drop a channel its posts still point at
+            await app.db.delete_post(post.id)
         async with app.db.Session() as s:
             await s.delete(await s.get(Channel, 1))
             await s.commit()

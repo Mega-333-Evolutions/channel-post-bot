@@ -183,7 +183,7 @@ async def saved_world(tmp_path, msgs):
     return db, ch
 
 
-def test_the_sync_compares_and_cleans_a_channel_through_a_real_client(wire, tmp_path):
+def test_the_sync_compares_a_channel_and_deletes_new_notices_through_a_real_client(wire, tmp_path):
     client, seen = wire.client, wire.seen
     msgs, chan = synced_channel(wire)
 
@@ -204,10 +204,10 @@ def test_the_sync_compares_and_cleans_a_channel_through_a_real_client(wire, tmp_
         notice(chan, types.MessageActionChatEditTitle("A new name"))  # id 7
         notice(chan, types.MessageActionPinMessage())  # id 8
 
-        rep = await sync_channel(client, db, ch, SyncOptions(pause=0, grace=0, clean=True))
+        rep = await sync_channel(client, db, ch, opts)
         assert rep.error is None and rep.anomaly is None
-        assert (rep.deleted, rep.edited, rep.adopted, rep.services_deleted, rep.services_failed) == ([3], [1], [6], 3, 0)
-        assert sorted(chan.msgs) == [1, 2, 5, 6]  # the old notice and the two new ones are gone
+        assert (rep.deleted, rep.edited, rep.adopted, rep.services_deleted, rep.services_failed) == ([3], [1], [6], 2, 0)
+        assert sorted(chan.msgs) == [1, 2, 4, 5, 6]  # the two new notices are gone, the old one is left alone
 
         assert await db.find_by_message(1, 3) is None
         assert (await db.find_by_message(1, 1)).text == "first, edited"
@@ -227,9 +227,9 @@ def test_the_sync_compares_and_cleans_a_channel_through_a_real_client(wire, tmp_
     assert fulls and all(isinstance(r.channel, types.InputChannel) and r.channel.channel_id == 1 for r in fulls)
     reads = [r for r in seen if isinstance(r, functions.channels.GetMessagesRequest)]
     assert reads and all(isinstance(r.channel, types.InputChannel) for r in reads)
-    # only the notices were deleted, in one request, and nothing was written to the channel
+    # only the two new notices were deleted, in one request, and nothing was written to the channel
     deletes = [r for r in seen if isinstance(r, functions.channels.DeleteMessagesRequest)]
-    assert [i for r in deletes for i in r.id] == [4, 7, 8]
+    assert [i for r in deletes for i in r.id] == [7, 8]
     assert all(isinstance(r.channel, types.InputChannel) and r.channel.channel_id == 1 for r in deletes)
     writes = (
         functions.messages.SendMessageRequest, functions.messages.SendMediaRequest, functions.messages.SendMultiMediaRequest,
@@ -291,3 +291,43 @@ def test_deleting_a_notice_and_the_refusals_through_a_real_client(wire, tmp_path
         await db.close()
 
     asyncio.run(go())
+
+
+def test_a_restricted_channel_and_restricted_posts_through_a_real_client(wire, tmp_path):
+    """The channel object and the messages come back as real Telethon types, with Telegram's restriction marks."""
+    client, seen = wire.client, wire.seen
+    msgs, chan = synced_channel(wire)
+
+    async def go():
+        db, ch = await saved_world(tmp_path, msgs)
+        opts = SyncOptions(pause=0, grace=0)
+        await sync_channel(client, db, ch, opts)  # the first look
+
+        notice_text = "This message couldn't be displayed on your device due to copyright infringement."
+        chan.restriction = notice_text  # a copyright strike: the channel itself is restricted
+        for m in chan.msgs.values():
+            if not isinstance(m, types.MessageService):
+                m.message = notice_text
+        chan._pts += 4
+        del chan.msgs[3]
+        rep = await sync_channel(client, db, ch, opts)
+        assert rep.restricted_channel == notice_text and not rep.changed and rep.checked == 0
+        assert [p.text for p in await db.sent_posts(1)] == ["first", "second", "third", "fifth"]  # My posts untouched
+
+        chan.restriction = None  # only the posts carry the mark now (as real messages with restriction_reason)
+        for i in (1, 2):
+            chan.msgs[i].restriction_reason = [types.RestrictionReason("all", "copyright", notice_text)]
+        rep = await sync_channel(client, db, ch, opts)
+        assert sorted(rep.restricted) == [1, 2, 5] and rep.restricted_why in (notice_text, "Telegram shows a notice instead of the post")
+        assert rep.deleted == [3] and rep.edited == []  # post 3 really is gone, the others were left alone
+        assert [p.text for p in await db.sent_posts(1)] == ["first", "second", "fifth"]
+        await db.close()
+
+    asyncio.run(go())
+    writes = (
+        functions.messages.SendMessageRequest, functions.messages.SendMediaRequest, functions.messages.EditMessageRequest,
+        functions.messages.ForwardMessagesRequest, functions.channels.DeleteMessagesRequest,
+    )
+    assert not [r for r in seen if isinstance(r, writes)]
+    fulls = [r for r in seen if isinstance(r, functions.channels.GetFullChannelRequest)]
+    assert len(fulls) == 3 and all(isinstance(r.channel, types.InputChannel) for r in fulls)
