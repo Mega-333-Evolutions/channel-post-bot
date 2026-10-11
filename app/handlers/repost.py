@@ -147,23 +147,45 @@ def plan_text(p: RepostPlan, o: RepostOptions, title: str, delay: float) -> str:
 
 
 def held_plan_lines(p: RepostPlan, title: str, *, shift: bool = False) -> list:
-    """Plan lines about posts Telegram holds back (it shows a notice, for example for a copyright strike, instead of them)."""
+    """Plan lines about posts Telegram restricts (a copyright strike: the channel is "unavailable", or its posts are
+    marked or shown as a notice)."""
     lines = []
     name = esc(title)
-    if p.channel_restricted:
-        lines.append(f"• ⚠️ Telegram restricts {name} itself: “{esc(p.channel_restricted)}”")
     said = f" (“{esc(p.held_why)}”)" if p.held_why else ""
-    if p.held_saved:
+    if p.channel_restricted and shift:
+        lines.append(f"• ⚠️ Telegram restricts {name} itself: “{esc(p.channel_restricted)}”")
+    elif p.channel_restricted:
         lines.append(
-            f"• 📋 Telegram holds back {p.held_saved} post(s) of {name}{said} - it shows a notice instead of them. "
-            "Those are copied from what My posts saved of them: text, formatting, buttons and media (a file that "
+            f"• ⚠️ Telegram restricts {name} itself: “{esc(p.channel_restricted)}”. Telegram may hide what is posted into "
+            "such a channel as well, so a repost here may not bring the posts back. To save a struck channel use "
+            "/shift: it copies the posts from My posts into another channel."
+        )
+    if p.held_saved and p.no_media:
+        lines.append(
+            f"• 📋 {p.held_saved} post(s) of {name} are restricted by Telegram{said}. They are copied from what My posts "
+            "saved of them - text, formatting and buttons - not from what Telegram shows now."
+        )
+    elif p.held_saved:
+        lines.append(
+            f"• 📋 {p.held_saved} post(s) of {name} are restricted by Telegram{said}. They are copied from what My posts "
+            "saved of them - text, formatting, buttons and media - not from what Telegram shows now (a file that "
             "Telegram refuses goes out without it)."
+        )
+    if p.live_restricted and shift:
+        lines.append(
+            f"• ⚠️ {p.live_restricted} restricted post(s) of {name} have no saved copy in My posts, but Telegram still "
+            "hands out their content, so they are copied as they are now."
+        )
+    elif p.live_restricted:
+        lines.append(
+            f"• ⚠️ Telegram marks {p.live_restricted} post(s) of {name} as restricted but still hands out their content, "
+            "so they are copied as they are now."
         )
     if p.held_skipped and shift:
         lines.append(
-            f"• ⚠️ Telegram holds back {p.held_skipped} more post(s) of {name}{said} and My posts has no saved copy of "
-            "them, so they are skipped and the shift will show as not complete. If you have a backup made before that, "
-            "put it back with /import and run /shift again."
+            f"• ⚠️ Telegram shows only its notice for {p.held_skipped} more post(s) of {name}{said} and My posts has no "
+            "saved copy of them, so they are skipped and the shift will show as not complete. If you have a backup made "
+            "before that, put it back with /import and run /shift again."
         )
     elif p.held_skipped:
         lines.append(
@@ -171,36 +193,49 @@ def held_plan_lines(p: RepostPlan, title: str, *, shift: bool = False) -> list:
             "Copying the notice would be wrong, so they are skipped, and the old posts can't be deleted afterwards "
             "(the repost will show as not complete)."
         )
+    if p.channel_restricted or p.held_saved or p.live_restricted:
+        lines.append("• The new posts are read back: if Telegram itself hides them, the report says so.")
     return lines
 
 
 def held_notes(res) -> list:
-    """Lines about the posts Telegram holds back, for the end of a repost or shift."""
+    """Lines about the posts Telegram restricts, for the end of a repost or shift."""
     notes = []
 
     def sample(ids, n=8):
         return ", ".join(f"#{i}" for i in ids[:n]) + ("…" if len(ids) > n else "")
 
+    what = "text, formatting and buttons" if getattr(res, "no_media", False) else "text, formatting, buttons and media"
     if res.from_db:
         if res.from_saved:
             notes.append(
                 f"📋 The source can't be read, so {res.from_saved} post(s) were copied from what My posts saved of them: "
-                "text, formatting, buttons and media - without replies, pins and albums."
+                f"{what} - without replies, pins and albums."
             )
     elif res.from_saved:
         notes.append(
-            f"📋 {res.from_saved} post(s) are held back by Telegram - it shows a notice instead of them. They were "
-            "copied from what My posts saved of them: text, formatting, buttons and media."
+            f"📋 {res.from_saved} post(s) are restricted by Telegram. They were copied from what My posts saved of "
+            f"them: {what}."
         )
     if res.media_lost:
         notes.append(
             f"⚠️ {len(res.media_lost)} of them went out without their media, because Telegram refuses the saved file "
             f"({sample(res.media_lost)})."
         )
+    if res.live_restricted and res.used_saved:
+        notes.append(
+            f"⚠️ {res.live_restricted} restricted post(s) had no saved copy in My posts, so they were copied as Telegram "
+            "hands them out (their content was intact)."
+        )
+    elif res.live_restricted:
+        notes.append(
+            f"⚠️ Telegram marks {res.live_restricted} post(s) as restricted but still handed out their content, so they "
+            "were copied as they are."
+        )
     if res.held_back and res.used_saved:
         notes.append(
-            f"⚠️ {len(res.held_back)} post(s) are held back by Telegram and My posts has no saved copy of them, so they "
-            f"were not copied ({sample(res.held_back)}). Put a backup made before that back with /import, then use "
+            f"⚠️ {len(res.held_back)} post(s): Telegram shows only its notice and My posts has no saved copy of them, so "
+            f"they were not copied ({sample(res.held_back)}). Put a backup made before that back with /import, then use "
             "“Try the rest again”."
         )
     elif res.held_back:
@@ -212,9 +247,70 @@ def held_notes(res) -> list:
     return notes
 
 
-def finishing_notes(res) -> list:
-    """Lines about answers, links and pins for the end of a repost."""
-    notes = held_notes(res)
+def no_media_notes(res) -> list:
+    """Lines about the files that /shift --no-media left out."""
+    if not getattr(res, "no_media", False):
+        return []
+    notes = []
+    if res.files_left_out:
+        notes.append(f"🚫 {res.files_left_out} post(s) were copied as text only - their file was left out (--no-media).")
+    if res.file_only:
+        ids = ", ".join(f"#{i}" for i in res.file_only[:8]) + ("…" if len(res.file_only) > 8 else "")
+        notes.append(f"🚫 {len(res.file_only)} post(s) are only a file, so there was nothing to copy of them ({ids}).")
+    return notes
+
+
+def hidden_notes(res, *, shift: bool = False) -> list:
+    """Lines about new posts that TELEGRAM itself hides (they were read back after posting)."""
+    if not getattr(res, "hidden", None):
+        return []
+    k, n = len(res.hidden), res.checked
+    with_file = sum(1 for _, has in res.hidden if has)
+    plain = k - with_file
+    why = f" (“{esc(res.hidden_why)}”)" if res.hidden_why else ""
+    lines = [
+        f"⚠️ <b>Telegram itself hides {k} of the {n} new post(s) I read back</b>{why}: right after they were created they "
+        "carry its restriction mark, so its apps show the notice instead of them. The bot did not copy a notice - it "
+        "never posts one: Telegram marks these posts itself, because of something in them or because of the destination."
+    ]
+    if with_file:
+        hint = (
+            " <code>/shift … --no-media</code> copies the text and buttons without the files."
+            if shift
+            else ""
+        )
+        lines.append(
+            f"• {with_file} post(s) of these carry a file. Telegram may hide a message that carries a file it has "
+            f"blocked for copyright, wherever it is posted.{hint}"
+        )
+    if plain:
+        lines.append(
+            f"• {plain} post(s) of these have no file: Telegram hides them for their text or links, or because it "
+            "restricts the new channel too."
+        )
+    if getattr(res, "dst_restricted", None):
+        lines.append(f"• Telegram restricts the destination channel itself: “{esc(res.dst_restricted)}”.")
+    if getattr(res, "hidden_stop", False):
+        lines.append(
+            f"⏹ <b>I stopped after {res.copied_units} post(s)</b>: Telegram hides every new copy I read back, so going on "
+            "would only add more posts nobody can see. Nothing else was posted. ▶️ <b>Continue anyway</b> copies the rest; "
+            "↩️ <b>Undo</b> removes the copies."
+        )
+    lines.append("The saved posts in My posts are intact. Undo removes the new copies again.")
+    return lines
+
+
+def hidden_progress(res) -> str:
+    """One line for the running progress message when Telegram hides what was just posted."""
+    if not getattr(res, "hidden", None):
+        return ""
+    why = f" (“{esc(res.hidden_why)}”)" if res.hidden_why else ""
+    return f"\n⚠️ Telegram itself hides {len(res.hidden)} of the {res.checked} new posts checked so far{why}. ⏹ Stop is below."
+
+
+def finishing_notes(res, *, shift: bool = False) -> list:
+    """Lines about answers, links and pins for the end of a repost or shift."""
+    notes = held_notes(res) + no_media_notes(res) + hidden_notes(res, shift=shift)
     if res.replies:
         notes.append(f"↩️ {res.replies} post(s) answer the copy of the post they answered.")
     if res.reply_lost:
@@ -430,6 +526,7 @@ def register(ctx: Ctx) -> None:
                 body = f"🔗 Copied {done}{of} posts. Now pointing links at the new copies and pinning…"
             else:
                 body = f"⏳ Copying <b>{esc(ch.title)}</b>: {done}{of} posts…\nThe old posts stay untouched."
+                body += hidden_progress(res)
             try:
                 await edit_callback_message(event, body, [[Button.inline("⏹ Stop", f"rps:{mig.id}")]])
             except errors.MessageNotModifiedError:

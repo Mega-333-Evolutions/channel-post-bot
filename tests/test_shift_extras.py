@@ -381,7 +381,7 @@ def test_an_unknown_option_is_explained(tmp_path):
     async def go():
         app, dst, other = await extras_app(tmp_path)
         await app.text("/shift @srcch @dstch -x")
-        assert "Unknown option -x" in norm(app.out.last_text) and "-c and -all" in norm(app.out.last_text)
+        assert "Unknown option -x" in norm(app.out.last_text) and "-c, -all and --no-media" in norm(app.out.last_text)
         assert dst.title == "Anime Backup"
         await app.db.close()
 

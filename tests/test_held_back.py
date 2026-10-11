@@ -6,6 +6,7 @@ import asyncio
 from telethon import functions, types
 
 from app.repost_engine import RepostOptions, plan_repost, saved_lookup
+from app.restrictions import PLACEHOLDER_NOTE
 from app.shift_engine import run_shift
 from app.tgutil import button_url
 
@@ -13,7 +14,7 @@ from .dbutil import db_url_for, fresh_db
 from .fakes import FakeChannelClient, make_msg, markup, photo_media, rpc, service_msg, url_btn
 from .harness import norm
 from .test_repost_flow import fill, make_app
-from .test_restricted import NOTICE, strike
+from .test_restricted import CHANNEL_NOTICE, NOTICE, strike
 from .test_shift import SRC, old_posts, shift_app
 from .test_sync import saved
 
@@ -135,24 +136,30 @@ def test_a_post_that_telegram_shows_as_it_is_still_comes_from_the_channel(tmp_pa
     run(go())
 
 
-def test_a_post_with_telegrams_mark_that_is_still_handed_out_as_it_is_is_an_ordinary_post(tmp_path):
+def test_a_post_with_telegrams_mark_comes_from_my_posts_even_when_telegram_still_hands_it_out(tmp_path):
+    """The rule of a struck channel: what My posts saved wins over what Telegram hands out now - however intact that
+    looks. Only a post without a saved copy is copied as Telegram hands it out (it is the post itself, not a notice)."""
+
     async def go():
         orig = originals()
         live = dict(orig)
         live[2] = strike(make_msg(2, "Episode 2 is out", [types.MessageEntityBold(0, 9)], markup=orig[2].reply_markup))
-        live[3] = strike(make_msg(3, "Caption with link", [types.MessageEntityTextUrl(13, 4, "https://t.me/srcch/5")], media=photo_media(31)))
+        live[3] = strike(make_msg(3, "Caption as Telegram hands it out", media=photo_media(31)))  # differs from My posts
         src = FakeChannelClient(live, username="srcch", title="Anime Source")
         dst = src.add_channel(FakeChannelClient(old_posts(), username="dstch", cid=2, title="Anime Backup"))
+        for m in orig.values():
+            src._remember_media(m)
         db = await fresh_db(db_url_for(tmp_path))
         await db.save_channel(1, 5, "Anime Source", "srcch", 1)
         await db.save_channel(2, 6, "Anime Backup", "dstch", 1)
         await save_rows(db, orig, skip=(2,))  # no saved copy of post 2; post 3 has one
         await db.create_shift("s1", src=SRC, dst_channel_id=2, first_id=1, last_id=6, user_id=1)
         res = await run_shift(src, db, await db.get_shift("s1"), await db.get_channel(2), 99, delay=0, settle_pause=0)
-        # the live posts are what they are: nothing is rebuilt from My posts, nothing is skipped
-        assert res.from_saved == 0 and res.held_back == [] and res.failed == [] and res.copied_units == 5
+        assert res.held_back == [] and res.failed == [] and res.copied_units == 5
+        assert res.from_saved == 1  # post 3
+        assert res.live_restricted == 1  # post 2: marked, but nothing saved to use instead and its content is intact
         assert shown(dst) == {11: "Welcome", 12: "Episode 2 is out", 13: "Caption with link", 14: "Fifth", 15: "Sixth"}
-        assert 3 in forwarded_ids(dst)
+        assert forwarded_ids(dst) == [1, 6]  # a restricted post is never copied by Telegram itself
         await db.close()
 
     run(go())
@@ -178,14 +185,54 @@ def test_a_post_that_telegram_empties_out_is_held_back_too(tmp_path):
     run(go())
 
 
-def test_a_text_that_my_posts_has_too_is_the_owners_own_wording_not_a_notice(tmp_path):
+def test_telegrams_notice_is_never_posted_even_when_my_posts_holds_it_as_the_text(tmp_path):
+    """A saved copy made from a restricted post can hold Telegram's notice as its text (an older version did that), and a
+    post may really say it: either way it is indistinguishable from the notice, so it is not copied - and reported."""
+
     async def go():
         orig = originals()
-        orig[6] = make_msg(6, NOTICE)  # the owner really wrote this
+        orig[6] = make_msg(6, NOTICE)
         src, dst, db, dst_row, shift = await held_setup(tmp_path, held=(2, 3, 5), orig=orig, flagged=False)
         res = await run_shift(src, db, shift, dst_row, 99, delay=0, settle_pause=0)
-        assert res.from_saved == 3 and res.held_back == [] and res.failed == []
-        assert dst.msgs[15].message == NOTICE and 6 in forwarded_ids(dst)  # copied as it is
+        assert res.from_saved == 3 and res.held_back == [6] and res.failed == []
+        assert shown(dst) == {11: "Welcome", 12: "Episode 2 is out", 13: "Caption with link", 14: "Fifth"}
+        assert not any(NOTICE in (m.message or "") for m in dst.msgs.values())
+        assert 6 not in forwarded_ids(dst) and res.held_why == PLACEHOLDER_NOTE
+        await db.close()
+
+    run(go())
+
+
+def test_a_saved_copy_that_holds_the_notice_is_not_used_for_a_restricted_post(tmp_path):
+    async def go():
+        orig = originals()
+        orig[5] = make_msg(5, "Fifth")  # answers nothing
+        src, dst, db, dst_row, shift = await held_setup(tmp_path, held=(2, 3), no_row=(2,), orig=orig)
+        await db.create_post(  # what an older version saved when it synced the struck post
+            channel_id=1, message_id=2, status="sent", source="adopted", created_by=1, link_preview=False,
+            text=NOTICE, entities=[], buttons=[], media_kind=None, media_file_id=None,
+        )
+        res = await run_shift(src, db, shift, dst_row, 99, delay=0, settle_pause=0)
+        # post 2: Telegram shows the notice and the saved copy is the notice too: nothing to copy; post 3 is fine
+        assert res.held_back == [2] and res.from_saved == 1 and res.failed == []
+        assert shown(dst) == {11: "Welcome", 12: "Caption with link", 13: "Fifth", 14: "Sixth"}
+        assert not any(NOTICE in (m.message or "") for m in dst.msgs.values())
+        await db.close()
+
+    run(go())
+
+
+def test_an_answer_to_a_post_that_could_not_be_copied_follows_when_that_post_has_its_copy(tmp_path):
+    async def go():
+        src, dst, db, dst_row, shift = await held_setup(tmp_path, held=(2,), no_row=(2,))  # post 5 answers post 2
+        res = await run_shift(src, db, shift, dst_row, 99, delay=0, settle_pause=0)
+        assert res.held_back == [2] and res.failed == [(5, "ReplyParentMissing")]  # it would answer nothing
+        assert shown(dst) == {11: "Welcome", 12: "Caption with link", 13: "Sixth"}
+        await save_rows(db, {2: originals()[2]})  # the saved copy arrives
+        again = await run_shift(src, db, shift, dst_row, 99, delay=0, settle_pause=0)
+        assert again.held_back == [] and again.failed == [] and again.copied_units == 2
+        assert dst.msgs[14].message == "Episode 2 is out" and dst.msgs[15].message == "Fifth"
+        assert dst.msgs[15].reply_to.reply_to_msg_id == 14  # the answer answers the copy
         await db.close()
 
     run(go())
@@ -376,22 +423,26 @@ def buttons(app):
 def test_the_shift_plan_and_result_explain_what_comes_from_my_posts(tmp_path):
     async def go():
         app, dst = await held_app(tmp_path, no_row=(5,))
-        app.tg.restriction = NOTICE
+        app.tg.restriction = CHANNEL_NOTICE  # the whole channel is struck: My posts is used for every post it has
         await app.text("/shift @srcch @dstch")
         plan = norm(app.out.last_text)
-        assert "Telegram restricts Anime Source itself" in plan
-        assert "Telegram holds back 2 post(s) of Anime Source" in plan and "copied from what My posts saved of them" in plan
-        assert "holds back 1 more post(s)" in plan and "no saved copy" in plan and "/import" in plan
+        assert "Telegram restricts Anime Source itself" in plan and "unavailable due to copyright infringement" in plan
+        assert "4 post(s) of Anime Source are restricted by Telegram" in plan
+        assert "copied from what My posts saved of them" in plan and "not from what Telegram shows now" in plan
+        assert "Telegram shows only its notice for 1 more post(s)" in plan and "no saved copy" in plan and "/import" in plan
         assert "4 posts" in plan  # 1, 2, 3 and 6 are copied
+        assert "The new posts are read back" in plan
         assert not any(isinstance(r, functions.messages.SendMessageRequest) for r in dst.requests)  # a plan posts nothing
 
         await app.press(app.out.callback_data("Start copying"))
         done = norm(app.out.last_text)
-        assert "2 post(s) are held back by Telegram" in done and "copied from what My posts saved of them" in done
-        assert "1 post(s) are held back by Telegram and My posts has no saved copy of them" in done and "#5" in done
+        assert "4 post(s) are restricted by Telegram" in done and "copied from what My posts saved of them" in done
+        assert "1 post(s): Telegram shows only its notice and My posts has no saved copy of them" in done and "#5" in done
         assert "not everything was copied" in done  # so the rest can be tried again later
         assert any("Try the rest again" in t for t in buttons(app))
+        assert "hides" not in done  # nothing the new posts show is restricted
         assert not any(NOTICE in (m.message or "") for m in dst.msgs.values())
+        assert forwarded_ids(dst) == []  # a struck channel: nothing is copied by Telegram itself
 
         # the missing copy arrives (a backup put back with /import): the rest can be copied
         await save_rows(app.db, {5: originals()[5]})

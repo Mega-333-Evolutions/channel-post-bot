@@ -21,7 +21,7 @@ reported to a Telegram chat.
 | `/replace` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
 | `/handleswap` | swaps a `@username` that is *written* in posts (text, captions, button names) - links are left alone. Preview first, full undo |
 | `/repost` | copies **every post of a channel, in order**, to the end of the channel (links swapped on the way, replies, pins and links between posts kept), registers the copies in My posts, verifies every button, **points links to the old posts - in this and in all your other connected channels - at the copies**, then deletes the old posts after your confirmation |
-| `/shift` | copies posts from **one channel into another** (all, or a range of message ids); the source is only read. `-c` points links to the source's posts in all your connected channels at the copies, `-all` also gives the destination the source's name, description and photo. Posts Telegram holds back after a copyright strike are copied from My posts |
+| `/shift` | copies posts from **one channel into another** (all, or a range of message ids); the source is only read. `-c` points links to the source's posts in all your connected channels at the copies, `-all` also gives the destination the source's name, description and photo. Posts Telegram holds back after a copyright strike are copied from My posts, whatever Telegram hands out of them now; `--no-media` leaves the files out |
 | `/broadcast` | sends one message to every channel; with a time (`50m`, `1h`, `5d`) it is deleted again from the channels and from My posts. `/boardcast` works too |
 | Service notices | "name changed", "photo changed", "pinned a message", live stream notices ... are deleted from every connected channel |
 | Sync | posts deleted, edited or added by other admins are recorded in My posts (`/sync` runs it now); the posts that were in a channel before the bot was added are read in; what Telegram itself does to a channel (a copyright strike) is never taken for an edit |
@@ -178,16 +178,17 @@ Without a userbot, the bot tells you what is left and which messages they are; d
 media, albums, buttons and replies, and lists the copies in My posts. `/shift @source @destination 15 20` copies only the
 posts with message ids 15 to 20, `/shift @source @destination 15` only post 15.
 
-Two optional extras can be added - alone or together, in any order, before or after the range (`- all` typed with a space
+Three optional extras can be added - alone or together, in any order, before or after the range (`- all` typed with a space
 is understood too):
 
 | Option | What it does |
 |---|---|
 | `-c` | afterwards the bot looks through **all your connected channels** for links to a post of the source - `https://t.me/old/52`, `https://t.me/c/123/52`, a hyperlink behind text, a link typed in the text, a link button - and points each at the equivalent post of the destination (`https://t.me/new/<id of its copy>`). The source itself is only read |
 | `-all` | afterwards the destination gets the **name, description and profile photo** of the source. Its own are replaced (undo does not bring them back); a part the source does not have is left as it is. The bot needs the *Change channel info* admin right in the destination (the plan warns if it lacks it) |
+| `--no-media` | **no file is copied**: every post goes out as its text with its formatting and buttons. A post that is only a file has nothing to copy and is left out (counted, not an error); an album becomes one text post per picture that has a caption. `-nomedia` and a long dash typed by a phone keyboard in place of `--` are understood too. Use it when Telegram hides the new copies because of their files (see the next section) |
 
-`/shift @old @new`, `/shift @old @new -c`, `/shift @old @new -all`, `/shift @old @new -c -all` and
-`/shift @old @new -all -c` all work; so does a range: `/shift @old @new 15 20 -c`.
+`/shift @old @new`, `/shift @old @new -c`, `/shift @old @new -all`, `/shift @old @new --no-media`, `/shift @old @new -c -all`
+and `/shift @old @new -all -c` all work; so does a range: `/shift @old @new 15 20 -c`.
 
 - The source is **only read**: nothing in it is changed or deleted, and the bot need not be an admin there. It does have to
   be able to read it: a member of it, or a public channel found by its `@username`. Give it as `@username`, a t.me link,
@@ -195,7 +196,10 @@ is understood too):
   mean - it cannot join by itself). The bot must be an admin of the destination (*Post messages*).
 - You see a plan first and press **Start copying**. **Stop** and **Continue** work like in `/repost`; **Undo** removes the
   copies again from the destination. The extras are remembered with the shift, so **Continue** and **Try the rest again**
-  keep them.
+  keep them (`--no-media` included). `/shift` on its own shows the shift that is not finished, or else the latest finished
+  one that still has copies, with its **Undo** - so the button is found again without scrolling up to the old message.
+  Undo a shift you are not happy with *before* you run it again: the old copies stay in the destination otherwise and the
+  plan warns that those posts would be copied a second time.
 - Links from a copied post to another post of the source follow the content: if that post was copied too, the link points
   at its copy in the destination; links to posts that were not copied stay as they were.
 - **`-c`** follows the same rules as the repost's link update (see above): only links to posts that were copied change, a
@@ -212,26 +216,59 @@ is understood too):
 
 ## Copyright strikes: what Telegram does is not an admin's edit
 
-When a channel gets a copyright strike, Telegram shows "This message couldn't be displayed on your device due to copyright
-infringement." in place of its posts. The bot treats that as what it is - something Telegram did, not something an admin did:
+When a channel gets a copyright strike, Telegram marks the channel ("This channel is unavailable due to copyright
+infringement.") and its apps show "This message couldn't be displayed on your device due to copyright infringement." in
+place of its posts. The bot treats that as what it is - something Telegram did, not something an admin did:
 
 - **Sync:** My posts stays exactly as it was saved. A channel Telegram restricts is not looked at (the report says so), a single
   post Telegram holds back, a notice shown in place of a post, and many posts that suddenly all show one and the same text are
   never taken for edits: nothing is edited, removed or added for them.
-- **`/shift`:** a post of the source that Telegram holds back is copied from what **My posts** saved of it - text, formatting,
-  buttons and media (that is why My posts should have the channel's posts *before* the strike: connect the channel early, or
-  `/import` a backup). The plan counts them. A saved media file that Telegram refuses (a file taken down for copyright) is
-  tried again without its old file reference and, if it is still refused, a post that has text goes out without the file
-  (the result names these posts; a post that is only a refused file fails and is listed). A post that My posts has no saved
-  copy of is skipped and listed, and the shift then shows "not everything was copied": after the data is there - for
-  instance after `/import` - **Try the rest again** copies the rest. If the source **can't be read at all** (a banned or
-  private channel) and My posts has its posts, the plan says so and offers to copy everything from My posts alone; replies,
-  pins and albums are not kept that way (an album's pictures become posts of their own).
-- **`/repost`:** a post Telegram holds back is not copied (the notice must not become a post) and so is not deleted.
+- **`/shift` - the rule:** a source that Telegram restricts is copied from what **My posts** saved of its posts - text,
+  formatting, buttons and media - **every post that has a saved copy, however intact Telegram's version still looks**
+  (that is why My posts should have the channel's posts *before* the strike: connect the channel early, or `/import` a
+  backup). The restriction is recognised from the channel itself, from a mark on a single post, or from the notice shown as a
+  post's text. Nothing is copied out of such a channel by Telegram itself (forwarding from it is refused anyway). The plan
+  counts the posts; **Telegram's notice is never posted**, from whichever source - a saved copy whose text *is* the notice
+  (an older version could save that) is not used either.
+- A post of a restricted source that My posts has **no saved copy** of is copied as Telegram hands it out when that is the
+  post itself (the plan and the result say how many), and skipped and listed when only the notice is left; the shift then
+  shows "not everything was copied", and after the data is there - for instance after `/import` - **Try the rest again**
+  copies the rest.
+- A saved media file that Telegram refuses (a file taken down for copyright) is tried again without its old file reference
+  and, if it is still refused, a post that has text goes out without the file (the result names these posts; a post that is
+  only a refused file fails and is listed).
+- If the source **can't be read at all** (a banned or private channel) and My posts has its posts, the plan says so and
+  offers to copy everything from My posts alone; replies, pins and albums are not kept that way (an album's pictures become
+  posts of their own).
+- **`/repost`:** a post Telegram holds back is not copied (the notice must not become a post) and so is not deleted. A
+  channel Telegram restricts as a whole is not a good place for a repost - Telegram may hide what is posted into it as
+  well - the plan says so and points at `/shift`.
 - **Links (`-c`, repost):** posts Telegram holds back are not edited.
 
-A post counts as held back when what Telegram hands out for it is its notice - or nothing - instead of the post. A post that
-carries Telegram's restriction mark but is still handed out as it is, is an ordinary post for a copy.
+### Telegram can hide the NEW copies too - the read-back
+
+Copying the right content does not guarantee that people can see the copies: Telegram may restrict a **new** post by itself
+(a file it has blocked for copyright, a link, or a destination channel it restricts). The bot cannot see what Telegram will
+decide, so it **reads the new posts back right after posting** (every one when the source is restricted, otherwise the first
+three and then every tenth) and looks for Telegram's restriction mark or its notice on them.
+
+- If it finds some, the result says so in plain words - "Telegram itself hides k of the n new posts I read back" - with
+  Telegram's own wording, how many of them carry a file, and whether the destination channel is restricted as well. It does
+  **not** claim the bot copied a notice: the bot never posts one.
+- When the **first three** copies that were read back are all hidden, the shift **stops by itself** instead of filling the
+  destination with posts nobody can see. The result offers **▶️ Continue anyway** (the rest is copied without stopping again)
+  and **↩️ Undo** (removes the copies).
+- If files are the reason, `/shift @source @destination --no-media` copies the text and buttons without them. The bot never
+  re-uploads or alters a file to get past Telegram's copyright enforcement - a blocked file stays blocked.
+- The saved posts in My posts are never changed by any of this.
+
+**What is verified and what is not:** all of this is covered by tests against a simulated Telegram. How the real Telegram
+answers for a struck channel (what it hands out for its posts, whether it marks the new copies, and why) is **not**
+verified - which is exactly why the copies are read back and the result reports what Telegram did.
+
+A post counts as held back when what Telegram hands out for it is its notice - or nothing - instead of the post. In a
+restricted source a post's own restriction mark makes it restricted too; where the channel is not restricted, a post that
+carries the mark is copied from My posts when there is a saved copy and as Telegram hands it out when there is none.
 
 ## 📣 `/broadcast`
 
@@ -371,8 +408,10 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
   channel update to the bot (the live sync and the notice removal depend on it - the timed check is the safety net), whether
   a bot may pin and delete as assumed, how forwarding behaves for every kind of source, and the real 48-hour delete limit.
   The same goes for the copyright rules: how exactly Telegram marks a held-back post (its own restriction mark, or the
-  notice as the text) is not verified - the bot recognises both, but the first real strike may show another shape. Try
-  `/repost --last 3` and `/shift` with a small range on a test channel first.
+  notice as the text), what it hands out for the posts of a struck channel, and whether it marks the *new* copies is not
+  verified - the bot recognises both shapes and reads the copies back (see "Telegram can hide the NEW copies too"), but the
+  real thing may show another shape. Try `/repost --last 3` and `/shift` with a small range (for example
+  `/shift @source @destination 1 3`) on a test channel first.
 - `/shift -all` copies the name, description and profile photo only - not the invite links, the username, the admins or the
   channel's settings - and undo does not give the destination its old ones back. `-c` and the repost's link update read every
   message id of every connected channel up to its counter, so a big channel takes a while; a post of somebody else is only

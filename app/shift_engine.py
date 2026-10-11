@@ -4,14 +4,22 @@
 It is the /repost copy loop pointed at two channels. Links from a shifted post to another post of the source channel
 follow the content: when that post was shifted too, the link points at its copy in the destination.
 
-Two optional extras are remembered with the shift (job marks), so that continuing a stopped shift keeps them:
-  -c    afterwards every link to a post of the source, in ANY connected channel, is pointed at the copy
-        (crosslinks.relink_after_shift; the source itself is only read);
-  -all  afterwards the destination gets the source's name, description and profile photo (profile_copy.copy_profile).
+Three optional extras are remembered with the shift (job marks), so that continuing a stopped shift keeps them:
+  -c          afterwards every link to a post of the source, in ANY connected channel, is pointed at the copy
+              (crosslinks.relink_after_shift; the source itself is only read);
+  -all        afterwards the destination gets the source's name, description and profile photo
+              (profile_copy.copy_profile);
+  --no-media  the copies get no files: every post is copied as its text, with its formatting and buttons (mark "nomedia";
+              repost_engine.without_files). A post that is only a file has nothing to copy and is left out.
 
-A source that Telegram holds back (a copyright strike: it shows a notice instead of its posts) is copied from what
-My posts saved of the posts (repost_engine: held_back_reason / stand_ins). A source that can't be read at all (a banned
-or private channel) is copied from My posts alone: mark "fromdb", set when the plan was made that way.
+When Telegram hides the first new copies (read back right after posting) the shift stops by itself - more copies would
+only be more posts nobody can see - and goes on only when the owner presses Continue (mark "hiddenok").
+
+A source that Telegram restricts (a copyright strike: "This channel is unavailable due to copyright infringement", its
+posts marked or shown as a notice) is copied from what My posts saved of its posts - every post that has a saved copy,
+however intact Telegram's version looks (repost_engine.copy_source). A post without a saved copy is copied as Telegram
+hands it out if that is the post itself, and skipped if it is only the notice. A source that can't be read at all (a
+banned or private channel) is copied from My posts alone: mark "fromdb", set when the plan was made that way.
 """
 from __future__ import annotations
 
@@ -22,6 +30,7 @@ from typing import Any, Awaitable, Callable, Optional
 from .crosslinks import CrossResult, relink_after_shift, shift_links
 from .profile_copy import copy_profile
 from .repost_engine import (
+    STOP_IF_HIDDEN,
     CopyJob,
     DeleteResult,
     RepostOptions,
@@ -34,6 +43,7 @@ from .repost_engine import (
     saved_lookup,
     saved_units,
 )
+from .restrictions import probe_channel
 from .tgutil import peer_of
 
 log = logging.getLogger(__name__)
@@ -46,12 +56,14 @@ def source_of(shift) -> SimpleNamespace:
     )
 
 
-async def plan_from_my_posts(db, src, first_id=None, last_id=None, unreadable=None) -> Optional[RepostPlan]:
+async def plan_from_my_posts(
+    db, src, first_id=None, last_id=None, unreadable=None, no_media: bool = False
+) -> Optional[RepostPlan]:
     """The plan of a shift made from My posts alone, for a source that can't be read; None when My posts has nothing
     of that channel (in that range)."""
     plan = plan_from_saved(
         src, await db.sent_posts_from(src.id, first_id or 1), RepostOptions(), first_id=first_id, last_id=last_id,
-        unreadable=unreadable,
+        unreadable=unreadable, no_media=no_media,
     )
     return None if plan.error else plan
 
@@ -73,7 +85,14 @@ async def run_shift(
     src = source_of(shift)
     idmap = dict(await db.shift_pairs(shift.id, alive_only=False))
     links = shift_links(src, dst, idmap)
-    from_db = "fromdb" in await db.marks_of(shift.id)  # the source can't be read: its posts come from My posts alone
+    marks = await db.marks_of(shift.id)
+    from_db = "fromdb" in marks  # the source can't be read: its posts come from My posts alone
+    restricted = None
+    if not from_db:  # does Telegram restrict the source channel itself (a copyright strike)? Then My posts is used
+        try:
+            _top, restricted, _err = await probe_channel(client, peer_of(src))
+        except Exception:  # unknown is treated as "not restricted": marks on single posts and the read-back still guard
+            log.warning("could not ask Telegram whether the source channel is restricted", exc_info=True)
     job = CopyJob(
         src_peer=peer_of(src),
         dst_peer=peer_of(dst),
@@ -88,6 +107,9 @@ async def run_shift(
         use_saved=True,
         units=(lambda: saved_units(db, src.id, shift.first_id, shift.last_id)) if from_db else None,
         from_db=from_db,
+        restricted=restricted,
+        no_media="nomedia" in marks,
+        stop_if_hidden=0 if "hiddenok" in marks else STOP_IF_HIDDEN,  # the owner said to go on although Telegram hides them
     )
     res = await copy_loop(client, job, delay=delay, progress=progress, should_stop=should_stop, settle_pause=settle_pause)
     if not res.stopped and not res.aborted:

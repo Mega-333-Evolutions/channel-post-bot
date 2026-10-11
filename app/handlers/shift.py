@@ -18,7 +18,7 @@ from ..repost_engine import RepostOptions, RepostPlan, RepostResult, plan_repost
 from ..shift_engine import delete_shift_copies, plan_from_my_posts, run_shift, shift_profile, source_of
 from ..tgutil import esc, explain_rpc, get_rights, post_link
 from ..userbot import delete_problem_text
-from .repost import finishing_notes, held_plan_lines
+from .repost import finishing_notes, held_plan_lines, hidden_progress
 
 log = logging.getLogger(__name__)
 
@@ -31,23 +31,28 @@ USAGE = (
     "<code>/shift @source @destination</code> - every post\n"
     "<code>/shift @source @destination 15 20</code> - only the posts with message ids 15 to 20\n"
     "<code>/shift @source @destination 15</code> - only post 15\n\n"
-    "A post that Telegram holds back in the source (a copyright strike: it shows “This message couldn't be displayed on "
-    "your device due to copyright infringement” instead of the post) is copied from what My posts saved of it. A post "
-    "without a saved copy is skipped.\n\n"
-    "Two extras, each optional, in any order, with or without a range:\n"
+    "A channel that Telegram restricts (a copyright strike: “This channel is unavailable due to copyright "
+    "infringement”, its posts shown as “This message couldn't be displayed on your device due to copyright "
+    "infringement”) is copied from what My posts saved of it - every post that has a saved copy, however intact "
+    "Telegram's version looks. Telegram's notice is never copied. A post without a saved copy is copied as Telegram "
+    "hands it out if it is still the post itself, and skipped if only the notice is left.\n\n"
+    "Three extras, each optional, in any order, with or without a range:\n"
     "<code>-c</code> - afterwards every link to a post of the source - in ANY of your connected channels - is pointed "
     "at the copy in the destination\n"
     "<code>-all</code> - afterwards the destination gets the source's name, description and profile photo\n"
-    "<code>/shift @source @destination -c -all</code> does both."
+    "<code>--no-media</code> - no file is copied: every post goes out as its text with its formatting and buttons "
+    "(use it when Telegram hides the copies because of their files)\n"
+    "<code>/shift @source @destination -c -all</code> does the first two."
 )
 
 
 @dataclass
 class ShiftFlags:
-    """The two optional extras of /shift."""
+    """The optional extras of /shift."""
 
     links: bool = False  # -c: links to the source's posts, in all connected channels, follow the copies
     profile: bool = False  # -all: the destination gets the source's name, description and profile photo
+    no_media: bool = False  # --no-media: the copies get no files (text, formatting and buttons only)
 
 
 @dataclass
@@ -66,26 +71,30 @@ class ShiftJob:
     created: float = field(default_factory=time.monotonic)
 
 
-_OPTION = re.compile(r"^-{1,2}([A-Za-z][A-Za-z0-9_]*)$")
+_OPTION = re.compile(r"^[-\u2013\u2014]{1,2}([A-Za-z][A-Za-z0-9_-]*)$")  # phone keyboards turn "--" into a long dash
 
 
 def parse_shift_args(raw: str) -> tuple:
     """-> (source text, destination text, first id or None, last id or None, ShiftFlags).
 
-    -c and -all can stand anywhere, in any order ("- all" with a space is understood too); a channel id such as
-    -1001234567890 is not an option."""
-    text = re.sub(r"(?<!\S)(-{1,2})\s+(all|c)(?!\S)", r"\1\2", raw or "", flags=re.I)
+    -c, -all and --no-media can stand anywhere, in any order ("- all" with a space is understood too, and so are
+    -nomedia and a long dash in place of --); a channel id such as -1001234567890 is not an option."""
+    text = re.sub(r"(?<!\S)([-\u2013\u2014]{1,2})\s+(all|c|no[-_]?media)(?!\S)", r"\1\2", raw or "", flags=re.I)
     flags, toks = ShiftFlags(), []
     for t in text.split():
         m = _OPTION.match(t)
         if m is None:
             toks.append(t)
-        elif m.group(1).lower() == "c":
+            continue
+        name = re.sub(r"[-_]", "", m.group(1)).lower()
+        if name == "c":
             flags.links = True
-        elif m.group(1).lower() == "all":
+        elif name == "all":
             flags.profile = True
+        elif name == "nomedia":
+            flags.no_media = True
         else:
-            raise ValueError(f"Unknown option {t}. The options are -c and -all.")
+            raise ValueError(f"Unknown option {t}. The options are -c, -all and --no-media.")
     if len(toks) < 2 or len(toks) > 4:
         raise ValueError("Give the source and the destination channel, and optionally the first and the last message id.")
     nums: list = []
@@ -122,6 +131,13 @@ def plan_text(
     if p.dropped_posts:
         lines.append(f"• {p.dropped_posts} post(s) carry other bots' buttons (reactions...) - those are not copied")
     lines += held_plan_lines(p, src.title, shift=True)
+    if p.no_media:
+        note = "• 🚫 <b>--no-media</b>: no file is copied - every post goes out as its text with its formatting and buttons"
+        if p.files_left_out:
+            note += f". {p.files_left_out} post(s) carry a file that stays out"
+        if p.file_only:
+            note += f"; {p.file_only} post(s) are only a file, so there is nothing to copy of them and they are skipped"
+        lines.append(note + ".")
     if p.post_links:
         lines.append(
             f"• {p.post_links} link(s) in {p.post_link_posts} post(s) point at other posts of {esc(src.title)}: those that "
@@ -160,13 +176,30 @@ def plan_text(
             )
     minutes = max(1, round(p.eta_seconds(delay) / 60))
     if p.from_db:
+        what = "its text, formatting and buttons" if p.no_media else (
+            "its text, formatting, buttons and media (a file that Telegram refuses goes out without it)"
+        )
         how = (
-            "<b>How:</b> every post is posted again from what My posts saved of it - its text, formatting, buttons and "
-            "media (a file that Telegram refuses goes out without it) - and every button is read back to make sure it "
-            "is there. Copies go to the end of the destination silently, in the original order, and are registered in "
-            "My posts."
+            f"<b>How:</b> every post is posted again from what My posts saved of it - {what} - and every button is read "
+            "back to make sure it is there. Copies go to the end of the destination silently, in the original order, and "
+            "are registered in My posts."
         )
         kept = "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes, pins, replies and albums (every picture of an album becomes a post of its own)."
+    elif p.no_media:
+        how = (
+            "<b>How:</b> every post is posted again as its text with its formatting and buttons - no file is copied - and "
+            "every button is read back to make sure it is there. Copies go to the end of the destination silently, in the "
+            "original order, and are registered in My posts."
+        )
+        kept = "<b>Not kept:</b> the files, albums (a caption becomes a post of its own), original dates, view counts, reactions, comments, poll votes and pins."
+    elif p.channel_restricted:
+        how = (
+            "<b>How:</b> Telegram copies nothing out of a restricted channel, so every post is posted again - from what "
+            "My posts saved of it, or as Telegram hands it out when there is no saved copy - with its text, formatting, "
+            "media and buttons in one go, and every button is read back to make sure it is there. Copies go to the end of "
+            "the destination silently, in the original order, and are registered in My posts."
+        )
+        kept = "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes and pins."
     else:
         how = (
             "<b>How:</b> posts are copied by Telegram itself where possible (exactly as they are); posts with buttons or "
@@ -174,6 +207,8 @@ def plan_text(
             "back to make sure it is there. Copies go to the end of the destination silently, in the original order, and "
             "are registered in My posts."
         )
+        if p.held_saved or p.live_restricted:
+            how += " Posts that Telegram restricts are never copied by Telegram itself: they are posted again."
         kept = "<b>Not kept:</b> original dates, view counts, reactions, comments, poll votes and pins."
     lines += [
         "",
@@ -201,6 +236,8 @@ def register(ctx: Ctx) -> None:
             first_copy = f'\n<a href="{post_link(dst, c["first_new"])}">First copy</a>'
         undo = [Button.inline("↩️ Undo - remove the copies", f"sfu:{sh.id}")]
         marks = await db.marks_of(sh.id)
+        if "nomedia" in marks:
+            route += " (without files)"
         extras = []
         if "relink" in marks:
             extras.append([Button.inline("🔗 Update links again", f"sfl:{sh.id}")])
@@ -218,7 +255,8 @@ def register(ctx: Ctx) -> None:
             kb = []
         elif sh.status == "stopped":
             text = f"⏹ {route}: <b>stopped</b>. {c['copied']} message(s) copied so far.{first_copy}"
-            kb = [[Button.inline("▶️ Continue", f"sfc:{sh.id}")], undo]
+            go = "▶️ Continue anyway" if "hiddenok" in marks else "▶️ Continue"
+            kb = [[Button.inline(go, f"sfc:{sh.id}")], undo]
         elif sh.status == "copying":
             text = f"⏳ {route}: a shift was running when the bot stopped. {c['copied']} message(s) copied.{first_copy}"
             kb = [[Button.inline("▶️ Continue", f"sfc:{sh.id}")], undo]
@@ -241,8 +279,13 @@ def register(ctx: Ctx) -> None:
             if sh is not None:
                 text, kb = await view_for(sh)
                 await say(event, "Unfinished shift:\n\n" + text, kb)
-            else:
-                await say(event, USAGE)
+                return
+            await say(event, USAGE)
+            # a finished shift keeps its Undo: offer it again, so it can be found without scrolling up to its old message
+            last = await db.last_finished_shift()
+            if last is not None:
+                text, kb = await view_for(last)
+                await say(event, "Latest finished shift - you can still undo it:\n\n" + text, kb)
             return
         try:
             src_text, dst_text, first, last, flags = parse_shift_args(raw)
@@ -278,12 +321,12 @@ def register(ctx: Ctx) -> None:
             async with ctx.lock:
                 plan = await plan_repost(
                     client, src, RepostOptions(), progress=prog, first_id=first, last_id=last,
-                    saved=saved_lookup(db, src.id), use_saved=True,
+                    saved=saved_lookup(db, src.id), use_saved=True, no_media=flags.no_media,
                 )
         except errors.RPCError as e:
             why = explain_rpc(e)
             # a channel that can't be read any more (banned, private ...) may still be in My posts: copy it from there
-            plan = await plan_from_my_posts(db, src, first, last, unreadable=why)
+            plan = await plan_from_my_posts(db, src, first, last, unreadable=why, no_media=flags.no_media)
             if plan is None:
                 raise UserError(
                     f"I can't read {src.title}: {why}\nThe bot has to be a member of the source channel "
@@ -336,6 +379,7 @@ def register(ctx: Ctx) -> None:
                 body = f"🔗 Copied {done}{of} posts. Now pointing links at the new copies…"
             else:
                 body = f"⏳ Shifting {names}: {done}{of} posts…\nThe source stays untouched."
+                body += hidden_progress(res)
             try:
                 await edit_callback_message(event, body, [[Button.inline("⏹ Stop", f"sfs:{sid}")]])
             except errors.MessageNotModifiedError:
@@ -353,6 +397,8 @@ def register(ctx: Ctx) -> None:
             job.running = False
         status = "stopped" if res.stopped else ("incomplete" if (res.failed or res.aborted or res.held_back) else "copied")
         await db.set_shift_status(sid, status)
+        if res.hidden_stop:  # stopped because Telegram hides the copies: pressing Continue means "go on anyway"
+            await db.set_mark(sid, "hiddenok")
         sh = await db.get_shift(sid)
         text, kb = await view_for(sh)
         notes = []
@@ -372,7 +418,7 @@ def register(ctx: Ctx) -> None:
                 notes.append("ReplyParentMissing: that post answers a post whose copy failed; it follows when you try again.")
         if res.aborted:
             notes.append(f"Stopped early because of {esc(res.aborted)}.")
-        notes += finishing_notes(res)
+        notes += finishing_notes(res, shift=True)
         await edit_callback_message(event, text + ("\n\n" + "\n".join(notes) if notes else ""), kb)
 
     @on_cb(ctx, "sfa")
@@ -397,6 +443,8 @@ def register(ctx: Ctx) -> None:
             await db.set_mark(sid, "relink")
         if job.flags.profile:
             await db.set_mark(sid, "profile")
+        if job.flags.no_media:  # continuing the shift later goes on without files as well
+            await db.set_mark(sid, "nomedia")
         if p.from_db:  # the source can't be read: continuing the shift goes on from My posts as well
             await db.set_mark(sid, "fromdb")
         ctx.pending.pop(parts[0], None)

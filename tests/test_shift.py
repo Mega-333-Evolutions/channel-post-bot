@@ -390,6 +390,62 @@ def test_the_whole_flow_copy_then_undo(tmp_path):
     run(go())
 
 
+def test_without_arguments_a_finished_shift_can_still_be_undone(tmp_path):
+    """The result message of a finished shift may be far up the chat: /shift alone offers its Undo again."""
+    async def go():
+        app, dst = await shift_app(tmp_path)
+        before = len(app.out.log)
+        await app.text("/shift")  # nothing was shifted yet: only the usage
+        assert len(app.out.log) - before == 1 and "Usage: /shift" in norm(app.out.last_text)
+
+        await app.text("/shift @srcch @dstch")
+        await app.press(app.out.callback_data("Start copying"))
+        assert "7 message(s) copied" in norm(app.out.last_text)
+
+        await app.text("/shift")
+        assert "Usage: /shift" in norm(app.out.log[-2][1])  # the usage first, the finished shift right under it
+        text = norm(app.out.last_text)
+        assert "Latest finished shift - you can still undo it" in text and "7 message(s) copied" in text
+        await app.press(app.out.callback_data("Undo"))
+        await app.press(app.out.callback_data("Yes, remove"))
+        assert "7 copied message(s) removed from Anime Backup" in norm(app.out.last_text)
+        assert sorted(dst.msgs) == list(range(1, 11))
+
+        before = len(app.out.log)
+        await app.text("/shift")  # undone: nothing is left to offer
+        assert len(app.out.log) - before == 1 and "Latest finished shift" not in norm(app.out.last_text)
+        await app.db.close()
+
+    run(go())
+
+
+def test_only_a_finished_shift_that_still_has_copies_is_offered(tmp_path):
+    async def go():
+        app, dst = await shift_app(tmp_path)
+        await app.text("/shift @srcch @dstch")
+        await app.press(app.out.callback_data("Start copying"))
+        first = await app.db.last_finished_shift()
+        assert first is not None
+        # every copy of it was deleted some other way: nothing to undo, so nothing is offered
+        await app.db.mark_shift_deleted(first.id, 2, await app.db.shift_pending_new(first.id))
+        assert await app.db.last_finished_shift() is None
+        before = len(app.out.log)
+        await app.text("/shift")
+        assert len(app.out.log) - before == 1 and "Latest finished shift" not in norm(app.out.last_text)
+
+        # a newer shift is the one offered
+        await app.text("/shift @srcch @dstch")
+        await app.press(app.out.callback_data("Start copying"))
+        second = await app.db.last_finished_shift()
+        assert second is not None and second.id != first.id
+        await app.text("/shift")
+        assert "Latest finished shift" in norm(app.out.last_text)
+        assert app.out.callback_data("Undo") == f"sfu:{second.id}"
+        await app.db.close()
+
+    run(go())
+
+
 def test_a_destination_the_bot_does_not_know_yet_becomes_one_of_its_channels(tmp_path):
     async def go():
         app, dst = await shift_app(tmp_path)

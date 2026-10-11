@@ -924,6 +924,13 @@ class Database:
                 q = q.where(Shift.dst_channel_id == dst_id)
             return (await s.execute(q.order_by(desc(Shift.created_at)).limit(1))).scalar_one_or_none()
 
+    async def last_finished_shift(self) -> Optional[Shift]:
+        """The newest finished shift that still has copies in its destination - so its Undo can be offered again."""
+        async with self.Session() as s:
+            alive = select(ShiftItem.id).where(ShiftItem.shift_id == Shift.id, ShiftItem.new_deleted.is_(False)).exists()
+            q = select(Shift).where(Shift.status == "copied", alive).order_by(desc(Shift.created_at)).limit(1)
+            return (await s.execute(q)).scalar_one_or_none()
+
     async def set_shift_status(self, sid: str, status: str) -> None:
         async with self.Session() as s:
             sh = await s.get(Shift, sid)

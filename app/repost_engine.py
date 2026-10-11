@@ -17,10 +17,14 @@ What a plain copy would lose is put back as well:
     copy already exists, afterwards (finalize_repost) for posts that are copied later;
   * a post that was pinned has its copy pinned at the end.
 
-A post that TELEGRAM holds back (a copyright strike shows "This message couldn't be displayed on your device due to
-copyright infringement" instead of the post) is never copied as it looks now - that would copy the notice. /shift
-rebuilds such a post from what My posts saved of it (text, formatting, buttons, media); /repost leaves it alone.
-A post that has no saved copy is skipped and reported.
+A post that TELEGRAM restricts (a copyright strike: the whole channel is "unavailable due to copyright infringement",
+or the post carries a restriction mark, or Telegram's apps show "This message couldn't be displayed on your device due
+to copyright infringement" instead of the post) is not copied as Telegram hands it out now. /shift rebuilds such a post
+from what My posts saved of it (text, formatting, buttons, media) - for a restricted CHANNEL every post that has a saved
+copy, however intact Telegram's version looks. A post without a saved copy is copied as Telegram hands it out when that
+is the post itself, and skipped (and reported) when it is only Telegram's notice. Telegram's notice is never posted, from
+whichever source. /repost leaves a post whose content Telegram holds back alone.
+Every copy of a restricted source is read back: if Telegram itself hides the new post, that is reported (copy_loop).
 """
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ from .crosslinks import CrossResult, relink_after_repost
 from .linkswap import compute_message_changes, url_only_markup
 from .postlinks import PostLinks, relink_message
 from .replace_engine import CHUNK, FALLBACK_EMPTY_BATCHES, fetch_messages, is_skippable, preview_flag
-from .restrictions import is_placeholder_text, message_restriction, norm_text, probe_channel
+from .restrictions import PLACEHOLDER_NOTE, is_placeholder_text, message_restriction, probe_channel
 from .tgutil import (
     FATAL,
     build_markup,
@@ -178,24 +182,39 @@ def saved_lookup(db, channel_id: int) -> SavedLookup:
     return lookup
 
 
-def held_back_reason(unit: list, rows: dict) -> Optional[str]:
-    """What Telegram says when it holds this post back (a copyright strike ...), else None.
+def usable_row(row) -> bool:
+    """A saved post that can take the place of a restricted post: it has something to post, and what it says is not
+    Telegram's notice (a saved copy that an older version made from a restricted post can hold the notice)."""
+    if row is None:
+        return False
+    text = row.text or ""
+    if is_placeholder_text(text):
+        return False
+    return bool(text.strip() or row.media_file_id)
 
-    "Held back" means that what Telegram hands out is its notice - or nothing - instead of the post: copying that would
-    copy the notice. A post that carries Telegram's restriction mark but is handed out as it is (its text, its media)
-    is an ordinary post for a copy, and so is a text that the saved copy has too (the owner's own wording)."""
+
+def copy_source(unit: list, rows: dict, *, restricted: Optional[str] = None, use_saved: bool = False) -> tuple:
+    """Where the copy of this post (or album) comes from -> (source, why).
+
+      "live"  - as Telegram hands the post out: nothing restricts it, or Telegram restricts it but still hands out the
+                post itself and there is no saved copy to use instead;
+      "saved" - from what My posts saved of it: Telegram restricts the channel (`restricted`) or the post (a copyright
+                strike) and My posts has every part of it. Only when `use_saved` (/shift) - the saved copy wins even when
+                Telegram's version still looks intact, because that is the owner's rule for a struck channel;
+      "skip"  - not copied: what Telegram hands out is its notice - or nothing - and My posts can't take over.
+
+    `why` is Telegram's own wording about the restriction, None when nothing restricts the post."""
+    marked = next((w for w in (message_restriction(m) for m in unit) if w), None)
+    why = marked or restricted
+    if why is None:
+        return "live", None
+    if use_saved and all(usable_row(rows.get(m.id)) for m in unit):
+        return "saved", why
     for m in unit:
-        row = rows.get(m.id)
-        saved_text = row.text if row is not None else None
-        why = message_restriction(m, saved_text)
-        if not why:
-            continue
         live = m.message or ""
-        notice = is_placeholder_text(live) and (saved_text is None or norm_text(live) != norm_text(saved_text))
-        nothing = not live.strip() and getattr(m, "media", None) is None
-        if notice or nothing:
-            return why
-    return None
+        if is_placeholder_text(live) or (not live.strip() and getattr(m, "media", None) is None):
+            return "skip", why
+    return "live", why
 
 
 def stand_in(m, row):
@@ -219,15 +238,45 @@ def stand_in(m, row):
 
 
 def stand_ins(unit: list, rows: dict) -> Optional[list]:
-    """The saved copies that stand in for a held-back post, or None when My posts does not have all of them (or one
-    of them has nothing to post)."""
+    """The saved copies that stand in for a restricted post, or None when My posts does not have all of them (or one of
+    them has nothing to post, or holds only Telegram's notice)."""
     out = []
     for m in unit:
         row = rows.get(m.id)
-        if row is None or not ((row.text or "").strip() or row.media_file_id):
+        if not usable_row(row):
             return None
         out.append(stand_in(m, row))
     return out
+
+
+FILE_MEDIA = (types.MessageMediaPhoto, types.MessageMediaDocument)  # a photo, video, document, voice, sticker ...
+
+
+def has_file(m) -> bool:
+    """The post carries a file. A link preview, a poll, a location or a contact is not a file."""
+    return isinstance(getattr(m, "media", None), FILE_MEDIA)
+
+
+def without_files(unit: list) -> tuple:
+    """/shift --no-media: the posts of `unit` as they look without their files -> (those that still have a text, the
+    number of files left out). A post that was only a file has nothing left to post and is dropped."""
+    out, lost = [], 0
+    for m in unit:
+        c = m
+        if has_file(m):
+            c = copy.copy(m)
+            c.media, c.saved_ref, c.invert_media = None, None, None
+            lost += 1
+        if (c.message or "").strip():
+            out.append(c)
+    return out, lost
+
+
+async def single_posts(units: AsyncIterator[list]) -> AsyncIterator[list]:
+    """/shift --no-media: an album can't be rebuilt without its pictures, so every message of it is a post of its own."""
+    async for unit in units:
+        for m in unit:
+            yield [m]
 
 
 def saved_message(row, channel_id: int):
@@ -240,13 +289,14 @@ def saved_message(row, channel_id: int):
 
 
 def saved_rows_between(rows: list, first: Optional[int], last: Optional[int]) -> list:
-    """The saved posts (oldest first, one per message id) that have something to post, between two message ids."""
+    """The saved posts (oldest first, one per message id) that can be posted - they have something to post that is not
+    Telegram's notice - between two message ids."""
     out, seen = [], set()
     for row in sorted(rows, key=lambda r: (r.message_id or 0, r.id)):
         mid = row.message_id
         if mid is None or mid in seen or (first and mid < first) or (last and mid > last):
             continue
-        if (row.text or "").strip() or row.media_file_id:
+        if usable_row(row):
             seen.add(mid)
             out.append(row)
     return out
@@ -282,8 +332,12 @@ class RepostPlan:
     post_links: int = 0
     pinned: int = 0  # pinned posts (their copies get pinned)
     replies: int = 0  # posts that answer another post
-    held_saved: int = 0  # posts Telegram holds back that are copied from what My posts saved of them (counted in units)
-    held_skipped: int = 0  # posts Telegram holds back that can't be copied (not counted in units)
+    held_saved: int = 0  # restricted posts that are copied from what My posts saved of them (counted in units)
+    held_skipped: int = 0  # restricted posts that can't be copied: only Telegram's notice is left (not counted in units)
+    live_restricted: int = 0  # restricted posts without a saved copy that are copied as Telegram hands them out
+    no_media: bool = False  # /shift --no-media: the files are left out
+    files_left_out: int = 0  # ... posts that are copied as text without their file (counted in units)
+    file_only: int = 0  # ... posts that are only a file: nothing to copy (not counted in units)
     held_why: Optional[str] = None  # what Telegram says about them
     channel_restricted: Optional[str] = None  # what Telegram says when it restricts the whole channel
     from_db: bool = False  # the channel can't be read: the plan (and the copy) is made from My posts alone
@@ -324,20 +378,34 @@ def tally(plan: RepostPlan, m, opts: RepostOptions, links: PostLinks) -> None:
         plan.replies += 1
 
 
-def plan_from_saved(ch, rows: list, opts: RepostOptions, *, first_id=None, last_id=None, unreadable=None) -> RepostPlan:
+def plan_from_saved(
+    ch, rows: list, opts: RepostOptions, *, first_id=None, last_id=None, unreadable=None, no_media: bool = False
+) -> RepostPlan:
     """The plan of a copy made from My posts alone (the channel can't be read): one post per saved message."""
-    plan = RepostPlan(channel=ch, partial=bool(first_id or last_id), from_db=True, unreadable=unreadable)
+    plan = RepostPlan(
+        channel=ch, partial=bool(first_id or last_id), from_db=True, unreadable=unreadable, no_media=no_media
+    )
     links = PostLinks.for_channel(ch)
     chosen = saved_rows_between(rows, first_id, last_id)
     for row in chosen:
+        m = saved_message(row, ch.id)
+        if no_media:
+            kept, lost = without_files([m])
+            if not kept:
+                plan.file_only += 1
+                continue
+            m, plan.files_left_out = kept[0], plan.files_left_out + lost
         plan.units += 1
-        tally(plan, saved_message(row, ch.id), opts, links)
+        tally(plan, m, opts, links)
     if chosen:
         plan.first, plan.last = chosen[0].message_id, chosen[-1].message_id
         plan.scanned = plan.last
     else:
         plan.first, plan.last = first_id or 1, last_id or 0
+    if not plan.units:
         plan.error = "There is nothing to copy."
+        if plan.file_only:
+            plan.error = "Every saved post in this range is only a file, so without files there is nothing to copy."
     return plan
 
 
@@ -366,12 +434,14 @@ async def plan_repost(
     last_id: Optional[int] = None,
     saved: Optional[SavedLookup] = None,
     use_saved: bool = False,
+    no_media: bool = False,
 ) -> RepostPlan:
     """Read the channel and count what a copy would do. first_id / last_id limit the range (used by /shift).
     `saved` looks up My posts' copies of the channel's posts; with `use_saved` a post Telegram holds back is counted as
-    the saved post it will be copied from (/shift), without it such a post is left out (/repost)."""
+    the saved post it will be copied from (/shift), without it such a post is left out (/repost). With `no_media` the
+    files are left out of the copies (/shift --no-media): a post that is only a file has nothing left to copy."""
     peer = peer_of(ch)
-    plan = RepostPlan(channel=ch, partial=bool(opts.last))
+    plan = RepostPlan(channel=ch, partial=bool(opts.last), no_media=no_media)
     try:
         top, plan.channel_restricted, _ = await probe_channel(client, peer)
     except Exception as e:  # the counter is only a help: without it the ids are read until nothing more turns up
@@ -411,20 +481,34 @@ async def plan_repost(
                 plan.service += 1
                 continue
             gid = getattr(m, "grouped_id", None)
-            new_unit = gid is None or gid != prev_gid
+            new_unit = no_media or gid is None or gid != prev_gid  # without files an album is a post per message
             row = rows.get(m.id)
-            why = held_back_reason([m], rows)
+            # a struck channel changes how /shift copies (My posts first); /repost copies as before, post by post
+            source, why = copy_source(
+                [m], rows, restricted=plan.channel_restricted if use_saved else None, use_saved=use_saved
+            )
             if why:
                 plan.held_why = plan.held_why or why
-                if not (use_saved and stand_ins([m], rows) is not None):
-                    plan.held_skipped += 1 if new_unit else 0  # nothing to copy it from
+            if source == "skip":
+                plan.held_skipped += 1 if new_unit else 0  # nothing to copy it from
+                prev_gid = gid
+                continue
+            if source == "saved":
+                m = stand_in(m, row)  # counted as the saved post it will be copied from
+            if no_media:
+                kept, lost = without_files([m])
+                if not kept:  # nothing but a file: nothing to copy without it
+                    plan.file_only += 1
                     prev_gid = gid
                     continue
+                m, plan.files_left_out = kept[0], plan.files_left_out + lost
+            if source == "saved":
                 plan.held_saved += 1 if new_unit else 0
-                m = stand_in(m, row)  # counted as the saved post it will be copied from
+            elif why:
+                plan.live_restricted += 1 if new_unit else 0
             if new_unit:
                 plan.units += 1
-                if gid is not None:
+                if gid is not None and not no_media:
                     plan.albums += 1
             prev_gid = gid
             tally(plan, m, opts, links)
@@ -444,6 +528,8 @@ async def plan_repost(
                 "Telegram holds back every post in this range (it shows a notice instead of the post) and My posts has "
                 "no saved copy of them, so there is nothing to copy."
             )
+        elif plan.file_only:
+            plan.error = "Every post in this range is only a file, so without files there is nothing to copy."
     return plan
 
 
@@ -626,9 +712,11 @@ async def copy_unit(
     dst_peer=None,
     *,
     from_saved: bool = False,
+    no_forward: bool = False,
 ) -> list:
     """Create the copy of one post (or album) at the end of `dst_peer` (default: the same channel `peer`).
-    `from_saved`: the posts in `unit` are saved copies standing in for posts Telegram holds back - never forwarded."""
+    `from_saved`: the posts in `unit` are saved copies standing in for posts Telegram restricts - never forwarded.
+    `no_forward`: Telegram restricts these posts and refuses to copy them itself: they are rebuilt from their parts."""
     dst = dst_peer if dst_peer is not None else peer
     if from_saved:
         news = await resend_saved(client, dst, unit, finals, st, reply_to)
@@ -638,7 +726,7 @@ async def copy_unit(
             st.replies += 1
         return news
     pure = all(is_pure(m, f, reply_to) for m, f in zip(unit, finals))
-    if st.mode == "forward" and pure:
+    if st.mode == "forward" and pure and not no_forward:
         try:
             news = await forward_unit(client, peer, unit, dst)
             if len(news) == len(unit):
@@ -659,7 +747,7 @@ async def copy_unit(
         # rebuild necessary, a plain copy by Telegram still works - without the reply.
         if isinstance(e, errors.RPCError) and type(e).__name__ in FATAL:
             raise
-        if reply_to and st.mode == "forward" and all(is_pure(m, f) for m, f in zip(unit, finals)):
+        if reply_to and st.mode == "forward" and not no_forward and all(is_pure(m, f) for m, f in zip(unit, finals)):
             news = await forward_unit(client, peer, unit, dst)
             if len(news) != len(unit):
                 await delete_ids(client, dst, [n.id for n in news])
@@ -721,12 +809,21 @@ class RepostResult:
     replies: int = 0  # copies created as an answer to the copy of the post the original answered
     reply_lost: int = 0  # answers that could only be copied without the reply
     reply_dropped: int = 0  # answers to a post that no longer exists (nothing to answer)
-    from_saved: int = 0  # posts Telegram holds back that were copied from their saved copy in My posts
+    from_saved: int = 0  # restricted posts that were copied from their saved copy in My posts
     media_lost: list = field(default_factory=list)  # ... of which these (old ids) went out without their media
-    held_back: list = field(default_factory=list)  # posts Telegram holds back that were not copied (first old id)
-    held_why: Optional[str] = None  # what Telegram says about them
-    used_saved: bool = False  # the run could take held-back posts from My posts (/shift)
+    held_back: list = field(default_factory=list)  # posts that were not copied: only Telegram's notice was left (old id)
+    held_why: Optional[str] = None  # what Telegram says about the restricted posts
+    live_restricted: int = 0  # restricted posts without a saved copy, copied as Telegram hands them out
+    no_media: bool = False  # /shift --no-media: no file was copied
+    files_left_out: int = 0  # ... posts that were copied as text, without their file
+    file_only: list = field(default_factory=list)  # ... posts that are only a file: nothing to copy (old id)
+    used_saved: bool = False  # the run could take restricted posts from My posts (/shift)
     from_db: bool = False  # the channel can't be read: every post was copied from My posts alone
+    checked: int = 0  # new posts that were read back to see whether Telegram itself hides them
+    hidden: list = field(default_factory=list)  # [(old id, had media)] new posts Telegram itself hides (restriction mark)
+    hidden_why: Optional[str] = None  # what Telegram says about them
+    dst_restricted: Optional[str] = None  # what Telegram says about the destination channel (when copies were hidden)
+    hidden_stop: bool = False  # the run stopped by itself: Telegram hides every copy it read back
     aborted: Optional[str] = None
     stopped: bool = False
     first_new: Optional[int] = None
@@ -762,6 +859,30 @@ def _rows(unit: list, finals: list, news: list) -> list:
     return rows
 
 
+CHECK_FIRST = 3  # the first copies of any run are read back ...
+CHECK_EVERY = 10  # ... then every tenth (all of them when Telegram restricts the source)
+STOP_IF_HIDDEN = 3  # /shift stops when Telegram hides this many new copies and not one of those read back is shown
+
+
+async def check_copies(client, dst_peer, unit: list, news: list, res: RepostResult) -> None:
+    """Read the new posts back: does TELEGRAM itself hide them (a restriction mark, or its notice as the text)? That
+    is not the bot copying a notice - Telegram restricts the new post as well, usually because of a file or a link in
+    it. What is found goes into `res` (checked, hidden, hidden_why). Never fails the copy: it is only a look."""
+    try:
+        got = await fetch_messages(client, dst_peer, [n.id for n in news])
+    except Exception as e:  # a look that fails is not a failed copy (the post exists and is registered already)
+        log.info("could not read the new posts back: %s", type(e).__name__)
+        return
+    for old, new in zip(unit, got):
+        if is_skippable(new):
+            continue
+        res.checked += 1
+        why = message_restriction(new)
+        if why:
+            res.hidden.append((old.id, _has_media([old])))
+            res.hidden_why = res.hidden_why or why
+
+
 @dataclass
 class CopyJob:
     """Everything the copy loop needs to know; /repost and /shift each fill it in their own way."""
@@ -779,6 +900,9 @@ class CopyJob:
     use_saved: bool = False  # a post Telegram holds back is rebuilt from its saved copy (otherwise it is left out)
     units: Optional[Callable[[], AsyncIterator[list]]] = None  # where the posts come from (default: read the channel)
     from_db: bool = False  # `units` are saved posts: they are all rebuilt, none is read from Telegram
+    restricted: Optional[str] = None  # what Telegram says about the source channel itself (a copyright strike), if anything
+    no_media: bool = False  # the copies get no files: text, formatting and buttons only (/shift --no-media)
+    stop_if_hidden: int = 0  # stop when this many copies were read back and Telegram hides every one (0: never)
 
 
 async def copy_loop(
@@ -795,7 +919,10 @@ async def copy_loop(
     src, dst = job.src_peer, job.dst_peer
     seen: set = set()  # old ids read in this run (a reply to one of them needs its copy)
     res, st, streak = RepostResult(used_saved=job.use_saved or job.from_db, from_db=job.from_db), _State(), 0
+    res.no_media = job.no_media
     units = job.units() if job.units is not None else iter_units(client, src, job.first_id, job.last_id)
+    if job.no_media:
+        units = single_posts(units)
     async for unit in units:
         if should_stop and should_stop():
             res.stopped = True
@@ -806,20 +933,43 @@ async def copy_loop(
             res.skipped_done += 1
             continue
         rows = await job.saved(ids) if (job.saved and not job.from_db) else {}
-        why = None if job.from_db else held_back_reason(unit, rows)
-        from_saved = job.from_db  # saved posts already
-        if why:  # Telegram shows a notice instead of this post: the notice must not become the copy
+        if job.from_db:
+            source, why = "saved", None
+        else:
+            source, why = copy_source(unit, rows, restricted=job.restricted, use_saved=job.use_saved)
+        if why:  # Telegram restricts this post (or the whole channel): what it hands out now is not trusted
             res.held_why = res.held_why or why
-            standing = stand_ins(unit, rows) if job.use_saved else None
+        from_saved = job.from_db  # saved posts already
+        standing = None
+        if source == "saved" and not job.from_db:
+            standing = stand_ins(unit, rows)
             if standing is None:
-                log.info("post %s is held back by Telegram (%s) and has no saved copy to take its place", ids[0], why)
-                res.held_back.append(ids[0])
-                continue
+                source = "skip"
+        if source == "skip":
+            log.info("post %s: Telegram shows only its notice (%s) and My posts has no saved copy to use", ids[0], why)
+            res.held_back.append(ids[0])
+            continue
+        if standing is not None:
             unit, from_saved = standing, True
+        no_forward, left_out = bool(why), 0
+        if job.no_media:  # the copy is the text with its formatting and buttons; its file stays where it is
+            unit, left_out = without_files(unit)
+            if not unit:  # nothing but a file: there is nothing to post without it, and nothing waits for it
+                res.file_only.append(ids[0])
+                seen.difference_update(ids)
+                continue
+            no_forward = no_forward or bool(left_out)  # a copy by Telegram would carry the file
         finals = [final_state(m, job.opts, job.links) for m in unit]
+        if any(is_placeholder_text(f.text) for f in finals):  # Telegram's notice is never posted, whatever it came from
+            log.info("post %s: its text is Telegram's notice - not copied", ids[0])
+            res.held_back.append(ids[0])
+            res.held_why = res.held_why or PLACEHOLDER_NOTE
+            continue
         try:
             reply_to = new_parent(unit[0], job.idmap, seen)
-            news = await copy_unit(client, src, unit, finals, st, reply_to, dst, from_saved=from_saved)
+            news = await copy_unit(
+                client, src, unit, finals, st, reply_to, dst, from_saved=from_saved, no_forward=no_forward
+            )
             await settle_buttons(client, dst, finals, news, st, pause=settle_pause)
         except Exception as e:  # one bad post must not stop the others
             name = type(e).__name__
@@ -845,13 +995,27 @@ async def copy_loop(
             job.idmap[old.id] = new.id
         if reply_parent(unit[0]) is not None and reply_to is None:
             res.reply_dropped += 1
+        if why and not from_saved:
+            res.live_restricted += 1
+        res.files_left_out += left_out
+        if why or res.copied_units < CHECK_FIRST or res.copied_units % CHECK_EVERY == 0:
+            await check_copies(client, dst, unit, news, res)
         res.copied_units += 1
         res.copied_messages += len(unit)
         res.first_new = res.first_new or news[0].id
         res.last_new = news[-1].id
         if progress:
             await progress(res)
+        if job.stop_if_hidden and res.checked >= job.stop_if_hidden and len(res.hidden) == res.checked:
+            log.info("Telegram hides every copy read back (%s): stopping", res.checked)
+            res.stopped = res.hidden_stop = True  # more copies would only be more posts that nobody can see
+            break
         await asyncio.sleep(delay)
+    if res.hidden:  # Telegram hides copies: is the destination itself restricted too?
+        try:
+            _top, res.dst_restricted, _err = await probe_channel(client, dst)
+        except Exception:  # only an extra for the report
+            log.debug("could not ask Telegram about the destination channel", exc_info=True)
     res.forwarded, res.rebuilt, res.repaired = st.forwarded, st.rebuilt, st.repaired
     res.replies, res.reply_lost = st.replies, st.reply_lost
     res.from_saved, res.media_lost = st.from_saved, st.media_lost

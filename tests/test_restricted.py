@@ -10,6 +10,7 @@ from .test_sync import foreign, looked, old_msg, opts, run, world
 from .test_syncer import dms, make_app, three as three_posts
 
 NOTICE = "This message couldn't be displayed on your device due to copyright infringement."
+CHANNEL_NOTICE = "This channel is unavailable due to copyright infringement."  # what Telegram says of a struck channel
 
 
 def strike(m, text=NOTICE):

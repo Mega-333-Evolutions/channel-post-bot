@@ -139,6 +139,7 @@ class FakeChannelClient:
         self.users = {}  # user id -> types.User, for participant lists
         self.cant_delete_at_all = set()  # ids nobody can delete (userbot included)
         self.restriction = None  # text: Telegram restricts the whole channel (a copyright strike)
+        self.restrict_new = None  # f(new message) -> text or None: Telegram itself restricts a NEW post (a blocked file ...)
         self.about = ""  # the channel's description
         self.photo_id = None  # the channel's profile photo (its bytes are in _photo_data)
         self._photo_data = {}  # photo id -> bytes; shared by all channels next to each other
@@ -236,6 +237,10 @@ class FakeChannelClient:
             hide = True
             self.hide_keyboard_on_create -= 1
         self._set_markup(m, markup, hide=hide)
+        if self.restrict_new is not None:
+            why = self.restrict_new(m)
+            if why:
+                m.restriction_reason = [types.RestrictionReason(platform="all", reason="copyright", text=why)]
         self.msgs[m.id] = m
         self._remember_media(m)
         return m
