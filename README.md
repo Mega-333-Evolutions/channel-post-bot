@@ -15,7 +15,8 @@ reported to a Telegram chat.
 | Posts | create text / photo / video / GIF / audio / file posts, formatting kept, preview, publish, drafts |
 | Edit later | text or caption, replace media, add / delete buttons, change button text, change button link, reorder buttons (⬅️⬆️⬇️➡️), link-preview toggle, **Mass replace links** (new links for the buttons of a channel, one after the other) |
 | Choosing a channel | every command that needs one of your channels lists them as a numbered text list (A to Z, 20 to a message); the buttons only carry the numbers (5 to a row), ◀ ▶ move to the next / previous 20 |
-| My posts | `/posts` lists drafts and published posts per channel, edit or delete them. **⬅️ Prev** is always shown; on the first page it jumps to the last page. Owners also get **🔧 Check buttons** (see below) |
+| My posts | `/posts` lists drafts and published posts per channel, edit or delete them: **🗑 Delete from channel** deletes the post in the channel *and* removes it, with its data, from My posts (the userbot, if there is one, takes over by itself where the bot is refused - nothing is asked); **🧹 Only forget it in the bot** leaves the channel alone. **⬅️ Prev** is always shown; on the first page it jumps to the last page. Owners also get **🔧 Check buttons** (see below) |
+| Channels | `/addchannel` registers a channel, `/channels` lists them. Tapping a channel's number takes it out of the bot - and the bot asks whether its saved posts in My posts are deleted too (**Yes** / **No**, see **Taking a channel out**) |
 | Auto-suggest | `/new` offers the next batch: after "Download Episodes 01 to 20" it proposes "Download Episodes 21 to 40", then 41 to 60 ... Tap **Use suggestion** and only the button link is asked |
 | `/autopost` | `/autopost 114 20` posts "Episodes 01 to 20", "21 to 40" ... up to 114, each with a download button, then asks for the real link of every button |
 | `/replace` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
@@ -26,7 +27,7 @@ reported to a Telegram chat.
 | Service notices | "name changed", "photo changed", "pinned a message", live stream notices ... are deleted from every connected channel |
 | Sync | posts deleted, edited or added by other admins are recorded in My posts (`/sync` runs it now); the posts that were in a channel before the bot was added are read in; what Telegram itself does to a channel (a copyright strike) is never taken for an edit |
 | Backup | `/export` downloads a JSON backup of your channels and posts, `/import` puts it back (it only adds) |
-| Userbot (optional) | a helper user account that deletes the old posts the bot itself is not allowed to delete (older than 48 hours) |
+| Userbot (optional) | a helper user account that deletes the old posts the bot itself is not allowed to delete (older than 48 hours) - used by itself wherever the bot deletes something and is refused; it is never asked about |
 | Error log | every error goes to a Telegram chat as a Python code block with the full traceback |
 
 ## Setup (local)
@@ -130,8 +131,9 @@ every post and button is editable here.
 3. **Start copying.** One post per ~1-2 s, **Stop** and **Continue** work without copying anything twice. Don't post
    in the channel meanwhile.
 4. Look at the end of the channel (formatting, buttons, media, albums, replies, pins).
-5. **Delete the old posts** (asks again) or **Undo**. Old posts are only offered for deletion after a complete copy,
-   and only the ones that have a copy are deleted.
+5. **Delete the old posts** (one more confirmation: it can't be undone) or **Undo**. Old posts are only offered for
+   deletion after a complete copy, and only the ones that have a copy are deleted. The confirmation is about the
+   deletion only: the userbot is not asked about - if Telegram refuses the bot, it takes over by itself.
 
 How it copies:
 
@@ -168,7 +170,9 @@ How it copies:
 
 Telegram's Bot API documentation says bots can delete only messages younger than 48 hours. This bot talks to
 Telegram directly and I could not verify whether that limit applies in channels. So: the bot always tries first and
-**checks by reading the messages back**. Whatever is still there goes to the userbot (if you set one up).
+**checks by reading the messages back**. Whatever is still there goes to the userbot (if you set one up) **at once and
+without asking you** - the one question you are asked is "Delete N old messages?", never "may the userbot do it?". The
+result says how many of them the userbot deleted.
 Without a userbot, the bot tells you what is left and which messages they are; delete those by hand and tap
 **Close this repost**.
 
@@ -222,7 +226,8 @@ place of its posts. The bot treats that as what it is - something Telegram did, 
 
 - **Sync:** My posts stays exactly as it was saved. A channel Telegram restricts is not looked at (the report says so), a single
   post Telegram holds back, a notice shown in place of a post, and many posts that suddenly all show one and the same text are
-  never taken for edits: nothing is edited, removed or added for them.
+  never taken for edits: nothing is edited, removed or added for them. That holds for the first look and for the older posts
+  that are read in, too: a post Telegram holds back is not read in as a "new" post and is counted once in the report.
 - **`/shift` - the rule:** a source that Telegram restricts is copied from what **My posts** saved of its posts - text,
   formatting, buttons and media - **every post that has a saved copy, however intact Telegram's version still looks**
   (that is why My posts should have the channel's posts *before* the strike: connect the channel early, or `/import` a
@@ -297,8 +302,8 @@ channel per day saying so.
 
 - Telegram's documentation says bots may delete only messages younger than 48 hours (see **Deleting the old posts** for
   what is not verified), and the notice that says a channel was created usually can't be deleted at all. Notices that were
-  already there when you added the bot are found while the sync reads the channel's older posts (see **Sync**); if you set up
-  the userbot, the helper account deletes the ones the bot may not (see **Userbot**).
+  already there when you added the bot are found while the sync reads the channel's older posts (see **Sync**). The bot alone
+  deletes them (the userbot is not used for notices): `/sync` says how many it was not allowed to delete.
 - The notices that a `/repost` or `/shift` pin makes are removed right after pinning, as before.
 
 ## Sync: what other admins do in the channels
@@ -307,12 +312,18 @@ The bot compares the channels with My posts, so My posts shows what is really in
 touches it:
 
 - a post that was **deleted** in the channel is removed from My posts, with everything saved of it (a timed deletion that is
-  not needed any more goes too);
+  not needed any more goes too) - at the first look at a channel as well, so posts deleted before the bot ever looked do not
+  stay in My posts;
 - a post that was **edited** in the channel (text, formatting, buttons, media) gets its saved copy updated;
 - a **new post** that was not made with this bot is added to My posts (it says "Picked up from the channel");
 - the posts that were in the channel **before the bot was added** are read into My posts too, oldest first, up to the newest
   message that existed at the first look. Where the reading stopped is saved: a timed check reads for about two and a half
   minutes per channel and goes on next time, `/sync` reads on until it is done. `IMPORT_OLD_POSTS=false` switches this off.
+
+The older posts that were read in are followed like every other post: an admin's edit (made without the bot) updates their
+saved copy, a deletion removes them, and `/shift … -c` and the repost's link update change links in them too (for a post the
+bot did not make that needs the *Edit messages of others* right - without it the report counts the posts it could not edit; a
+post made by another bot can't be edited by Telegram's rules, which is reported as failed).
 
 This runs in three ways: **live** (a few seconds after Telegram tells the bot about a change), **on a timer** (every
 `SYNC_INTERVAL_MINUTES`, default 60) and **on demand** with `/sync` (owners; `/sync --channel @name` for one channel,
@@ -329,14 +340,32 @@ Rules that keep it safe:
   seconds for live changes), are judged at the next look: the bot may still be saving it.
 - If a saved post shows **no buttons** in the channel, the saved buttons are **kept** (Telegram sometimes hides a keyboard);
   the report says so and **🔧 Check buttons** can put them back.
-- If **every** saved post of a channel looks deleted (and there are five or more), nothing is removed - more likely the bot
-  lost access. The report says so.
+- If **every** saved post of a channel looks deleted (and there are five or more), the bot first checks that it can still read
+  the channel: it looks at the channel's newest messages. If it sees any of them, the saved posts really are gone and they are
+  removed from My posts. If it can't read a single message of the channel, nothing is removed - then the bot has most likely
+  lost access (check that it is still an admin) - and the report says so.
 - Posts you forget with "Only forget it in the bot" are not picked up again, not even by the older-posts reading. Polls,
   stickers and other kinds My posts can't hold are left alone and only counted.
 - The older posts are found by reading message ids one range after the other (Telegram has no list of a channel's
   posts for a bot), so a channel with hundreds of thousands of ids takes a while the first time.
 - A quick look reads the ids that can plausibly be new. If more than about 300 message ids were deleted in a row right
   before a new post, that post may wait for the daily full look or for `/sync`.
+
+## Taking a channel out of the bot
+
+`/channels` lists your channels; an owner taps a channel's number to take it out. Before anything happens the bot asks what
+becomes of the channel's saved posts - the posts My posts holds for it, drafts included:
+
+- **🗑 Yes, delete them too** - the channel is removed **and** its saved posts are deleted from My posts, together with what the
+  sync remembers about the channel (where it stopped reading, the posts you told the bot to forget). Add the channel again with
+  `/addchannel` and its posts are read in again from the start.
+- **📦 No, keep them** - only the channel is removed. The saved posts stay, and they are all there again when you add the
+  channel again.
+
+Either way **nothing is deleted or changed in the channel itself**, and no other channel is touched. A channel that has no
+saved posts is removed without the question. A timed `/broadcast` deletion that is still waiting stays: the message is still in the
+channel. The channel is switched off in the database rather than erased. The deletion waits for a running look at the
+channels to finish, so that look can't save the posts again.
 
 ## `/export` and `/import`: backup and restore
 
@@ -363,6 +392,11 @@ Imported channels and posts are rows in the bot's own database: to post or edit 
 2. Put that text into the Space / host secrets as `USERBOT_SESSION`. Whoever has it can act as that account; you can end
    it any time in Telegram → Settings → Devices.
 3. In the bot, `/userbot` shows whether it is connected.
+
+The userbot is used **automatically** wherever the bot deletes something and Telegram refuses it - **🗑 Delete from channel** in
+`/posts`, `/repost` (delete the old posts, undo), `/shift` undo, a timed `/broadcast` deletion. Nothing asks you for permission
+first: the only questions are about the deletion itself ("Delete N old messages?"). If it still does not work, the message says
+why (no userbot set up, a missing right, a channel that needs an approval ...).
 
 What happens when the bot cannot delete something (nothing happens before that, and only for that channel):
 

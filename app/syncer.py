@@ -110,6 +110,10 @@ class Syncer:
     def forget_cache(self) -> None:
         self._cache.clear()
 
+    def exclusive(self):
+        """Held (`async with`) while no look at any channel runs - for a change that must not race with one."""
+        return self._busy
+
     def options(self, **kw) -> SyncOptions:
         ctx = self.ctx
         base = dict(

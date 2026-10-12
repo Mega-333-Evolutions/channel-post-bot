@@ -124,24 +124,59 @@ def register(ctx: Ctx) -> None:
 
     @on_cb(ctx, "chd")
     async def cb_remove_channel(event, parts):
-        """A number was tapped: ask before the channel is taken out of the bot."""
+        """A number was tapped: ask what becomes of the channel's saved posts before it is taken out of the bot."""
         require_owner(ctx, event)
         ch = await db.get_channel(int(parts[0]))
         if ch is None or not ch.active:
             await show_channels(event)
             return
-        kb = [[Button.inline("✅ Yes, remove it", f"chy:{ch.id}"), Button.inline("🔙 Back", f"{picker.PAGE_CB}:ch::0")]]
+        back = Button.inline("🔙 Back", f"{picker.PAGE_CB}:ch::0")
+        n = await db.count_channel_posts(ch.id)
+        if not n:  # nothing saved: nothing to ask about
+            await show(
+                event,
+                f"➖ Take <b>{esc(ch.title)}</b> out of the bot?\nIt has no saved posts. You can add it again with /addchannel.",
+                [[Button.inline("✅ Yes, remove it", f"chy:{ch.id}:0"), back]],
+            )
+            return
         await show(
             event,
-            f"➖ Take <b>{esc(ch.title)}</b> out of the bot?\n"
-            "Its saved posts are kept, and you can add it again with /addchannel.",
-            kb,
+            f"➖ Take <b>{esc(ch.title)}</b> out of the bot.\n\n"
+            f"Do you also want to delete its saved posts - the {n} post(s) My posts holds for this channel? "
+            "Nothing is deleted in the channel itself.",
+            [
+                [Button.inline("🗑 Yes, delete them too", f"chy:{ch.id}:1"), Button.inline("📦 No, keep them", f"chy:{ch.id}:0")],
+                [back],
+            ],
         )
 
     @on_cb(ctx, "chy")
     async def cb_remove_channel_yes(event, parts):
+        """chy:<channel>:1 removes the channel and deletes its saved posts, chy:<channel>:0 (or an old button without the
+        second part) removes only the channel and keeps them."""
         require_owner(ctx, event)
-        await db.set_channel_active(int(parts[0]), False)
-        if ctx.syncer is not None:
-            ctx.syncer.forget_cache()
-        await show(event, "Channel removed from the bot. Its saved posts are kept; add it again with /addchannel.")
+        cid = int(parts[0])
+        wipe = len(parts) > 1 and parts[1] == "1"
+        ch = await db.get_channel(cid)
+        name = f"<b>{esc(ch.title)}</b>" if ch is not None else "The channel"
+        await db.set_channel_active(cid, False)
+        gone = 0
+        sy = ctx.syncer
+        if sy is not None:
+            sy.forget_cache()
+        if wipe:
+            await show(event, f"⏳ Deleting the saved posts of {name}…")
+            # no look at the channel may be saving posts while they are deleted (it would bring some back)
+            if sy is not None:
+                async with sy.exclusive():
+                    gone = await db.delete_channel_data(cid)
+            else:
+                gone = await db.delete_channel_data(cid)
+            ctx.sync_ignore.difference_update({k for k in ctx.sync_ignore if k[0] == cid})
+            text = (
+                f"✅ {name} was removed from the bot, and its {gone} saved post(s) were deleted from My posts. Nothing was deleted "
+                "in the channel. If you add it again with /addchannel, its posts are read in again."
+            )
+        else:
+            text = f"✅ {name} was removed from the bot. Its saved posts are kept; add it again with /addchannel and they are there again."
+        await show(event, text)

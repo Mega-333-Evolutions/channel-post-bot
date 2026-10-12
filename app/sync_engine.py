@@ -15,8 +15,10 @@ Safety rules
   * a saved copy is only changed if nobody changed it since it was read (optimistic check in the database);
   * buttons that are missing in the channel are never removed from the saved copy (Telegram sometimes hides a keyboard
     for a while - the saved buttons are what "Check buttons" restores from);
-  * if EVERY saved post of a channel looks deleted, nothing is removed: more likely the bot lost access (unless the
-    channel's event counter moved by at least that many events, which is what really deleting them looks like);
+  * if EVERY saved post of a channel looks deleted, the bot first makes sure it can read the channel at all: when it
+    still sees other messages there (or the channel's event counter moved by at least that many events, which is what
+    really deleting them looks like) the posts are really gone and leave My posts; only when it sees nothing at all
+    - more likely the bot lost access - is nothing removed;
   * what TELEGRAM does to a channel is not an admin's edit: a channel it restricts (a copyright strike turns every post
     into "This message couldn't be displayed on your device due to copyright infringement"), a single post it holds
     back, a notice shown instead of a post, or many posts that suddenly all show one and the same text are left exactly
@@ -223,6 +225,24 @@ async def find_top(client, peer, pts: int, floor: int, *, pause: float = PAUSE) 
     return max(floor, hi)
 
 
+async def sees_live_messages(client, peer, pts: Optional[int], *, pause: float = PAUSE, tries: int = MAX_PROBE) -> bool:
+    """True when the bot can read at least one message of the channel (a post or a service message). Then a saved post
+    that is missing from the channel really is gone - the bot is not just blind. Looks downwards from the event counter."""
+    if not pts or pts < 1:
+        return False
+    hi = pts
+    for _ in range(tries):
+        if hi < 1:
+            return False
+        lo = max(1, hi - CHUNK + 1)
+        msgs = await fetch_messages(client, peer, list(range(lo, hi + 1)))
+        if any(not is_gone(m) for m in msgs):
+            return True
+        hi = lo - 1
+        await asyncio.sleep(pause)
+    return False
+
+
 async def delete_services(client, peer, ids: list, rep: SyncReport) -> None:
     """Delete service messages and count what happened (the bot only: Telegram may refuse the old ones)."""
     ids = sorted(set(ids))
@@ -280,9 +300,12 @@ async def _adopt(db, ch, rep: SyncReport, fresh: list, opts: SyncOptions, busy, 
             rep.adopted.append(m.id)
 
 
-async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, busy, progress, moved=None) -> None:
+async def _compare_saved(
+    client, db, ch, rep: SyncReport, opts: SyncOptions, busy, progress, moved=None, pts: Optional[int] = None
+) -> None:
     """Every saved post against the channel. `moved`: how far the channel's event counter has come since the last look
-    (None: unknown) - deleting posts is an event each, which tells "everything was deleted" from "I can't see anything"."""
+    (None: unknown) - deleting posts is an event each, which tells "everything was deleted" from "I can't see anything".
+    `pts`: the channel's event counter now - where the bot looks for other messages to prove that it can read the channel."""
     rep.phase = "comparing the saved posts"
     peer = peer_of(ch)
     posts = await db.sent_posts(ch.id)  # the saved copies are read BEFORE the channel is, never after
@@ -328,10 +351,18 @@ async def _compare_saved(client, db, ch, rep: SyncReport, opts: SyncOptions, bus
         hold_back(rep, [p.message_id for p, _ in held], MASS_NOTE)
     if gone:
         really = moved is not None and moved >= len(gone)  # at least one event for each post that vanished
-        if len(ids) >= MIN_FOR_ANOMALY and len(gone) == len(ids) and not really:
+        everything = len(ids) >= MIN_FOR_ANOMALY and len(gone) == len(ids)
+        if everything and not really:
+            # No earlier look to compare with (or too few events): is the bot blind, or are the posts really gone? If it
+            # can read other messages of the channel it is not blind.
+            if busy():
+                rep.busy = True
+                return
+            really = await sees_live_messages(client, peer, pts, pause=opts.pause)
+        if everything and not really:
             rep.anomaly = (
-                f"All {len(ids)} saved posts look deleted, so none was removed here - "
-                "check that the bot is still an admin of the channel."
+                f"All {len(ids)} saved posts look deleted, and I can't read any other message of the channel either, "
+                "so none was removed here - check that the bot is still an admin of the channel."
             )
         else:
             gone_ids = [p.message_id for p in gone]
@@ -428,13 +459,16 @@ async def _import_history(client, db, ch, rep: SyncReport, opts: SyncOptions, bu
         now = utcnow()
         stop = None
         todo = []
+        # posts the bot has saved already are none of the reading's business: the comparison of the saved posts looks
+        # after them (and counts the ones Telegram holds back there - not a second time here)
+        have = {p.message_id for p in await db.posts_at(ch.id, [m.id for m in msgs if not is_gone(m)])}
         for m in msgs:
             if is_gone(m) or isinstance(m, types.MessageService):
                 continue
             if age(m.date, now) < opts.grace:  # the bot may still be saving it: the next look reads it
                 stop = m.id
                 break
-            if m.id in forgotten or (ch.id, m.id) in opts.ignore:
+            if m.id in forgotten or m.id in have or (ch.id, m.id) in opts.ignore:
                 continue
             why = message_restriction(m)
             if why:
@@ -443,8 +477,7 @@ async def _import_history(client, db, ch, rep: SyncReport, opts: SyncOptions, bu
                 rep.history_unsupported += 1
             else:
                 todo.append(m)
-        known = {p.message_id for p in await db.posts_at(ch.id, [m.id for m in todo])}
-        made = await db.adopt_many(ch.id, [(m.id, adopt_fields(m), m.date) for m in todo if m.id not in known])
+        made = await db.adopt_many(ch.id, [(m.id, adopt_fields(m), m.date) for m in todo])  # (skips what is saved)
         rep.imported += len(made)
         a = hi + 1 if stop is None else stop
         rep.history_done = stop is None and a > hist.top
@@ -474,7 +507,7 @@ async def sync_channel(client, db, ch, opts: Optional[SyncOptions] = None, *, bu
     try:
         state = await db.get_sync(ch.id)
         moved = None if state is None else max(0, pts - state.last_pts)
-        await _compare_saved(client, db, ch, rep, opts, busy, progress, moved)
+        await _compare_saved(client, db, ch, rep, opts, busy, progress, moved, pts)
         if not rep.busy:
             await _look_for_new(client, db, ch, rep, opts, state, pts, busy, progress)
         if not rep.busy and opts.history:

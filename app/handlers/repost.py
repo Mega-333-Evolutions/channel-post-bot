@@ -685,9 +685,8 @@ def register(ctx: Ctx) -> None:
         await edit_callback_message(
             event,
             f"🗑 <b>Delete {c['old_left']} old message(s) from {esc(ch.title)}?</b>\n"
-            "Only originals that have a copy are deleted. This can't be undone. The copies stay and become the channel.\n"
-            "If Telegram refuses (rights, or an age limit), the userbot - if you set one up - deletes what the bot can't. "
-            "Nothing is lost either way: the copies are already there.",
+            "Only originals that have a copy are deleted. This can't be undone. The copies stay and become the channel: "
+            "nothing is lost, they are already there.",
             [[Button.inline(f"🗑 Yes, delete {c['old_left']}", f"rpdy:{mig.id}"), Button.inline("↩️ Back", f"rpb:{mig.id}")]],
         )
 

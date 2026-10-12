@@ -7,7 +7,7 @@ from telethon import functions, types
 from app.crosslinks import relink_after_shift, restore_after_shift_undo
 from app.profile_copy import copy_profile, profile_lines
 from app.shift_engine import delete_shift_copies, run_shift, shift_profile, source_of
-from app.sync_engine import live_fields
+from app.sync_engine import SyncOptions, live_fields, sync_channel
 from app.tgutil import button_url
 
 from .dbutil import db_url_for, fresh_db
@@ -101,6 +101,73 @@ def test_links_to_the_source_follow_the_copies_in_every_connected_channel(tmp_pa
         assert row1.text == other.msgs[1].message
         assert await db.has_mark("s1", "links")
         assert sorted(c.channel.id for c in res.cross.changed_channels) == [2, 3]
+        await db.close()
+
+    run(go())
+
+
+async def older_posts_setup(tmp_path, *, edit_right=True):
+    """Like extras_setup, but the third channel's posts are all older ones made by somebody else before the bot was added:
+    the sync has read them into My posts ("adopted"), nothing is registered as made by the bot."""
+    src, dst = two_channels()
+    posts = other_posts()
+    for m in posts.values():
+        m.out = False
+    other = src.add_channel(FakeChannelClient(posts, username="otherch", cid=3, title="Other"))
+    if not edit_right:
+        other.rights = dict(admin=True, post=True, edit=False, delete=True, invite=False, add_admins=False)
+    dst.msgs[5] = make_msg(5, "Old post: https://t.me/srcch/1", out=True)
+    db = await fresh_db(db_url_for(tmp_path))
+    await db.save_channel(1, 5, "Anime Source", "srcch", 1)
+    await db.save_channel(2, 6, "Anime Backup", "dstch", 1)
+    await db.save_channel(3, 7, "Other", "otherch", 1)
+    rep = await sync_channel(src, db, await db.get_channel(3), SyncOptions(pause=0, grace=0))  # reads the older posts in
+    assert rep.imported == 8 and {p.source for p in await db.sent_posts(3)} == {"adopted"}
+    await db.create_shift("s1", src=SRC, dst_channel_id=2, first_id=1, last_id=8, user_id=1)
+    await db.set_mark("s1", "relink")
+    return src, dst, other, db, await db.get_channel(2), await db.get_shift("s1")
+
+
+def test_links_in_the_older_posts_the_sync_read_into_my_posts_follow_the_copies_too(tmp_path):
+    async def go():
+        src, dst, other, db, dst_row, shift = await older_posts_setup(tmp_path)
+        res = await run_shift(src, db, shift, dst_row, 99, delay=0, settle_pause=0)
+        assert (res.copied_units, res.failed, res.aborted, res.cross_error) == (6, [], None, None)
+        assert res.cross is not None and res.cross.clean
+        # the links in posts that were in the channel before the bot was added: every kind is changed
+        assert other.msgs[1].message == "Watch https://t.me/dstch/13 here"
+        assert other.msgs[2].entities[0].url == "https://t.me/dstch/14?single"
+        assert button_url(other.msgs[3].reply_markup.rows[0].buttons[0]) == "https://t.me/dstch/12"
+        assert button_url(other.msgs[3].reply_markup.rows[0].buttons[1]) == "https://example.com/x"
+        assert other.msgs[4].message == "Private https://t.me/dstch/17 form"
+        assert other.msgs[7].message == "By a friend https://t.me/dstch/11"
+        assert other.msgs[5].message == "Never shifted https://t.me/srcch/99" and other.msgs[8].message == "No link"
+        assert edited(other) == [1, 2, 3, 4, 7]
+        # My posts follows: the saved copies are the posts of others, now with the new links
+        for mid in (1, 2, 3, 4, 7):
+            row = await db.find_by_message(3, mid)
+            assert row.source == "adopted" and row.created_by == 0
+            assert row.text == other.msgs[mid].message
+        assert (await db.find_by_message(3, 3)).buttons[0][0]["u"] == "https://t.me/dstch/12"
+        assert (await db.find_by_message(3, 2)).entities[0]["u"] == "https://t.me/dstch/14?single"
+        assert (await db.find_by_message(3, 5)).text == "Never shifted https://t.me/srcch/99"
+        # nothing is left for the sync to "find": the saved copies and the channel agree
+        rep = await sync_channel(src, db, await db.get_channel(3), SyncOptions(pause=0, grace=0))
+        assert rep.edited == [] and rep.deleted == [] and rep.adopted == []
+        await db.close()
+
+    run(go())
+
+
+def test_older_posts_of_others_need_the_edit_right_and_the_report_counts_the_ones_left(tmp_path):
+    async def go():
+        src, dst, other, db, dst_row, shift = await older_posts_setup(tmp_path, edit_right=False)
+        res = await run_shift(src, db, shift, dst_row, 99, delay=0, settle_pause=0)
+        assert res.cross is not None and res.cross.not_allowed == 5 and not res.cross.clean
+        assert edited(other) == []  # Telegram would refuse: nothing is tried, nothing is changed
+        assert other.msgs[1].message == "Watch https://t.me/srcch/3 here"
+        assert (await db.find_by_message(3, 1)).text == "Watch https://t.me/srcch/3 here"
+        assert dst.msgs[5].message == "Old post: https://t.me/dstch/11"  # a post of the bot itself is still fixed
         await db.close()
 
     run(go())

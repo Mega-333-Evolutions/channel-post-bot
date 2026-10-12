@@ -397,9 +397,8 @@ def register(ctx: Ctx) -> None:
         await show(
             event,
             f"Delete this post from <b>{esc(ch.title)}</b>?\n\n"
-            "Telegram's documentation says bots can only delete posts younger than 48 hours; in channels that limit may "
-            "not apply. If the bot can't, the userbot (if you set one up, see /userbot) tries next. If both fail, delete "
-            "the post by hand and then use “Only forget it in the bot”.",
+            "🗑 <b>Delete from channel</b> - deletes it in the channel and removes it, with its data, from My posts.\n"
+            "🧹 <b>Only forget it in the bot</b> - the post stays in the channel; only My posts forgets it.",
             [
                 [Button.inline("🗑 Delete from channel", f"dly:{post.id}:a")],
                 [Button.inline("🧹 Only forget it in the bot", f"dly:{post.id}:b")],
@@ -410,7 +409,10 @@ def register(ctx: Ctx) -> None:
     @on_cb(ctx, "dly")
     async def cb_delete_yes(event, parts):
         post, ch = await load_post(ctx, parts[0])
+        note = "🗑 Done."
         if post.status == "sent" and parts[1] == "a":
+            # The bot deletes the post; where Telegram refuses it (an age limit on old posts, a missing right) the userbot
+            # takes over at once - nothing is asked first.
             fallback, deleter = await ctx.userbot.fallback_for(ch) if ctx.userbot is not None else (None, None)
             try:
                 out = await delete_batch(client, peer_of(ch), [post.message_id], fallback)
@@ -421,9 +423,17 @@ def register(ctx: Ctx) -> None:
                 why = delete_problem_text(
                     ctx.userbot, bot_error=out.bot_error, fallback_error=out.fallback_error, tried=out.tried_userbot
                 )
-                raise UserError(f"Telegram did not delete that message. {why}\nDelete it by hand in the channel, then use “Only forget it in the bot”.")
+                raise UserError(
+                    f"Telegram did not delete that message. {why}\n"
+                    "The post is still in My posts. Delete it by hand in the channel, then use “Only forget it in the bot”."
+                )
+            # gone from the channel: it goes from My posts too, with what hangs on it (a timed deletion ...)
+            await db.forget_posts(post.channel_id, [post.message_id])
+            note = "🗑 Done - deleted in the channel and removed from My posts."
+            if out.by_userbot:
+                note += "\nThe bot was not allowed to delete it, so the userbot did."
         if post.status == "sent" and post.message_id and parts[1] == "b":
             ctx.sync_ignore.add((post.channel_id, post.message_id))  # forgotten on purpose: the sync must not bring it back
             await db.ignore_post(post.channel_id, post.message_id)  # ... not even after a restart
         await db.delete_post(post.id)
-        await show(event, "🗑 Done.", [[Button.inline("📚 My posts", "pl")]])
+        await show(event, note, [[Button.inline("📚 My posts", "pl")]])

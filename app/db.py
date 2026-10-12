@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    delete,
     desc,
     func,
     select,
@@ -339,6 +340,25 @@ class Database:
             if ch is not None:
                 ch.active = active
                 await s.commit()
+
+    async def count_channel_posts(self, cid: int) -> int:
+        """Every post of the channel in My posts - published ones and drafts."""
+        async with self.Session() as s:
+            return int((await s.execute(select(func.count()).select_from(Post).where(Post.channel_id == cid))).scalar_one())
+
+    async def delete_channel_data(self, cid: int) -> int:
+        """Everything My posts holds about a channel: its saved posts (published and drafts) and what the sync keeps
+        about them - the posts forgotten on purpose, where the last look and the reading of the older posts stopped - so a
+        channel that is added again starts from scratch. Nothing is touched in Telegram. The channel itself stays
+        registered (switched off) because reposts and shifts that name it still need it, and so do timed deletions.
+        Returns how many posts went."""
+        async with self.Session() as s:
+            n = (await s.execute(select(func.count()).select_from(Post).where(Post.channel_id == cid))).scalar_one()
+            await s.execute(delete(Post).where(Post.channel_id == cid))
+            for model in (IgnoredPost, ChannelSync, ChannelHistory):
+                await s.execute(delete(model).where(model.channel_id == cid))
+            await s.commit()
+            return int(n)
 
     # --------------------------------------------------------------------- posts
     async def create_post(self, **fields: Any) -> Post:

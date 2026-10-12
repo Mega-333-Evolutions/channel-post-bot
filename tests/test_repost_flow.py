@@ -441,6 +441,32 @@ def test_the_userbot_joins_promotes_deletes_and_then_steps_back(tmp_path):
     asyncio.run(run())
 
 
+def test_deleting_the_old_posts_never_asks_whether_the_userbot_may_help(tmp_path):
+    """The one question is about deleting the old posts. Who deletes them is not asked: the bot tries first and the userbot
+    takes over by itself wherever Telegram refuses the bot - one press of "Yes, delete", one answer."""
+    async def run():
+        app = await make_app(tmp_path)
+        await copy_all(app)
+        userbot_setup(app)
+        app.tg.undeletable = {1, 2, 3, 4, 5}  # the bot is refused for these
+        await app.press(app.out.callback_data("Delete the old posts"))
+        ask = norm(app.out.last_text)
+        assert "Delete 8 old message(s)" in ask and "can't be undone" in ask
+        assert "userbot" not in ask.lower() and "if you set one up" not in ask  # nothing about the helper account to agree to
+        assert app.out.last_buttons() == [["🗑 Yes, delete 8", "↩️ Back"]]
+        shown = len(app.out.log)
+        await app.press(app.out.callback_data("Yes, delete 8"))
+        after = [norm(row[1]) for row in app.out.log[shown:]]  # everything the owner was shown after that one press
+        assert after and "Done. 8 old message(s) deleted (5 of them by the userbot)" in after[-1]
+        # nothing on the way asks for a go-ahead: no "may I", no yes/no about the userbot
+        assert not any(w in t.lower() for t in after for w in ("may i", "permission", "allow", "shall i", "use the userbot?"))
+        assert app.out.last_buttons() == [["🔗 Update links again"]]
+        assert sorted(app.tg.msgs) == [6] + list(range(11, 19))
+        await app.db.close()
+
+    asyncio.run(run())
+
+
 def test_the_userbot_is_not_touched_when_the_bot_can_delete_everything(tmp_path):
     async def run():
         app = await make_app(tmp_path)
