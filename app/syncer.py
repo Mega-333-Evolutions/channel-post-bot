@@ -5,7 +5,7 @@
   seconds later (the wait lets a burst of changes settle, and lets the bot finish saving its own posts first);
 * service messages ("pinned a message", "channel photo changed" ...) are deleted the moment they appear.
 
-Nothing here holds the bot's one-long-job lock: a running /repost, /shift, /replace ... always wins, and what happens
+Nothing here holds the bot's one-long-job lock: a running /repost, /shift, /swap ... always wins, and what happens
 while it runs is picked up by the next timed check.
 """
 from __future__ import annotations

@@ -2,7 +2,7 @@
 
 A Telegram bot (Telethon, bot-token login) for creating and managing channel posts with link buttons,
 modelled on Channel Help, plus extras for people who run many channels: episode-range auto-suggest and `/autopost`,
-`/replace` and `/handleswap`, `/repost` and `/shift` (copy a channel in order; links between posts - and links to them in
+`/swap` and `/handleswap`, `/replace` (replace post media), `/repost` and `/shift` (copy a channel in order; links between posts - and links to them in
 your other channels - follow the copies), `/broadcast` (with an optional self-delete time), automatic removal of
 Telegram's service notices, a sync that records what other admins do in the channels (and reads in the posts that were
 there before the bot), and `/export` / `/import` for backups. Data lives in PostgreSQL (SQLite for local use). Errors are
@@ -19,7 +19,8 @@ reported to a Telegram chat.
 | Channels | `/addchannel` registers a channel, `/channels` lists them. Tapping a channel's number takes it out of the bot - and the bot asks whether its saved posts in My posts are deleted too (**Yes** / **No**, see **Taking a channel out**) |
 | Auto-suggest | `/new` offers the next batch: after "Download Episodes 01 to 20" it proposes "Download Episodes 21 to 40", then 41 to 60 ... Tap **Use suggestion** and only the button link is asked |
 | `/autopost` | `/autopost 114 20` posts "Episodes 01 to 20", "21 to 40" ... up to 114, each with a download button, then asks for the real link of every button |
-| `/replace` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
+| `/swap` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
+| `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption; My posts is updated |
 | `/handleswap` | swaps a `@username` that is *written* in posts (text, captions, button names) - links are left alone. Preview first, full undo |
 | `/repost` | copies **every post of a channel, in order**, to the end of the channel (links swapped on the way, replies, pins and links between posts kept), registers the copies in My posts, verifies every button, **points links to the old posts - in this and in all your other connected channels - at the copies**, then deletes the old posts after your confirmation |
 | `/shift` | copies posts from **one channel into another** (all, or a range of message ids); the source is only read. `-c` points links to the source's posts in all your connected channels at the copies, `-all` also gives the destination the source's name, description and photo. Posts Telegram holds back after a copyright strike are copied from My posts, whatever Telegram hands out of them now; `--no-media` leaves the files out |
@@ -101,10 +102,14 @@ the button in the channel at once. The posts are in My posts like any other.
 post in `/posts` and tap it; the bot asks for that post's new link, then for the next button post of the channel (posts
 without a link button are skipped). Stop with ✖️ Cancel at any time; what was answered stays changed.
 
-## `/replace` and `/handleswap`
+## `/swap`, `/replace` and `/handleswap`
 
-`/replace @old @new` shows what would change, nothing is edited until you press **Apply**. Try it small first:
-`/replace @old @new --last 50`, look at a changed post, `/undo` if it is wrong, then run it for everything.
+`/swap @old @new` shows what would change, nothing is edited until you press **Apply**. Try it small first:
+`/swap @old @new --last 50`, look at a changed post, `/undo` if it is wrong, then run it for everything.
+
+To replace a published post's media, reply to the new photo / video / file with `/replace <channel post link>`. The post
+must be in My posts and its channel registered with the bot. The replied media and caption replace the old media and
+caption in the channel; My posts is updated after Telegram accepts the edit.
 If Telegram refuses to edit posts made by another bot (the preview and the result say so), use `/repost`.
 
 Options: `--channel @name` · `--last N` (newest N post ids) · `--posts` (also change `t.me/old/123` post links; skipped
@@ -327,7 +332,7 @@ post made by another bot can't be edited by Telegram's rules, which is reported 
 This runs in three ways: **live** (a few seconds after Telegram tells the bot about a change), **on a timer** (every
 `SYNC_INTERVAL_MINUTES`, default 60) and **on demand** with `/sync` (owners; `/sync --channel @name` for one channel,
 `/sync --history` reads the channel's older posts again and adds the ones that are missing). `/sync` answers with what it
-found, channel by channel. Automatic runs are silent. While a long job (`/repost`, `/shift`, `/replace`, `/broadcast` ...)
+found, channel by channel. Automatic runs are silent. While a long job (`/repost`, `/shift`, `/swap`, `/broadcast` ...)
 runs, the automatic runs wait; `/sync` refuses.
 
 Rules that keep it safe:
@@ -426,7 +431,7 @@ records of level ERROR, exceptions nobody caught in background tasks, and a cras
 
 ## Commands
 
-`/new` `/posts` `/autopost` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace`
+`/new` `/posts` `/autopost` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace` `/swap`
 `/handleswap` `/undo` `/repost` `/shift` `/sync` `/userbot` `/export` `/import`
 
 Auto-suggest reads the newest published post of the channel that has a button with numbers in its text
@@ -461,7 +466,7 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
 - A published media post can't be turned back into plain text (Telegram limitation).
 - Saved drafts store Telegram's media reference. If it has expired the bot retries without it; if Telegram
   still refuses, send the media again with 🖼 Media.
-- `/replace` and `/handleswap` read posts by id, from 1 up to the channel's counter. Big channels take a while; edits are
+- `/swap` and `/handleswap` read posts by id, from 1 up to the channel's counter. Big channels take a while; edits are
   spaced by `EDIT_DELAY` seconds to stay inside Telegram's limits.
 - Telethon is pinned to 1.45.x: that version changed how inline buttons are represented.
 

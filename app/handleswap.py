@@ -43,7 +43,7 @@ def find_mention_spans(sur: str, entities, name: str) -> tuple:
 
 def compute_handle_changes(msg, old: str, new: str) -> tuple:
     """(MsgChange or None, number of mentions skipped because they are part of a link) - same shape as
-    linkswap.compute_message_changes, so the /replace engine can apply it."""
+    linkswap.compute_message_changes, so the /swap engine can apply it."""
     text = msg.message or ""
     ents = list(msg.entities or [])
     sur = add_surrogate(text)

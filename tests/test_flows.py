@@ -123,7 +123,7 @@ def test_bad_input_and_permissions(tmp_path):
 
         # a non-owner is rejected everywhere
         app.uid = 999
-        await app.text("/replace @a @b")
+        await app.text("/swap @a @b")
         assert "private" in app.out.last_text.lower()
         await app.db.close()
 

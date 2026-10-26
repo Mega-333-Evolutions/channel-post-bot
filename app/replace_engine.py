@@ -1,4 +1,4 @@
-"""/replace engine: scan channels message by message, rewrite links, log every change, undo."""
+"""/swap engine: scan channels message by message, rewrite links, log every change, undo."""
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +36,7 @@ class ScanOptions:
     include_typed: bool = True
     include_posts: bool = False
     last: Optional[int] = None
-    mode: str = "links"  # "links": the username inside t.me links (/replace); "handles": '@name' written in a post (/handleswap)
+    mode: str = "links"  # "links": the username inside t.me links (/swap); "handles": '@name' written in a post (/handleswap)
 
 
 def compute_changes(m, opts: ScanOptions) -> tuple:
@@ -284,7 +284,7 @@ async def undo_batch(
     edit_delay: float = 1.2,
     progress: Optional[Callable[[UndoResult], Awaitable[None]]] = None,
 ) -> UndoResult:
-    """Put every post touched by a /replace run back exactly as it was."""
+    """Put every post touched by a /swap run back exactly as it was."""
     res = UndoResult()
     channels: dict = {}
     done_ids: list = []

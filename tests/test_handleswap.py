@@ -246,13 +246,13 @@ def test_replace_still_works_after_the_refactor(tmp_path):
     async def go():
         app = await flow_app(tmp_path)
         app.tg.msgs[3].reply_markup = markup([url_btn("Get", "https://t.me/bro?start=1")])
-        await app.text("/replace @bro @sis")
+        await app.text("/swap @bro @sis")
         shown = norm(app.out.last_text)
         assert "replace @bro → @sis" in shown and "Apply to" in str(app.out.last_buttons())
         await app.press(app.out.callback_data("Apply to"))
         assert "Done - @bro → @sis" in norm(app.out.last_text)
         assert button_url(app.tg.msgs[3].reply_markup.rows[0].buttons[0]) == "https://t.me/sis?start=1"
-        assert app.tg.msgs[1].message == "Join @bro today"  # /replace never touches a plain username
+        assert app.tg.msgs[1].message == "Join @bro today"  # /swap never touches a plain username
         await app.text("/undo")
         assert "Undo the replace @bro → @sis" in norm(app.out.last_text)
         await app.db.close()

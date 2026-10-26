@@ -1,4 +1,4 @@
-"""/replace, /handleswap and /undo (owner only)."""
+"""/replace media, /swap links, /handleswap and /undo (owner only)."""
 from __future__ import annotations
 
 import logging
@@ -6,19 +6,20 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from telethon import Button, errors
 
-from ..common import Ctx, UserError, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say, show
+from ..common import Ctx, UserError, apply_edit, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say, show
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
-from ..tgutil import esc, explain_rpc, get_rights
+from ..tgutil import classify_media, esc, explain_rpc, get_rights, pack_file_id, ser_entities
 from ..channelref import parse_channel_ref
 
 log = logging.getLogger(__name__)
 
 USAGE = (
-    "Usage: <code>/replace @old @new</code>\n"
+    "Usage: <code>/swap @old @new</code>\n"
     "Options: <code>--channel @name</code> (only that channel), <code>--last 200</code> (only the newest 200 "
     "post ids), <code>--posts</code> (also change t.me/old/123 post links), <code>--no-typed</code> (don't touch "
     "links typed in the text)."
@@ -87,6 +88,24 @@ def pick_channels(chans: list, ref) -> list:
     if not out:
         raise ValueError("That channel isn't registered (see /channels).")
     return out
+
+
+def parse_post_link(value: str):
+    """Return (public username or private channel id, message id) for Telegram post links."""
+    try:
+        u = urlparse(value if "://" in value else "https://" + value)
+        bits = [x for x in u.path.strip("/").split("/") if x]
+        if u.netloc.lower() not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+            return None
+        if bits and bits[0] == "c" and len(bits) == 3 and bits[1].isdigit() and bits[2].isdigit():
+            return -1000000000000 - int(bits[1]), int(bits[2])
+        if bits and bits[0] == "s":
+            bits = bits[1:]
+        if len(bits) == 2 and bits[1].isdigit() and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", bits[0]):
+            return bits[0].lower(), int(bits[1])
+    except Exception:
+        pass
+    return None
 
 
 def handles_summary(job: Job) -> str:
@@ -183,10 +202,47 @@ def register(ctx: Ctx) -> None:
 
         return upd
 
-    # ------------------------------------------------------------------ /replace
+    # ------------------------------------------------------------------ /replace media
     @client.on(cmd("replace", args=True))
     @guard(ctx, owner=True)
     async def h_replace(event):
+        purge_pending(ctx)
+        raw = (event.pattern_match.group(1) or "").strip()
+        if not raw:
+            await say(event, "Reply to a new photo, video, or file with <code>/replace &lt;channel post link&gt;</code>.")
+            return
+        # File replacement mode: reply to a media message with /replace <link to the saved post>.
+        link_bits = parse_post_link(raw) if len(raw.split()) == 1 else None
+        if link_bits:
+            reply = await event.get_reply_message()
+            if reply is None:
+                raise UserError("Reply to the new photo, video, or file, then send /replace <channel post link>.")
+            kind = classify_media(reply)
+            if not kind:
+                raise UserError("The replied-to message must contain a photo, video, GIF, audio file, or document.")
+            ref, message_id = link_bits
+            channels = await db.list_channels()
+            channel = next((c for c in channels if c.id == ref), None) if isinstance(ref, int) else next(
+                (c for c in channels if (c.username or "").lower() == ref), None
+            )
+            if channel is None:
+                raise UserError("That post link is not from a registered channel. Check /channels.")
+            post = await db.find_by_message(channel.id, message_id)
+            if post is None or post.status != "sent":
+                raise UserError("That published post is not in My posts.")
+            caption = reply.raw_text or ""
+            await apply_edit(
+                ctx, post, channel, replace_media=True, media_kind=kind, media_file_id=pack_file_id(reply),
+                text=caption, entities=ser_entities(reply.entities),
+            )
+            await say(event, f"✅ Replaced the media in <b>{esc(channel.title)}</b> and updated My posts.")
+            return
+        raise UserError("Use /replace with a channel post link, replying to the new media. Username swaps use /swap.")
+
+    # ------------------------------------------------------------------ /swap usernames in links
+    @client.on(cmd("swap", args=True))
+    @guard(ctx, owner=True)
+    async def h_swap(event):
         purge_pending(ctx)
         raw = (event.pattern_match.group(1) or "").strip()
         if not raw:
@@ -229,7 +285,7 @@ def register(ctx: Ctx) -> None:
     async def begin_scan(event, opts, chans) -> None:
         """Read the channels, show what would change and wait for the owner's yes."""
         if lock.locked():
-            raise UserError("Another /replace, /handleswap or /undo is still running - wait for it to finish.")
+            raise UserError("Another /swap, /handleswap or /undo is still running - wait for it to finish.")
         async with lock:
             status = await say(event, f"🔍 Scanning {len(chans)} channel(s)…")
             last_edit = [0.0]
@@ -281,7 +337,7 @@ def register(ctx: Ctx) -> None:
         token, action = parts[0], parts[1]
         job = ctx.pending.get(token)
         if not isinstance(job, Job) or job.user != event.sender_id:
-            raise UserError("That scan has expired. Run /replace again.")
+            raise UserError("That scan has expired. Run /swap again.")
         if action == "n":
             ctx.pending.pop(token, None)
             await show(event, "Cancelled - nothing was changed.")
@@ -367,7 +423,7 @@ def register(ctx: Ctx) -> None:
     async def h_undo(event):
         batch = await db.last_batch()
         if batch is None:
-            raise UserError("There is nothing to undo - no /replace or /handleswap run yet.")
+            raise UserError("There is nothing to undo - no /swap or /handleswap run yet.")
         await ask_undo(event, batch)
 
     @on_cb(ctx, "ruc")
@@ -382,7 +438,7 @@ def register(ctx: Ctx) -> None:
     async def cb_undo(event, parts):
         require_owner(ctx, event)
         if lock.locked():
-            raise UserError("Another /replace, /handleswap or /undo is still running.")
+            raise UserError("Another /swap, /handleswap or /undo is still running.")
         upd = make_updater(event)
         async with lock:
             await upd("⏳ Restoring…", force=True)

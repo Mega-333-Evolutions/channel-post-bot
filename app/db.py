@@ -80,7 +80,7 @@ class Post(Base):
 
 
 class Batch(Base):
-    """One /replace run (so it can be undone)."""
+    """One /swap run (so it can be undone)."""
 
     __tablename__ = "batches"
 
