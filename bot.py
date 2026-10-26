@@ -51,6 +51,9 @@ COMMANDS = [
     ("userbot", "Status of the helper account that deletes old posts (owner)"),
     ("export", "Backup as JSON (owner)"),
     ("import", "Restore a backup made by /export (owner)"),
+    ("admins", "List admins (owner)"),
+    ("addadmin", "Add an admin by numeric ID (owner)"),
+    ("removeadmin", "Remove an admin by numeric ID (owner)"),
     ("cancel", "Cancel what I'm doing"),
     ("help", "Show help"),
 ]
@@ -115,6 +118,7 @@ async def main() -> None:
         db = Database(cfg.database_url, cfg.db_pool)
         await db.init()
         ctx = Ctx(cfg=cfg, db=db, client=client, userbot=userbot, reporter=reporter)
+        ctx.admins = await db.list_admins()
         ctx.expirer = Expirer(ctx)
         ctx.syncer = Syncer(ctx)
         register_all(ctx)

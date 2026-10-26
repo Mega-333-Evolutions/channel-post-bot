@@ -232,6 +232,11 @@ class JobMark(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Admin(Base):
+    __tablename__ = "admins"
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+
 def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """A datetime from the database as an aware UTC one (SQLite hands back naive values)."""
     if dt is None:
@@ -300,6 +305,27 @@ class Database:
 
     async def close(self) -> None:
         await self.engine.dispose()
+
+    async def list_admins(self) -> set[int]:
+        async with self.Session() as s:
+            return set((await s.execute(select(Admin.user_id))).scalars())
+
+    async def add_admin(self, uid: int) -> bool:
+        async with self.Session() as s:
+            if await s.get(Admin, uid) is not None:
+                return False
+            s.add(Admin(user_id=uid))
+            await s.commit()
+            return True
+
+    async def remove_admin(self, uid: int) -> bool:
+        async with self.Session() as s:
+            row = await s.get(Admin, uid)
+            if row is None:
+                return False
+            await s.delete(row)
+            await s.commit()
+            return True
 
     # ------------------------------------------------------------------ channels
     async def list_channels(self, active_only: bool = True) -> list:

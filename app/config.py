@@ -113,7 +113,7 @@ def load_config() -> Config:
         api_hash=os.environ["API_HASH"].strip(),
         bot_token=os.environ["BOT_TOKEN"].strip(),
         owners=owners,
-        admins=_ints("ADMIN_IDS"),
+        admins=frozenset(),
         database_url=(os.getenv("DATABASE_URL") or "sqlite+aiosqlite:///data/bot.db").strip(),
         db_pool=(os.getenv("DB_POOL") or "null").strip().lower(),
         session_path=(os.getenv("SESSION_PATH") or default_session_path()).strip(),

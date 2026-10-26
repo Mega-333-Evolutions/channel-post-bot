@@ -37,11 +37,46 @@ HELP = (
     "/userbot - status of the helper account that, by itself and without asking, deletes the posts the bot is not allowed to delete\n"
     "/export - download a JSON backup of your channels and posts\n"
     "/import - put a backup made by /export back (only adds: nothing that exists is changed or deleted)"
+    "\n/admins - list admins (owner)\n/addadmin 123456789 - add an admin (owner)\n/removeadmin 123456789 - remove an admin (owner)"
 )
 
 
 def register(ctx: Ctx) -> None:
     client, db = ctx.client, ctx.db
+
+    @client.on(cmd("admins"))
+    @guard(ctx, owner=True)
+    async def h_admins(event):
+        ids = sorted(ctx.admins | set(ctx.cfg.admins))
+        await say(event, "Admins: " + (", ".join(map(str, ids)) if ids else "none"))
+
+    @client.on(cmd("addadmin"))
+    @guard(ctx, owner=True)
+    async def h_addadmin(event):
+        parts = (event.raw_text or "").split()
+        if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
+            raise UserError("Use /addadmin followed by a numeric Telegram user ID.")
+        uid = int(parts[1])
+        if ctx.cfg.is_owner(uid):
+            raise UserError("That user is already an owner.")
+        if not await db.add_admin(uid):
+            await say(event, f"{uid} is already an admin.")
+            return
+        ctx.admins.add(uid)
+        await say(event, f"Added {uid} as an admin.")
+
+    @client.on(cmd("removeadmin"))
+    @guard(ctx, owner=True)
+    async def h_removeadmin(event):
+        parts = (event.raw_text or "").split()
+        if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
+            raise UserError("Use /removeadmin followed by a numeric Telegram user ID.")
+        uid = int(parts[1])
+        if not await db.remove_admin(uid):
+            await say(event, f"{uid} is not an admin.")
+            return
+        ctx.admins.discard(uid)
+        await say(event, f"Removed {uid} as an admin.")
 
     @client.on(cmd("start"))
     @client.on(cmd("help"))

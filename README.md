@@ -36,7 +36,7 @@ reported to a Telegram chat.
 2. Get `API_ID` and `API_HASH` at https://my.telegram.org (API development tools).
 3. Database: create a free Postgres (for example at neon.tech) and copy its connection string into `DATABASE_URL`.
    Leave it empty to use a local SQLite file.
-4. `cp .env.example .env`, fill it in (`OWNER_IDS` = your numeric Telegram id, ask @userinfobot).
+4. `cp .env.example .env`, fill it in (`OWNER_IDS` = your numeric Telegram id, ask @userinfobot). Manage admins with `/addadmin`, `/removeadmin` and `/admins` in the bot.
 5. `pip install -r requirements.txt` then `python bot.py`.
 6. Add the bot to each channel as **admin** with: *Post messages*, *Edit messages of others*, *Delete messages*
    (*Edit messages of others* is also what lets it pin; *Delete messages* is what removes the service notices).
@@ -45,7 +45,7 @@ reported to a Telegram chat.
    Private channel? Post something in the channel while the bot is running, then forward that post.
 8. Add the bot to the error-log chat (see **Error log** below).
 
-New tables (`channel_sync`, `channel_history`, `ignored_posts`, `job_marks`) are created by the bot itself when it starts;
+New tables (`channel_sync`, `channel_history`, `ignored_posts`, `job_marks`, `admins`) are created by the bot itself when it starts;
 no existing table or column changes, so nothing has to be migrated by hand.
 
 ## Settings
@@ -56,7 +56,6 @@ All settings are environment variables (a `.env` file works locally; on a host u
 |---|---|
 | `API_ID`, `API_HASH`, `BOT_TOKEN` | Telegram credentials (required) |
 | `OWNER_IDS` | your numeric Telegram id(s), comma separated (required). Owners can do everything |
-| `ADMIN_IDS` | ids that may create / edit posts but not use the owner tools |
 | `DATABASE_URL` | PostgreSQL URL (Neon works), empty = local SQLite |
 | `DB_POOL` | `null` (default, short connections, lets serverless Postgres sleep) or `queue` |
 | `ERROR_LOG_CHAT_ID` | chat that receives the error reports. Empty = `-1002525172451`, `0` or `off` = switched off |

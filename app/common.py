@@ -27,6 +27,7 @@ class Ctx:
     cfg: Config
     db: Database
     client: TelegramClient
+    admins: set = field(default_factory=set)
     state: dict = field(default_factory=dict)  # user id -> {"mode": ..., ...}
     pending: dict = field(default_factory=dict)  # tokens for confirm dialogs (replace, repost)
     seen_channels: dict = field(default_factory=dict)  # channel id -> Channel entity seen in updates
@@ -52,7 +53,7 @@ def guard(ctx: Ctx, owner: bool = False) -> Callable:
         @functools.wraps(fn)
         async def wrapper(event):
             uid = event.sender_id
-            ok = ctx.cfg.is_owner(uid) if owner else ctx.cfg.is_allowed(uid)
+            ok = ctx.cfg.is_owner(uid) if owner else (ctx.cfg.is_owner(uid) or uid in ctx.admins or uid in ctx.cfg.admins)
             if not ok:
                 try:
                     if is_cb(event):
