@@ -13,6 +13,7 @@ from telethon import Button, errors
 from ..common import Ctx, UserError, apply_edit, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say, show
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
+from ..sync_engine import SyncOptions, sync_ids
 from ..tgutil import classify_media, esc, explain_rpc, get_rights, pack_file_id, ser_entities
 from ..channelref import parse_channel_ref
 
@@ -98,7 +99,8 @@ def parse_post_link(value: str):
         if u.netloc.lower() not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
             return None
         if bits and bits[0] == "c" and len(bits) == 3 and bits[1].isdigit() and bits[2].isdigit():
-            return -1000000000000 - int(bits[1]), int(bits[2])
+            # Telegram's t.me/c URL uses the same positive channel ID stored by Telethon and in our database.
+            return int(bits[1]), int(bits[2])
         if bits and bits[0] == "s":
             bits = bits[1:]
         if len(bits) == 2 and bits[1].isdigit() and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", bits[0]):
@@ -228,8 +230,26 @@ def register(ctx: Ctx) -> None:
             if channel is None:
                 raise UserError("That post link is not from a registered channel. Check /channels.")
             post = await db.find_by_message(channel.id, message_id)
-            if post is None or post.status != "sent":
-                raise UserError("That published post is not in My posts.")
+            if post is None:
+                report = await sync_ids(
+                    ctx.client,
+                    db,
+                    channel,
+                    [message_id],
+                    SyncOptions(history=False, grace=0, delete_services=False, ignore=ctx.sync_ignore),
+                    adopt_ids={message_id},
+                )
+                post = await db.find_by_message(channel.id, message_id)
+                if post is None:
+                    if report.error:
+                        raise UserError(f"I couldn't read that post: {report.error}")
+                    if report.restricted:
+                        raise UserError("Telegram is currently holding that post back, so I can't replace its media.")
+                    if report.unsupported:
+                        raise UserError("That post can't be saved in My posts, so its media can't be replaced here.")
+                    raise UserError("That post no longer exists in the channel, or I can't add it to My posts.")
+            if post.status != "sent":
+                raise UserError("That post is not published yet.")
             caption = reply.raw_text or ""
             await apply_edit(
                 ctx, post, channel, replace_media=True, media_kind=kind, media_file_id=pack_file_id(reply),

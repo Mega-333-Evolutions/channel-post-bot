@@ -11,7 +11,7 @@ from app.common import UserError
 from app.db import normalize_db_url
 from app.channelref import parse_channel_ref
 from app.handlers.panel import extract_content
-from app.handlers.replace import parse_replace_args
+from app.handlers.replace import parse_post_link, parse_replace_args
 from app.linkswap import apply_span_replacements, classify_url, normalize_username, swap_url
 from app.suggest import advance_plain, build_suggestion
 from app.tgutil import (
@@ -27,7 +27,7 @@ from app.tgutil import (
     utf16_len,
 )
 
-from .fakes import cb_btn, make_msg, markup, url_btn
+from .fakes import FakeChannelClient, cb_btn, make_msg, markup, photo_media, url_btn
 from .harness import App
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
@@ -166,6 +166,30 @@ def test_replace_args_and_refs():
     assert normalize_username("https://t.me/foo_bar/") == "foo_bar" and normalize_username("@x y") is None
     assert parse_channel_ref("@animech") == "animech" and parse_channel_ref("https://t.me/c/123456/7") == 123456
     assert parse_channel_ref("-1001234567890") == 1234567890 and parse_channel_ref("???") is None
+    assert parse_post_link("https://t.me/c/1723201445/9084") == (1723201445, 9084)
+    assert parse_post_link("https://t.me/animech/9084") == ("animech", 9084)
+
+
+def test_replace_adopts_a_linked_private_post_then_updates_its_media(tmp_path):
+    async def run():
+        app = App(tmp_path)
+        await app.start()
+        channel_id, message_id = 1723201445, 9084
+        old = make_msg(message_id, "old caption", media=photo_media(10))
+        app.tg.add_channel(FakeChannelClient({message_id: old}, cid=channel_id, title="Database Channel"))
+        await app.db.save_channel(channel_id, 5, "Database Channel", None, 1)
+        replacement = make_msg(1, "new caption", media=photo_media(20))
+
+        await app.text(f"/replace https://t.me/c/{channel_id}/{message_id}", reply=replacement)
+
+        saved = await app.db.find_by_message(channel_id, message_id)
+        assert saved is not None and saved.source == "adopted"
+        assert saved.text == "new caption" and saved.media_file_id == pack_file_id(replacement)
+        assert app.tg.edits[-1][1] == message_id
+        assert "Replaced the media" in app.out.last_text
+        await app.db.close()
+
+    asyncio.run(run())
 
 
 def test_url_helpers():

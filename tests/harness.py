@@ -29,7 +29,7 @@ class FakeSent:
 
 
 class FakeEvent:
-    def __init__(self, uid, out, text="", data=None, message=None):
+    def __init__(self, uid, out, text="", data=None, message=None, reply=None):
         self.sender_id, self.out = uid, out
         self.is_private = True
         self.is_channel = False
@@ -40,6 +40,7 @@ class FakeEvent:
             raw_text=text, entities=[], media=None, grouped_id=None, forward=None
         )
         self.pattern_match = None
+        self._reply = reply
         self._is_callback = data is not None
         if data is not None:
             self.data = data.encode()
@@ -56,6 +57,9 @@ class FakeEvent:
 
     async def get_input_chat(self):
         return types.InputPeerUser(self.sender_id, 0)
+
+    async def get_reply_message(self):
+        return self._reply
 
 
 class Outbox:
@@ -189,8 +193,8 @@ class App:
         await self.db.init()
         register_all(self.ctx)
 
-    async def text(self, s, message=None):
-        ev = FakeEvent(self.uid, self.out, s, message=message)
+    async def text(self, s, message=None, reply=None):
+        ev = FakeEvent(self.uid, self.out, s, message=message, reply=reply)
         for builder, cb in self.tg.handlers:
             if not isinstance(builder, events.NewMessage):
                 continue
