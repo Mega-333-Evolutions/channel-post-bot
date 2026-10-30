@@ -38,7 +38,7 @@ from ..db import utcnow
 from ..expiry import human, parse_duration, stamp
 from ..tgutil import esc, explain_rpc, flood_retry, peer_of
 from ..ui import CANCEL
-from .panel import extract_content
+from .panel import extract_content, markup_note
 
 log = logging.getLogger(__name__)
 
@@ -164,7 +164,8 @@ def register(ctx: Ctx) -> None:
         await say(
             event,
             f"📣 <b>Broadcast</b> to {len(chans)} channel(s)\n{when}\n\n"
-            "✍️ <b>Send the message now.</b> Text, or a photo / video / GIF / file with a caption. Formatting is kept.",
+            "✍️ <b>Send the message now.</b> Text, or a photo / video / GIF / file with a caption. Formatting is kept "
+            "(or type HTML / Markdown - /formatting shows how).",
             CANCEL,
         )
 
@@ -175,9 +176,9 @@ def register(ctx: Ctx) -> None:
             return  # the other items of an album: only the first one is used
         if m.grouped_id:
             st["group"] = m.grouped_id
-        content = extract_content(m)
+        content = extract_content(m, ctx.cfg.markup_input)
         set_state(ctx, event.sender_id, "bc_buttons", ttl=st["ttl"], content=content)
-        await say(event, BUTTON_HELP, [[Button.inline("⏭ No buttons", "brs")], CANCEL[0]])
+        await say(event, markup_note(content.how) + BUTTON_HELP, [[Button.inline("⏭ No buttons", "brs")], CANCEL[0]])
 
     async def confirm_step(event, st, rows: list) -> None:
         uid = event.sender_id

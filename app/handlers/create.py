@@ -11,7 +11,7 @@ from ..common import Ctx, UserError, clear_state, cmd, discard_temp, guard, on_c
 from ..suggest import make_suggestion
 from ..tgutil import esc, short
 from ..ui import CANCEL, KIND_NAME
-from .panel import extract_content, show_panel
+from .panel import extract_content, markup_note, show_panel
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def register(ctx: Ctx) -> None:
         await show(
             event,
             "✍️ <b>Send the post now.</b>\nText, or a photo / video / GIF / file with a caption. "
-            "Formatting (bold, links, spoilers...) is kept.",
+            "Formatting (bold, links, spoilers...) is kept. No Telegram editor at hand? Type HTML or Markdown - /formatting shows how.",
             CANCEL,
         )
 
@@ -153,7 +153,7 @@ def register(ctx: Ctx) -> None:
             return  # the other items of an album: only the first one is used
         if m.grouped_id:
             st["group"] = m.grouped_id
-        content = extract_content(m)
+        content = extract_content(m, ctx.cfg.markup_input)
         post = await db.create_post(
             channel_id=st["cid"],
             created_by=event.sender_id,
@@ -164,7 +164,7 @@ def register(ctx: Ctx) -> None:
             **content,
         )
         set_state(ctx, event.sender_id, "new_buttons", pid=post.id, temp=True)
-        await say(event, BUTTON_HELP, CANCEL)
+        await say(event, markup_note(content.how) + BUTTON_HELP, CANCEL)
 
     @on_text(ctx, "new_buttons")
     async def h_new_buttons(event, st):

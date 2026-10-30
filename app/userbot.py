@@ -1,12 +1,19 @@
-"""A userbot - a normal Telegram account - that deletes the posts the bot is not allowed to delete.
+"""A userbot - a normal Telegram account - that does what the bot is not allowed to do in a channel.
 
-Telegram's documentation says bots can only delete messages younger than 48 hours. The bot always tries first;
-whatever is left goes to the userbot:
+Deleting: Telegram's documentation says bots can only delete messages younger than 48 hours. The bot always tries
+first; whatever is left goes to the userbot.
+Editing: Telegram refuses the bot an edit of a post that belongs to another bot (its buttons were added by that bot,
+or it was posted through it). The bot always tries first; when Telegram refuses, the userbot makes the edit (text,
+caption or a new photo / file). A user account can't set inline buttons, so Telegram may drop them with that edit -
+the bot puts them back where it can.
+
+How it gets into the channel:
   1. the bot makes a one-time invite link (or reads the channel's own link) and the userbot joins with it
      (public channels without a usable link: the userbot joins by name);
-  2. if the userbot is not allowed to delete there yet and the bot has the "Add new admins" right, the bot makes
-     the userbot an admin with only "Delete messages";
-  3. the userbot deletes, and afterwards the bot takes the admin right away again (USERBOT_KEEP_ADMIN=true keeps it).
+  2. if the userbot is not allowed to do the job there yet and the bot has the "Add new admins" right, the bot
+     makes the userbot an admin with that one right ("Delete messages" / "Edit messages of others");
+  3. the userbot does the job, and afterwards the bot gives the admin rights back as they were
+     (USERBOT_KEEP_ADMIN=true keeps the new right).
 The session lives in USERBOT_SESSION (made on your own computer with make_userbot_session.py).
 """
 from __future__ import annotations
@@ -20,7 +27,7 @@ from typing import Optional
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.sessions import StringSession
 
-from .tgutil import flood_retry, get_rights, peer_of
+from .tgutil import MediaFile, edit_raw, flood_retry, get_rights, peer_of
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +58,7 @@ class Userbot:
         self.client = None
         self.me = None
         self.last_error: Optional[str] = None
-        self.lock = asyncio.Lock()  # one channel clean-up at a time (join / promote / delete / demote)
+        self.lock = asyncio.Lock()  # one channel job at a time (join / promote / delete or edit / demote)
 
     @property
     def enabled(self) -> bool:
@@ -117,6 +124,9 @@ class Userbot:
     def deleter(self, ch) -> "UserbotDeleter":
         return UserbotDeleter(self, ch)
 
+    def editor(self, ch) -> "UserbotEditor":
+        return UserbotEditor(self, ch)
+
     async def fallback_for(self, ch):
         """(delete function, deleter) to hand to the delete step, or (None, None) when no userbot is usable.
 
@@ -132,9 +142,29 @@ class Userbot:
         d = self.deleter(ch)
         return d.delete, d
 
+    async def editor_for(self, ch) -> Optional["UserbotEditor"]:
+        """An editor for posts in `ch`, or None when no userbot is usable. The caller must always `await editor.close()`."""
+        if not self.enabled:
+            return None
+        if not self.ready:
+            await self.connect()
+        return self.editor(ch) if self.ready else None
 
-class UserbotDeleter:
-    """Everything needed to delete in ONE channel with the userbot. Call close() when done, whatever happened."""
+
+def _rights_dict(rights) -> dict:
+    return {k: v for k, v in rights.to_dict().items() if k != "_"} if rights is not None else {}
+
+
+class _ChannelJob:
+    """Everything needed to do ONE job in ONE channel with the userbot. Call close() when done, whatever happened.
+
+    What the job needs is named by RIGHT (the field of ChatAdminRights) and RIGHT_NAME (what the Telegram apps call it).
+    """
+
+    RIGHT = "delete_messages"
+    RIGHT_NAME = "Delete messages"
+    WHAT = "delete messages"  # what the userbot may not do without the right (as the owner is told)
+    VERB = "delete"
 
     def __init__(self, ub: Userbot, ch):
         self.ub = ub
@@ -144,11 +174,13 @@ class UserbotDeleter:
         self._ready = False
         self._holds_lock = False
         self._promoted = False
+        self._before = None  # (admin rights, rank) the userbot had before the bot changed them; None = a plain member
         self._bot_user = None  # the userbot account as the bot sees it (InputUser)
         self._link: Optional[str] = None  # the temporary invite link we made
 
     # ------------------------------------------------------------------ public
-    async def delete(self, ids: list) -> None:
+    async def _begin(self) -> None:
+        """Get the channel ready (joined, with the right). The userbot's lock is kept until close()."""
         if not self.ub.ready:
             raise UserbotError(f"The userbot is not connected: {self.ub.last_error or 'unknown reason'}")
         if not self._ready:
@@ -157,25 +189,24 @@ class UserbotDeleter:
                 self._holds_lock = True
             await self._prepare()
             self._ready = True
-        client = self.ub.client
-        for i in range(0, len(ids), 100):
-            part = list(ids[i : i + 100])
-            await flood_retry(
-                lambda part=part: client(functions.channels.DeleteMessagesRequest(channel=self.peer, id=part))
-            )
 
     async def close(self) -> None:
-        """Undo what this clean-up changed: take the admin right away again, revoke the temporary link."""
+        """Undo what this job changed: give the admin rights back as they were, revoke the temporary link."""
         bot, ch = self.ub.bot, self.ch
         try:
             if self._promoted and self._bot_user is not None and not self.ub.keep_admin:
+                rights, rank = self._before or (types.ChatAdminRights(), "")
                 try:
                     await bot(
                         functions.channels.EditAdminRequest(
-                            channel=peer_of(ch), user_id=self._bot_user, admin_rights=types.ChatAdminRights(), rank=""
+                            channel=peer_of(ch), user_id=self._bot_user, admin_rights=rights, rank=rank
                         )
                     )
-                    self.notes.append("took the admin right away from the userbot again")
+                    self.notes.append(
+                        "took the admin right away from the userbot again"
+                        if self._before is None
+                        else "put the userbot's admin rights back as they were"
+                    )
                 except Exception as e:
                     log.warning("could not demote the userbot in %s: %s", ch.id, type(e).__name__)
                     self.notes.append("could not take the admin right away from the userbot - please do it by hand")
@@ -198,7 +229,7 @@ class UserbotDeleter:
         if peer is None:
             peer = await self._join()
         self.peer = peer
-        await self._ensure_delete_right()
+        await self._ensure_right()
 
     async def _member_peer(self):
         """The channel as the userbot sees it, if the userbot is in it already."""
@@ -251,7 +282,7 @@ class UserbotDeleter:
         raise UserbotError(
             "I could not get the userbot into this private channel: Telegram gave me no invite link. "
             "Give the bot the “Invite users via link” admin right, or add the userbot to the channel yourself "
-            "(with the “Delete messages” admin right)."
+            f"(with the “{self.RIGHT_NAME}” admin right)."
         )
 
     async def _import_invite(self, h: str):
@@ -312,36 +343,47 @@ class UserbotDeleter:
         return peer
 
     # ------------------------------------------------------------------ rights
-    async def _userbot_can_delete(self) -> bool:
+    async def _userbot_status(self):
+        """(is the creator, its admin rights or None, its rank) as the channel shows the userbot; None if unknown."""
         try:
             res = await self.ub.client(functions.channels.GetParticipantRequest(self.peer, types.InputPeerSelf()))
         except errors.RPCError:
-            return False
+            return None
         p = res.participant
         if isinstance(p, types.ChannelParticipantCreator):
-            return True
+            return True, None, ""
         if isinstance(p, types.ChannelParticipantAdmin):
-            return bool(getattr(p.admin_rights, "delete_messages", False))
-        return False
+            return False, p.admin_rights, getattr(p, "rank", None) or ""
+        return False, None, ""
 
-    async def _ensure_delete_right(self) -> None:
-        if await self._userbot_can_delete():
+    async def _userbot_has_right(self) -> bool:
+        status = await self._userbot_status()
+        if status is None:
+            return False
+        creator, rights, _ = status
+        return creator or bool(getattr(rights, self.RIGHT, False))
+
+    async def _ensure_right(self) -> None:
+        if await self._userbot_has_right():
             return
         rights = await get_rights(self.ub.bot, self.ch)
         if rights is None or not (rights.admin and rights.add_admins):
             raise UserbotError(
-                "The userbot is in the channel but may not delete messages there, and the bot may not add admins. "
+                f"The userbot is in the channel but may not {self.WHAT} there, and the bot may not add admins. "
                 "Give the bot the “Add new admins” right (it then promotes the userbot by itself), or make the userbot "
-                "an admin with “Delete messages” yourself."
+                f"an admin with “{self.RIGHT_NAME}” yourself."
             )
         user = await self._bot_view_of_userbot()
+        status = await self._userbot_status()
+        had = _rights_dict(status[1]) if status else {}
+        rank = status[2] if status else ""
         try:
             await self.ub.bot(
                 functions.channels.EditAdminRequest(
                     channel=peer_of(self.ch),
                     user_id=user,
-                    admin_rights=types.ChatAdminRights(delete_messages=True),
-                    rank="",
+                    admin_rights=types.ChatAdminRights(**{**had, self.RIGHT: True}),  # what it had, plus this one right
+                    rank=rank,
                 )
             )
         except errors.RPCError as e:
@@ -354,12 +396,18 @@ class UserbotDeleter:
             }.get(name, str(e)[:150])
             raise UserbotError(f"I could not make the userbot an admin ({name}). {hint}")
         self._promoted, self._bot_user = True, user
-        self.notes.append("made the userbot an admin with only “Delete messages”")
+        if any(had.values()):
+            self._before = (status[1], rank)
+            self.notes.append(f"gave the userbot the “{self.RIGHT_NAME}” right on top of the ones it had")
+        else:
+            self.notes.append(f"made the userbot an admin with only “{self.RIGHT_NAME}”")
         for _ in range(12):  # the new right can take a moment to show up for the other account
-            if await self._userbot_can_delete():
+            if await self._userbot_has_right():
                 return
             await asyncio.sleep(0.5)
-        raise UserbotError("I made the userbot an admin, but Telegram still does not let it delete there. Check its rights.")
+        raise UserbotError(
+            f"I made the userbot an admin, but Telegram still does not let it {self.VERB} there. Check its rights."
+        )
 
     async def _bot_view_of_userbot(self):
         """The userbot account as an InputUser the BOT can use (needs the bot's own access hash for that user)."""
@@ -394,7 +442,70 @@ class UserbotDeleter:
                 pass
         raise UserbotError(
             "The userbot joined, but the bot cannot find that account in the channel's member list, so it cannot "
-            "promote it. Make the userbot an admin with “Delete messages” yourself."
+            f"promote it. Make the userbot an admin with “{self.RIGHT_NAME}” yourself."
+        )
+
+
+class UserbotDeleter(_ChannelJob):
+    """Deletes messages in ONE channel with the userbot. Call close() when done, whatever happened."""
+
+    async def delete(self, ids: list) -> None:
+        await self._begin()
+        client = self.ub.client
+        for i in range(0, len(ids), 100):
+            part = list(ids[i : i + 100])
+            await flood_retry(
+                lambda part=part: client(functions.channels.DeleteMessagesRequest(channel=self.peer, id=part))
+            )
+
+
+_EDIT_HINTS = {
+    "ChatAdminRequiredError": "It needs the “Edit messages of others” admin right in that channel.",
+    "MessageAuthorRequiredError": "It needs the “Edit messages of others” admin right in that channel.",
+    "MessageIdInvalidError": "The post may be gone, or Telegram does not let anyone edit it.",
+    "InlineBotRequiredError": "That post was sent through another bot's inline mode, so only that bot can edit it.",
+    "MessageEditTimeExpiredError": "Telegram no longer allows editing that message.",
+}
+
+
+class UserbotEditor(_ChannelJob):
+    """Edits posts in ONE channel as the userbot. Call close() when done, whatever happened.
+
+    The userbot is a user account: it can't set inline buttons, so its edit carries none and Telegram may drop the ones
+    the post had. The caller puts them back afterwards."""
+
+    RIGHT = "edit_messages"
+    RIGHT_NAME = "Edit messages of others"
+    WHAT = "edit other people's posts"
+    VERB = "edit"
+
+    async def edit(self, message_id: int, *, text: str, entities: list, media: Optional[MediaFile] = None, preview=None) -> None:
+        """Make the post show `text` (with `entities`) and, when given, the photo / file `media` (uploaded again)."""
+        await self._begin()
+        client = self.ub.client
+        try:
+            input_media = await self._input_media(media) if media is not None else None
+            await flood_retry(
+                lambda: edit_raw(
+                    client, self.peer, message_id, text=text, entities=entities, preview=preview, media=input_media
+                )
+            )
+        except errors.MessageNotModifiedError:
+            return  # it already looks like that
+        except errors.RPCError as e:
+            name = type(e).__name__
+            raise UserbotError(f"Telegram refused the userbot as well ({name}). {_EDIT_HINTS.get(name) or str(e)[:200]}")
+
+    async def _input_media(self, f: MediaFile):
+        client = self.ub.client
+        handle = await flood_retry(lambda: client.upload_file(f.path, file_name=f.name))
+        if f.kind == "photo":
+            return types.InputMediaUploadedPhoto(file=handle)
+        return types.InputMediaUploadedDocument(
+            file=handle,
+            mime_type=f.mime_type or "application/octet-stream",
+            attributes=list(f.attributes),
+            force_file=True if f.kind == "document" else None,  # a file sent "as a file" stays one
         )
 
 
@@ -412,3 +523,14 @@ def delete_problem_text(ub, *, bot_error: Optional[str] = None, fallback_error: 
     elif not ub.ready:
         parts.append(f"The userbot is not connected: {ub.last_error or 'unknown reason'}")
     return " ".join(parts) or "Telegram did not delete them (the bot's “Delete messages” right, or an age limit on old posts)."
+
+
+def edit_problem_text(ub, *, fallback_error: Optional[str] = None) -> str:
+    """What to add when Telegram refused the bot's edit and the userbot could not take over (empty: nothing to add)."""
+    if fallback_error:
+        return f"The userbot could not do it either: {fallback_error}"
+    if ub is None or not getattr(ub, "enabled", False):
+        return "A userbot can edit such posts for you - see /userbot."
+    if not ub.ready:
+        return f"The userbot is not connected: {ub.last_error or 'unknown reason'}"
+    return ""

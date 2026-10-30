@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -11,9 +13,12 @@ from typing import Any, Callable, Optional
 
 from telethon import TelegramClient, errors, events
 
+from .buttons_sync import ensure_markup, link_urls
 from .config import Config
 from .db import Database
-from .tgutil import build_markup, de_entities, edit_raw, esc, explain_rpc, peer_of, with_media
+from .replace_engine import fetch_messages, is_skippable
+from .tgutil import build_markup, de_entities, edit_raw, esc, explain_rpc, fetch_media, media_info, peer_of, with_media
+from .userbot import UserbotError, edit_problem_text
 
 log = logging.getLogger(__name__)
 
@@ -172,8 +177,118 @@ async def push_edit(client, ch, p, *, replace_media: bool = False) -> None:
         )
 
 
-async def apply_edit(ctx: Ctx, post, ch, *, replace_media: bool = False, **changes):
-    """Edit the channel message first (if the post is published), and only then save the change."""
+# What the userbot can change in a post. It is a user account: it can't set buttons, and it fails the way the bot did
+# when Telegram dislikes the text itself.
+USERBOT_EDITS = {"text", "entities", "link_preview"}
+NOT_THE_USERBOTS_JOB = {
+    "EntityBoundsInvalidError", "EntitiesTooLongError", "MessageTooLongError", "MediaCaptionTooLongError",
+    "MessageEmptyError", "ButtonUrlInvalidError", "ReplyMarkupInvalidError",
+}
+
+
+@dataclass
+class EditReport:
+    """How the edit of a published post went (for the message the owner gets)."""
+
+    by_userbot: bool = False  # Telegram refused the bot, so the userbot made the edit
+    bot_error: Optional[str] = None  # the name of the error Telegram gave the bot
+    buttons: Optional[str] = None  # after the userbot's edit: "kept" | "restored" | "lost" (None: no link buttons saved)
+    notes: list = field(default_factory=list)  # what the userbot had to do in the channel (joined, got a right ...)
+    media: Optional[tuple] = None  # (kind, reference) of the photo / file the post shows now, as the bot sees it
+
+
+def edit_report_text(report: Optional[EditReport]) -> str:
+    """The lines to add to the owner's message when the userbot had to make the edit (empty for an ordinary edit)."""
+    if report is None or not report.by_userbot:
+        return ""
+    lines = [f"🤖 Telegram refused the bot ({esc(report.bot_error or 'error')}), so the userbot made the edit."]
+    if report.buttons == "kept":
+        lines.append("The buttons are still on the post.")
+    elif report.buttons == "restored":
+        lines.append("Telegram dropped the buttons with that edit, so the bot put them back.")
+    elif report.buttons == "lost":
+        lines.append(
+            "Telegram dropped the buttons with that edit and the bot may not put them back. They stay saved in "
+            "My posts; 🔧 Check buttons tries again."
+        )
+    if report.notes:
+        text = "; ".join(report.notes)
+        lines.append("ℹ️ " + esc(text[:1].upper() + text[1:]) + ".")
+    return "\n".join(lines)
+
+
+async def put_buttons_back(client, ch, p) -> Optional[str]:
+    """After the userbot's edit: make the post show its saved link buttons again where Telegram dropped them.
+
+    "kept" (they were there), "restored", "lost" (Telegram won't let the bot set them), None (none are saved)."""
+    markup = build_markup(p.buttons)
+    if not link_urls(markup):
+        return None
+    try:
+        how = await ensure_markup(client, peer_of(ch), p.message_id, markup)
+    except Exception as e:  # noqa: BLE001 - the edit itself worked; only the buttons are missing
+        log.info("could not put the buttons back on %s: %s", p.message_id, type(e).__name__)
+        return "lost"
+    return "kept" if how == "fine" else "restored"
+
+
+async def live_media(client, ch, message_id: int) -> Optional[tuple]:
+    """(kind, reference) of the photo / file the channel post shows now, as the bot sees it; None if it can't be read."""
+    try:
+        msgs = await fetch_messages(client, peer_of(ch), [message_id])
+    except Exception:  # noqa: BLE001
+        return None
+    m = msgs[0] if msgs else None
+    if is_skippable(m):
+        return None
+    kind, ref = media_info(m)
+    return (kind, ref) if kind else None
+
+
+async def edit_by_userbot(ctx: Ctx, ch, p, *, replace_media: bool, bot_error: str, notify=None) -> Optional[EditReport]:
+    """The userbot makes the live post look like `p`. None when there is no userbot to ask; UserbotError when it fails.
+
+    The new photo / file is downloaded by the bot (the userbot can't see the owner's chat with the bot) and uploaded again."""
+    ub = ctx.userbot
+    editor = await ub.editor_for(ch) if ub is not None else None
+    if editor is None:
+        return None
+    report = EditReport(by_userbot=True, bot_error=bot_error)
+    folder = None
+    try:
+        if notify is not None:
+            await notify()
+        media = None
+        if replace_media and p.media_file_id:
+            folder = tempfile.mkdtemp(prefix="cpb-media-")
+            try:
+                media = await fetch_media(ctx.client, p.media_file_id, p.media_kind, folder)
+            except (errors.RPCError, OSError, ValueError) as e:
+                raise UserbotError(f"I could not download the new media for the userbot ({type(e).__name__}).")
+        await editor.edit(
+            p.message_id,
+            text=p.text or "",
+            entities=de_entities(p.entities),
+            media=media,
+            preview=None if p.media_kind else bool(p.link_preview),
+        )
+    finally:
+        await editor.close()
+        report.notes = list(editor.notes)
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+    if replace_media:
+        report.media = await live_media(ctx.client, ch, p.message_id)
+    report.buttons = await put_buttons_back(ctx.client, ch, p)
+    return report
+
+
+async def apply_edit_reported(ctx: Ctx, post, ch, *, replace_media: bool = False, notify=None, **changes):
+    """Edit the channel message first (if the post is published), and only then save the change.
+
+    The bot edits. If Telegram refuses it (a post that belongs to another bot) and the change is to the text, caption
+    or media, the userbot makes the edit instead. Returns (the saved post, an EditReport)."""
+    report = EditReport()
     if post.status == "sent" and post.message_id:
         new = SimpleNamespace(**{**post.as_dict(), **changes})
         try:
@@ -181,8 +296,28 @@ async def apply_edit(ctx: Ctx, post, ch, *, replace_media: bool = False, **chang
         except errors.MessageNotModifiedError:
             pass
         except errors.RPCError as e:
-            raise UserError("❌ " + explain_rpc(e) + "\nNothing was changed.")
-    return await ctx.db.update_post(post.id, **changes)
+            refused = "❌ " + explain_rpc(e)
+            if type(e).__name__ in NOT_THE_USERBOTS_JOB or not (replace_media or USERBOT_EDITS & set(changes)):
+                raise UserError(refused + "\nNothing was changed.")
+            try:
+                done = await edit_by_userbot(
+                    ctx, ch, new, replace_media=replace_media, bot_error=type(e).__name__, notify=notify
+                )
+            except UserbotError as ue:
+                log.info("the userbot could not make the edit either: %s", ue)
+                raise UserError(f"{refused} {edit_problem_text(ctx.userbot, fallback_error=str(ue))}\nNothing was changed.")
+            if done is None:
+                raise UserError(f"{refused} {edit_problem_text(ctx.userbot)}\nNothing was changed.")
+            report = done
+            if report.media:  # the post now shows the userbot's upload: keep My posts in step with it
+                changes = {**changes, "media_kind": report.media[0], "media_file_id": report.media[1]}
+    return await ctx.db.update_post(post.id, **changes), report
+
+
+async def apply_edit(ctx: Ctx, post, ch, *, replace_media: bool = False, **changes):
+    """apply_edit_reported for the callers that only want the saved post."""
+    saved, _ = await apply_edit_reported(ctx, post, ch, replace_media=replace_media, **changes)
+    return saved
 
 
 def purge_pending(ctx: Ctx, ttl: float = 3600.0) -> None:

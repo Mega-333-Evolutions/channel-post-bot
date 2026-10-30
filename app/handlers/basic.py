@@ -9,6 +9,7 @@ from telethon import events
 
 from ..common import Ctx, UserError, cmd, clear_state, discard_temp, guard, say, show
 from ..picker import PAGE_CB
+from ..richtext import CHEAT_SHEET
 from ..tgutil import esc
 
 log = logging.getLogger(__name__)
@@ -19,13 +20,14 @@ HELP = (
     "/new - create a post (text or media, with buttons)\n"
     "/posts - your posts and drafts: edit text, caption, media and buttons, or delete them - a published post is deleted in the channel and in My posts (a button post also has “Mass replace links”)\n"
     "/autopost 114 20 - post “Episodes 01 to 20”, “21 to 40” ... up to 114, each with a download button, then fill in the links\n"
+    "/formatting - bold, italic, links, quotes ...: Telegram's own formatting is kept, or type HTML / Markdown instead\n"
     "/cancel - stop what you're doing\n\n"
     "<b>Channels</b>\n"
     "/addchannel - register a channel (the bot must be an admin there)\n"
     "/channels - list your channels, or take one out (the bot asks whether its saved posts in My posts are deleted too)\n\n"
     "<b>Owner tools</b>\n"
     "/broadcast [time] - send one message to all channels; with a time (50m, 1h, 5d) it is deleted again from all channels and My posts afterwards\n"
-    "/replace <post link> - reply to a new media message to replace that post's media and caption\n"
+    "/replace <post link> - reply to a new media message to replace that post's media and caption (where Telegram refuses the bot, the userbot does it)\n"
     "/swap @old @new - swap the username inside t.me links (button links and hyperlinks) in all channels\n"
     "/handleswap @old @new - change the username @old written in posts (text, captions, button names) to @new in all channels; links stay\n"
     "/undo - undo the last /swap or /handleswap\n"
@@ -35,7 +37,7 @@ HELP = (
     "-c: links to the source's posts in all your channels are changed to the copies; -all: the destination also gets the source's name, description and photo; "
     "--no-media: no files, only the text and buttons\n"
     "/sync - compare every channel with My posts right now (posts deleted, edited or added by others, the older posts from before the bot was added; service messages are deleted)\n"
-    "/userbot - status of the helper account that, by itself and without asking, deletes the posts the bot is not allowed to delete\n"
+    "/userbot - status of the helper account that, by itself and without asking, deletes and edits the posts the bot is not allowed to\n"
     "/export - download a JSON backup of your channels and posts\n"
     "/import - put a backup made by /export back (only adds: nothing that exists is changed or deleted)"
     "\n/admins - list admins (owner)\n/addadmin 123456789 - add an admin (owner)\n/removeadmin 123456789 - remove an admin (owner)"
@@ -85,6 +87,11 @@ def register(ctx: Ctx) -> None:
     async def h_help(event):
         await say(event, HELP)
 
+    @client.on(cmd("formatting"))
+    @guard(ctx)
+    async def h_formatting(event):
+        await say(event, CHEAT_SHEET)
+
     @client.on(cmd("cancel"))
     @guard(ctx)
     async def h_cancel(event):
@@ -112,10 +119,11 @@ def register(ctx: Ctx) -> None:
             await say(
                 event,
                 "🤖 <b>Userbot: not set up.</b>\n"
-                "The bot deletes old posts itself first. If Telegram refuses (posts older than 48 hours), a helper "
-                "account - the userbot - takes over by itself, without asking you each time: it joins the channel "
-                "through an invite link the bot makes, the bot gives it the “Delete messages” right if it has the "
-                "“Add new admins” right, and takes it away again afterwards.\n\n"
+                "The bot does its work itself first. If Telegram refuses - deleting posts older than 48 hours, or "
+                "editing a post that belongs to another bot (/replace, text and caption edits) - a helper account, "
+                "the userbot, takes over by itself, without asking you each time: it joins the channel through an "
+                "invite link the bot makes, the bot gives it the “Delete messages” or “Edit messages of others” right "
+                "if it has the “Add new admins” right, and gives the rights back afterwards.\n\n"
                 "To set it up: on your own computer run <code>python make_userbot_session.py</code> with a "
                 "<b>separate</b> Telegram account, and put the printed text into the bot's secrets as "
                 "<code>USERBOT_SESSION</code>. See the README.",

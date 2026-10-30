@@ -83,6 +83,7 @@ class Config:
     delete_service_messages: bool = True  # remove "channel name changed", "pinned a message", video chat ... notices
     sync_interval_minutes: int = 60  # how often every channel is compared with My posts (0 = never on its own)
     import_old_posts: bool = True  # read the posts that were in a channel before the bot was added into My posts
+    markup_input: bool = True  # text typed as HTML or Markdown (and sent without Telegram formatting) becomes real formatting
 
     def is_owner(self, uid) -> bool:
         return uid in self.owners
@@ -128,4 +129,5 @@ def load_config() -> Config:
         delete_service_messages=_bool("DELETE_SERVICE_MESSAGES", True),
         sync_interval_minutes=max(0, _whole("SYNC_INTERVAL_MINUTES", 60)),
         import_old_posts=_bool("IMPORT_OLD_POSTS", True),
+        markup_input=_bool("MARKUP_INPUT", True),
     )

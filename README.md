@@ -12,15 +12,15 @@ reported to a Telegram chat.
 
 | Area | Features |
 |---|---|
-| Posts | create text / photo / video / GIF / audio / file posts, formatting kept, preview, publish, drafts |
-| Edit later | text or caption, replace media, add / delete buttons, change button text, change button link, reorder buttons (⬅️⬆️⬇️➡️), link-preview toggle, **Mass replace links** (new links for the buttons of a channel, one after the other) |
+| Posts | create text / photo / video / GIF / audio / file posts, Telegram's own formatting kept - or typed as **HTML / Markdown** when its editor is not at hand (see **Formatting**), preview, publish, drafts |
+| Edit later | text or caption, replace media (where Telegram refuses the bot, the userbot makes the edit), add / delete buttons, change button text, change button link, reorder buttons (⬅️⬆️⬇️➡️), link-preview toggle, **Mass replace links** (new links for the buttons of a channel, one after the other) |
 | Choosing a channel | every command that needs one of your channels lists them as a numbered text list (A to Z, 20 to a message); the buttons only carry the numbers (5 to a row), ◀ ▶ move to the next / previous 20 |
 | My posts | `/posts` lists drafts and published posts per channel, edit or delete them: **🗑 Delete from channel** deletes the post in the channel *and* removes it, with its data, from My posts (the userbot, if there is one, takes over by itself where the bot is refused - nothing is asked); **🧹 Only forget it in the bot** leaves the channel alone. **⬅️ Prev** is always shown; on the first page it jumps to the last page. Owners also get **🔧 Check buttons** (see below) |
 | Channels | `/addchannel` registers a channel, `/channels` lists them. Tapping a channel's number takes it out of the bot - and the bot asks whether its saved posts in My posts are deleted too (**Yes** / **No**, see **Taking a channel out**) |
 | Auto-suggest | `/new` offers the next batch: after "Download Episodes 01 to 20" it proposes "Download Episodes 21 to 40", then 41 to 60 ... Tap **Use suggestion** and only the button link is asked |
 | `/autopost` | `/autopost 114 20` posts "Episodes 01 to 20", "21 to 40" ... up to 114, each with a download button, then asks for the real link of every button |
 | `/swap` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
-| `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption; My posts is updated |
+| `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption (nothing else); the caption keeps its formatting, Telegram's own or typed HTML / Markdown. Where Telegram refuses the bot - a post whose buttons another bot added - the userbot makes the edit; My posts is updated |
 | `/handleswap` | swaps a `@username` that is *written* in posts (text, captions, button names) - links are left alone. Preview first, full undo |
 | `/repost` | copies **every post of a channel, in order**, to the end of the channel (links swapped on the way, replies, pins and links between posts kept), registers the copies in My posts, verifies every button, **points links to the old posts - in this and in all your other connected channels - at the copies**, then deletes the old posts after your confirmation |
 | `/shift` | copies posts from **one channel into another** (all, or a range of message ids); the source is only read. `-c` points links to the source's posts in all your connected channels at the copies, `-all` also gives the destination the source's name, description and photo. Posts Telegram holds back after a copyright strike are copied from My posts, whatever Telegram hands out of them now; `--no-media` leaves the files out |
@@ -28,7 +28,7 @@ reported to a Telegram chat.
 | Service notices | "name changed", "photo changed", "pinned a message", live stream notices ... are deleted from every connected channel |
 | Sync | posts deleted, edited or added by other admins are recorded in My posts (`/sync` runs it now); the posts that were in a channel before the bot was added are read in; what Telegram itself does to a channel (a copyright strike) is never taken for an edit |
 | Backup | `/export` downloads a JSON backup of your channels and posts, `/import` puts it back (it only adds) |
-| Userbot (optional) | a helper user account that deletes the old posts the bot itself is not allowed to delete (older than 48 hours) - used by itself wherever the bot deletes something and is refused; it is never asked about |
+| Userbot (optional) | a helper user account that deletes the old posts the bot itself is not allowed to delete (older than 48 hours) and edits the posts the bot is not allowed to edit (text, caption, media) - used by itself wherever the bot is refused; it is never asked about |
 | Error log | every error goes to a Telegram chat as a Python code block with the full traceback |
 
 ## Setup (local)
@@ -41,7 +41,7 @@ reported to a Telegram chat.
 5. `pip install -r requirements.txt` then `python bot.py`.
 6. Add the bot to each channel as **admin** with: *Post messages*, *Edit messages of others*, *Delete messages*
    (*Edit messages of others* is also what lets it pin; *Delete messages* is what removes the service notices).
-   For the userbot clean-up below it also needs *Invite users via link* and *Add new admins*.
+   For the userbot below (clean-up and edits) it also needs *Invite users via link* and *Add new admins*.
 7. In the bot: `/addchannel`, then forward a post from the channel (or send its @username).
    Private channel? Post something in the channel while the bot is running, then forward that post.
 8. Add the bot to the error-log chat (see **Error log** below).
@@ -61,7 +61,7 @@ All settings are environment variables (a `.env` file works locally; on a host u
 | `DB_POOL` | `null` (default, short connections, lets serverless Postgres sleep) or `queue` |
 | `ERROR_LOG_CHAT_ID` | chat that receives the error reports. Empty = `-1002525172451`, `0` or `off` = switched off |
 | `USERBOT_SESSION` | session text of the helper account (see **Userbot**). Empty = no userbot |
-| `USERBOT_KEEP_ADMIN` | `true` = the userbot stays an admin after a clean-up (default: the right is taken away again) |
+| `USERBOT_KEEP_ADMIN` | `true` = the userbot stays an admin after a clean-up or an edit (default: the right is taken away again) |
 | `DELETE_SERVICE_MESSAGES` | `true` (default) = the bot deletes the notices Telegram adds to the channels. `false` = leave them |
 | `IMPORT_OLD_POSTS` | `true` (default) = the posts that were in a channel before the bot was added are read into My posts too (see **Sync**). `false` = follow only what happens from now on |
 | `SYNC_INTERVAL_MINUTES` | minutes between two full checks of every channel against My posts (default 60). `0` = no automatic checks and no live tracking of edits / deletes / new posts; `/sync` still works. Every check wakes a serverless database such as Neon for a few minutes, so a longer value (e.g. `180`) lets it sleep more |
@@ -69,6 +69,7 @@ All settings are environment variables (a `.env` file works locally; on a host u
 | `SESSION_STRING` | optional, from `python make_session.py` |
 | `EDIT_DELAY` | seconds between edits / copies (default 1.2, minimum 0.3) |
 | `REPLACE_TYPED_LINKS` | also swap links typed as plain text (default true) |
+| `MARKUP_INPUT` | `true` (default) = HTML and Markdown typed in a post's text become formatting (see **Formatting**). `false` = text is used exactly as typed; Telegram's own formatting still works |
 | `PORT` | the bot answers `ok` on this port (not needed with the Docker setup below) |
 | `LOG_LEVEL` | `INFO` (default) |
 
@@ -102,15 +103,82 @@ the button in the channel at once. The posts are in My posts like any other.
 post in `/posts` and tap it; the bot asks for that post's new link, then for the next button post of the channel (posts
 without a link button are skipped). Stop with ✖️ Cancel at any time; what was answered stays changed.
 
+## ✍️ Formatting: Telegram's own, HTML and Markdown
+
+Everywhere the bot takes a post's text or caption - `/new`, **✏️ Text / caption** in My posts, `/broadcast`, `/replace` -
+**Telegram's own formatting** (bold, italic, underline, strikethrough, spoiler, code, code blocks, quotes, expandable
+quotes, links behind words, custom emoji) is kept exactly as you made it and published like that: the channel, the
+preview, My posts and later copies (`/repost`, `/shift`) all show the same.
+
+When Telegram's editor is not at hand (no Premium, a client without the editor ...), **type** the formatting. If the
+message carries no Telegram formatting, the bot reads it as **HTML** (when the text holds a supported tag together with its
+closing tag) or else as **Markdown**, and what it recognises becomes real formatting. `/formatting` shows this cheat sheet in
+the chat.
+
+| Formatting | Markdown | HTML |
+|---|---|---|
+| bold | `**text**` | `<b>text</b>` (also `<strong>`) |
+| italic | `*text*` or `_text_` | `<i>text</i>` (also `<em>`) |
+| underline | `__text__` | `<u>text</u>` (also `<ins>`) |
+| strikethrough | `~~text~~` | `<s>text</s>` (also `<strike>`, `<del>`) |
+| spoiler | `\|\|text\|\|` | `<tg-spoiler>text</tg-spoiler>` (also `<span class="tg-spoiler">`) |
+| code | `` `text` `` | `<code>text</code>` |
+| code block | three backticks, optionally a language and a line break, the code, three backticks | `<pre>text</pre>` or `<pre><code class="language-python">text</code></pre>` |
+| link | `[text](https://t.me/name)` | `<a href="https://t.me/name">text</a>` |
+| quote | a line that starts with `>` | `<blockquote>text</blockquote>` |
+| expandable quote | `**>` starts the first line, `\|\|` ends the last | `<blockquote expandable>text</blockquote>` |
+| custom emoji | `![🙂](tg://emoji?id=5368324170671202286)` | `<tg-emoji emoji-id="5368324170671202286">🙂</tg-emoji>` |
+| line break | a line break | `<br>` (a line break works too) |
+
+How it decides, so ordinary text is never changed by accident:
+
+- **Telegram's own formatting always wins.** A message that already carries some is used exactly as it is: nothing in it is
+  read as HTML or Markdown, so `**x**` typed in a message that has a bold word stays literal.
+- **HTML** is read only when a supported tag comes with its closing tag (`<b>…</b>`); a lone `<b>` or `1 < 2` is just text.
+  `&lt;` `&gt;` `&amp;` stand for `<` `>` `&`. Tags the bot does not know stay as typed, and nothing is read inside
+  `<code>` or `<pre>`. If the text has such a tag pair it is read as HTML only - Markdown marks in it stay as typed.
+- **Markdown** follows the usual rules: a mark has to touch the text it formats (`**bold**`, not `** bold **`), so `5 * 3`,
+  `snake_case_name`, `Sub | Dub`, `[Group] Title`, `<3` and a link such as `https://example.com/a_b_c` stay as typed. A
+  single `*text*` is *italic* (not bold) and `__text__` is underline. A backslash keeps a mark as it is: `\*not italic\*`.
+  Nothing is read inside `` `code` `` or a code block. `>>` at the start of a line is decoration, not a quote.
+- Whatever the bot does not recognise stays exactly as typed, and the reader can't fail a post: if it ever chokes on a
+  text, the text is used as typed.
+- When it read your text the bot says **🎨 Formatting read from Markdown** (or **HTML**); 👁 **Preview** shows the result
+  before anything is published. If it read something you did not mean, put a backslash before the mark - or switch typed
+  formatting off with `MARKUP_INPUT=false` (Telegram's own formatting keeps working).
+- The length limits (4096 characters for text, 1024 for a caption) count the text that is left after the marks are taken out.
+
 ## `/swap`, `/replace` and `/handleswap`
 
 `/swap @old @new` shows what would change, nothing is edited until you press **Apply**. Try it small first:
 `/swap @old @new --last 50`, look at a changed post, `/undo` if it is wrong, then run it for everything.
 
 To replace a published post's media, reply to the new photo / video / file with `/replace <channel post link>`. The post
-must be in My posts and its channel registered with the bot. The replied media and caption replace the old media and
-caption in the channel; My posts is updated after Telegram accepts the edit.
-If Telegram refuses to edit posts made by another bot (the preview and the result say so), use `/repost`.
+must be in My posts and its channel registered with the bot. **Only the media and the caption change**: the replied media
+and caption replace the old ones in the channel, the caption keeps its formatting (Telegram's own, or HTML / Markdown typed
+as text - see **Formatting**), and the post's buttons are sent along as they are saved. My posts is updated after Telegram
+accepts the edit.
+
+If Telegram refuses the bot (`MessageIdInvalidError` - usually because another bot added the post's buttons, and only that
+bot may change such a post) and a userbot is set up, **the userbot makes the edit instead**, by itself:
+
+1. The bot downloads the new file (the userbot can't see your chat with the bot) and the userbot uploads it again with the
+   same file name, type and attributes (photo, video, GIF, audio or file); Telegram makes the thumbnail.
+2. The userbot needs the **Edit messages of others** right in that channel. If it has not got it, the bot gives it that one
+   right (the bot needs *Add new admins*), joins it the way **Userbot** describes, and takes the right away afterwards
+   (unless `USERBOT_KEEP_ADMIN=true`).
+3. A user account can't set inline buttons, and Telegram may drop the post's buttons with that edit. So the bot reads the
+   post back and puts the saved link buttons on again where Telegram lets it. The result says which happened: the buttons
+   **stayed**, were **put back**, or were **lost** - then they are still saved in My posts and 🔧 **Check buttons** tries
+   again later. The post's media and caption are changed either way.
+4. Without a userbot, or when it fails as well (no *Add new admins*, a channel that needs an approval ...), nothing is
+   changed and the message says why (`/repost` still rebuilds such posts as the bot's own). A refusal about the text itself
+   (a caption that is too long, a formatting entity Telegram does not accept) is not sent to the userbot: it would fail
+   the same way.
+
+The edits in My posts work the same way: **✏️ Text / caption**, **🖼 Media** and the link-preview switch try the bot first
+and hand over to the userbot when Telegram refuses. Changing a *button* can't be handed over - only a bot can set buttons.
+`/swap`, `/handleswap` and **Mass replace links** are unchanged: they still edit as the bot only.
 
 Options: `--channel @name` · `--last N` (newest N post ids) · `--posts` (also change `t.me/old/123` post links; skipped
 by default) · `--no-typed` (leave links typed in the text alone). Only the username changes:
@@ -282,8 +350,8 @@ carries the mark is copied from My posts when there is a saved copy and as Teleg
 ## 📣 `/broadcast`
 
 `/broadcast` (or `/boardcast`) sends one message to every connected channel; owners only. Then you send the message
-(text, or a photo / video / GIF / file with a caption; formatting is kept), optionally buttons, look at the preview and
-confirm. Every copy is saved in My posts.
+(text, or a photo / video / GIF / file with a caption; Telegram's formatting is kept, or type HTML / Markdown - see
+**Formatting**), optionally buttons, look at the preview and confirm. Every copy is saved in My posts.
 
 `/broadcast 1h` (also `50m`, `5d`, `1d12h`; from 1 minute to 365 days) deletes the message from all the channels and from
 My posts when the time is up. The schedule is kept in the database: a restart loses nothing, and whatever is overdue is
@@ -389,7 +457,7 @@ added: channels, published posts, drafts. Nothing happens until you press **✅ 
 
 Imported channels and posts are rows in the bot's own database: to post or edit in a channel the bot still has to be an admin there (on a different bot, add the channel again with `/addchannel`).
 
-## Userbot (optional): deleting posts older than 48 hours
+## Userbot (optional): deleting posts older than 48 hours and editing posts the bot may not edit
 
 1. On **your own computer**: `pip install telethon`, `python make_userbot_session.py`. Log in with a **separate**
    Telegram account (not your main one). It prints `USERBOT_SESSION=...`.
@@ -402,18 +470,28 @@ The userbot is used **automatically** wherever the bot deletes something and Tel
 first: the only questions are about the deletion itself ("Delete N old messages?"). If it still does not work, the message says
 why (no userbot set up, a missing right, a channel that needs an approval ...).
 
-What happens when the bot cannot delete something (nothing happens before that, and only for that channel):
+It is used the same way wherever the bot **edits** a published post and Telegram refuses it: `/replace` (media and caption),
+**✏️ Text / caption** and **🖼 Media** in `/posts`, and the link-preview switch (see `/replace` above for the details: the bot
+downloads a new file and the userbot uploads it again, and the saved buttons are put back where Telegram lets the bot).
+The bot always edits first; the userbot only steps in when Telegram answers the bot with an error that is not about the text
+itself. It can't change buttons (a user account can't set inline buttons).
+
+What happens when the bot cannot delete or edit something (nothing happens before that, and only for that channel):
 
 1. The bot makes a one-time invite link (1 hour, 1 use, titled "Cleanup helper"); if it may not, it uses the channel's
    own invite link; for a public channel the userbot joins by its @username.
 2. The userbot joins. A channel that makes new members wait for approval needs you to approve the request once.
-3. If the userbot may not delete there and the bot has the *Add new admins* right, the bot makes it an admin with
-   only **Delete messages**. Otherwise the message tells you which right to give, or add the userbot yourself.
-4. The userbot deletes (100 per request) and the bot checks by reading back.
-5. Afterwards the bot takes the admin right away again (unless `USERBOT_KEEP_ADMIN=true`) and revokes the temporary
-   link. The account stays a member of the channel; leave with it by hand if you like.
+3. If the userbot may not do it there and the bot has the *Add new admins* right, the bot makes it an admin with
+   only **Delete messages** (to delete) or **Edit messages of others** (to edit); rights it already had are kept.
+   Otherwise the message tells you which right to give, or add the userbot yourself.
+4. The userbot deletes (100 per request) and the bot checks by reading back - or the userbot edits the post and the bot
+   reads it back to bring My posts in step with it.
+5. Afterwards the bot takes the admin right away again (unless `USERBOT_KEEP_ADMIN=true`; a right the userbot had before is
+   put back as it was) and revokes the temporary link. The account stays a member of the channel; leave with it by hand if
+   you like.
 
-The result message lists these steps, so you can see exactly what was done.
+The result message lists these steps, so you can see exactly what was done. One job at a time: while the userbot works in a
+channel, another job that needs it waits.
 
 ## Error log
 
@@ -431,7 +509,7 @@ records of level ERROR, exceptions nobody caught in background tasks, and a cras
 
 ## Commands
 
-`/new` `/posts` `/autopost` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace` `/swap`
+`/new` `/posts` `/autopost` `/formatting` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace` `/swap`
 `/handleswap` `/undo` `/repost` `/shift` `/sync` `/userbot` `/export` `/import`
 
 Auto-suggest reads the newest published post of the channel that has a button with numbers in its text
@@ -450,6 +528,10 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
   verified - the bot recognises both shapes and reads the copies back (see "Telegram can hide the NEW copies too"), but the
   real thing may show another shape. Try `/repost --last 3` and `/shift` with a small range (for example
   `/shift @source @destination 1 3`) on a test channel first.
+  The userbot's edits are in the same position: the tests prove the requests (the right it is given and takes back, the
+  upload with the original file type, what is read back afterwards) against the simulation, not that Telegram lets a
+  channel admin account edit a post that another bot added buttons to, or whether the buttons then stay, go or can be
+  put back by the bot. The result message of `/replace` says what really happened - try it on one post of a test channel first.
 - `/shift -all` copies the name, description and profile photo only - not the invite links, the username, the admins or the
   channel's settings - and undo does not give the destination its old ones back. `-c` and the repost's link update read every
   message id of every connected channel up to its counter, so a big channel takes a while; a post of somebody else is only
@@ -462,7 +544,9 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
   created with their buttons in one request and read back, and why **Check buttons** exists. If it ever still happens,
   the result says `ButtonsNotShown` instead of staying silent.
 - Albums can't carry buttons, so a post is one text or one media message.
-- Captions: 1024 characters; text posts: 4096.
+- Captions: 1024 characters; text posts: 4096 (counted after typed HTML / Markdown is read). Telegram also limits how many
+  formatted pieces (bold, links ...) one message may have; if it refuses a post for that (`EntitiesTooLongError`) the message
+  says so and nothing is changed - use less formatting.
 - A published media post can't be turned back into plain text (Telegram limitation).
 - Saved drafts store Telegram's media reference. If it has expired the bot retries without it; if Telegram
   still refuses, send the media again with 🖼 Media.
@@ -474,3 +558,7 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
 
 `pip install -r requirements-dev.txt && pytest` (SQLite). For PostgreSQL:
 `TEST_DATABASE_URL=postgresql+asyncpg://user:pass@localhost/db pytest`.
+
+`tests/test_richtext.py` covers the HTML / Markdown reader (including random and hostile input), `tests/test_markup_flows.py`
+the flows that use it, `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
+bot-first, userbot-second edit of `/replace` and My posts.

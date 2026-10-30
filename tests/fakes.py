@@ -1,5 +1,6 @@
 """Tiny in-memory stand-ins for Telethon, good enough to exercise the engine offline."""
 import datetime
+import os
 from types import SimpleNamespace
 
 from telethon import errors, functions, types
@@ -143,7 +144,11 @@ class FakeChannelClient:
         self.about = ""  # the channel's description
         self.photo_id = None  # the channel's profile photo (its bytes are in _photo_data)
         self._photo_data = {}  # photo id -> bytes; shared by all channels next to each other
+        self._media_data = {}  # ("photo" | "doc", id) -> bytes of a message's photo or file; shared as well
         self._uploads = {}  # uploaded file id -> bytes; shared as well
+        self.user_edit_keeps_markup = False  # an edit by a user account leaves the keyboard alone (else it is dropped)
+        self.user_edit_frees_message = False  # after a user account edited it, the bot may edit the post again
+        self.user_edits = []  # the EditMessageRequests the userbot account made
         self._counter = [9000]  # ids for photos and uploads; shared
         self.pinned_order = []  # message ids in the order they were pinned
         self._n_invites = 0
@@ -157,6 +162,8 @@ class FakeChannelClient:
         other._media = self._media  # a photo or file is known to the account, whichever channel it is sent to
         self._photo_data.update(other._photo_data)
         other._photo_data, other._uploads, other._counter = self._photo_data, self._uploads, self._counter
+        self._media_data.update(other._media_data)
+        other._media_data = self._media_data
         return other
 
     def set_photo(self, data: bytes) -> int:
@@ -174,10 +181,33 @@ class FakeChannelClient:
             return types.PhotoEmpty(0)
         return types.Photo(self.photo_id, 1, b"ref", NOW, [types.PhotoSize("x", 100, 100, 999)], 2)
 
+    def media_bytes(self, media):
+        """What a photo / file of a message looks like (its bytes): set in `_media_data`, else made up from its id."""
+        if isinstance(media, types.MessageMediaPhoto) and media.photo:
+            key = ("photo", media.photo.id)
+        elif isinstance(media, types.MessageMediaDocument) and media.document:
+            key = ("doc", media.document.id)
+        else:
+            raise ValueError("this fake only has the bytes of a photo or a file")
+        return self._media_data.get(key, b"bytes of %s %d" % (key[0].encode(), key[1]))
+
     async def download_media(self, media, file=None):
         if isinstance(media, types.Photo) and media.id in self._photo_data:
             return self._photo_data[media.id]
-        raise ValueError("this fake can only download a channel's profile photo")
+        data = self.media_bytes(media)
+        if file is None or file is bytes:
+            return data
+        if isinstance(media, types.MessageMediaPhoto):
+            name = f"photo_{media.photo.id}.jpg"
+        else:  # a file keeps the name it was sent with
+            name = next(
+                (a.file_name for a in media.document.attributes if isinstance(a, types.DocumentAttributeFilename)),
+                f"file_{media.document.id}",
+            )
+        path = str(file) + name if str(file).endswith(os.sep) else str(file)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
 
     async def upload_file(self, data, file_name=None):
         self._counter[0] += 1
@@ -539,6 +569,7 @@ class FakeUserClient:
         self.known_channel = False
         self.requests = []
         self.deleted = []
+        self.uploads = []  # (path, file name, size) of everything uploaded
 
     async def connect(self):
         self.connected = True
@@ -566,6 +597,59 @@ class FakeUserClient:
     def _join(self):
         self.chan.members.add(self.me.id)
         self.known_channel = True
+
+    async def upload_file(self, path, file_name=None):
+        with open(path, "rb") as f:
+            data = f.read()
+        chan = self.chan
+        chan._counter[0] += 1
+        chan._uploads[chan._counter[0]] = data
+        self.uploads.append((path, file_name, len(data)))
+        return types.InputFile(id=chan._counter[0], parts=1, name=file_name or os.path.basename(path), md5_checksum="")
+
+    def _uploaded_media(self, inp):
+        """The photo / file Telegram makes out of an upload: new ids, the bytes that were sent."""
+        chan = self.chan
+        data = chan._uploads[inp.file.id]
+        chan._counter[0] += 1
+        n = chan._counter[0]
+        if isinstance(inp, types.InputMediaUploadedPhoto):
+            chan._media_data[("photo", n)] = data
+            photo = types.Photo(n, n * 7, b"up%d" % n, NOW, [types.PhotoSize("x", 100, 100, len(data))], 2)
+            return types.MessageMediaPhoto(photo=photo)
+        if isinstance(inp, types.InputMediaUploadedDocument):
+            chan._media_data[("doc", n)] = data
+            doc = types.Document(n, n * 7, b"up%d" % n, NOW, inp.mime_type, len(data), 2, list(inp.attributes))
+            return types.MessageMediaDocument(document=doc)
+        raise rpc("MediaInvalidError")
+
+    def _edit(self, req):
+        """messages.editMessage by a user account: it needs the "Edit messages of others" right and can't set a keyboard."""
+        chan, uid = self.chan, self.me.id
+        if uid not in chan.members:
+            raise rpc("ChannelPrivateError")
+        admin = chan.admins.get(uid)
+        if admin is None or not admin.edit_messages:
+            raise rpc("ChatAdminRequiredError")
+        m = chan.msgs.get(req.id)
+        if m is None:
+            raise rpc("MessageIdInvalidError")
+        media = self._uploaded_media(req.media) if req.media is not None else None
+        text = m.message if req.message is None else req.message
+        ents = list(m.entities or []) if req.message is None else list(req.entities or [])
+        if media is None and text == m.message and [_bytes(e) for e in ents] == [_bytes(e) for e in (m.entities or [])]:
+            raise rpc("MessageNotModifiedError")
+        m.message, m.entities = text, (ents or None)
+        if media is not None:
+            m.media = media
+            chan._remember_media(m)
+        if not chan.user_edit_keeps_markup:
+            chan._set_markup(m, None)  # no keyboard sent: Telegram drops it
+        if chan.user_edit_frees_message:
+            m.via_other_bot = False
+        chan.user_edits.append(req)
+        chan._pts += 1
+        return chan._updates([])
 
     async def __call__(self, req):
         bytes(req)
@@ -606,6 +690,8 @@ class FakeUserClient:
                     participant=types.ChannelParticipantAdmin(user_id=uid, promoted_by=1, date=NOW, admin_rights=chan.admins[uid])
                 )
             return SimpleNamespace(participant=types.ChannelParticipant(user_id=uid, date=NOW))
+        if name == "EditMessageRequest":
+            return self._edit(req)
         if name == "DeleteMessagesRequest":
             ids = list(req.id)
             self.deleted.append(ids)

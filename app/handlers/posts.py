@@ -22,8 +22,10 @@ from ..common import (
     Ctx,
     UserError,
     apply_edit,
+    apply_edit_reported,
     clear_state,
     cmd,
+    edit_report_text,
     guard,
     on_cb,
     on_text,
@@ -34,12 +36,14 @@ from ..common import (
 )
 from ..db import utcnow
 from ..repost_engine import delete_batch
-from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link, ser_entities
+from ..richtext import message_text
+from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link
 from ..ui import CANCEL, post_label
 from ..userbot import delete_problem_text
 from .panel import (
     check_lengths,
     load_post,
+    markup_note,
     show_button_screen,
     show_panel,
 )
@@ -52,8 +56,9 @@ UPDATED = "✅ Updated in the channel."
 def register(ctx: Ctx) -> None:
     client, db = ctx.client, ctx.db
 
-    def note_for(post) -> str:
-        return UPDATED if post.status == "sent" else "✅ Saved."
+    def note_for(post, report=None) -> str:
+        extra = edit_report_text(report)
+        return (UPDATED if post.status == "sent" else "✅ Saved.") + (f"\n{extra}" if extra else "")
 
     # ------------------------------------------------------------------ lists
     async def channel_chooser(event, arg: str = "", page: int = 0) -> None:
@@ -118,7 +123,7 @@ def register(ctx: Ctx) -> None:
         post, _ = await load_post(ctx, parts[0])
         set_state(ctx, event.sender_id, "edit_text", pid=post.id)
         what = "caption" if post.media_kind else "text"
-        await say(event, f"✏️ Send the new {what}. Formatting is kept.", CANCEL)
+        await say(event, f"✏️ Send the new {what}. Formatting is kept - or type HTML / Markdown (/formatting shows how).", CANCEL)
 
     @on_text(ctx, "edit_text")
     async def h_edit_text(event, st):
@@ -126,13 +131,13 @@ def register(ctx: Ctx) -> None:
         if classify_media(m):
             raise UserError("Send text only here. To change the media, use 🖼 Media.")
         post, ch = await load_post(ctx, st["pid"])
-        text = m.raw_text or ""
+        text, entities, how = message_text(m, ctx.cfg.markup_input)
         if not post.media_kind and not text.strip():
             raise UserError("A text post can't be empty.")
         check_lengths(text, bool(post.media_kind))
-        post = await apply_edit(ctx, post, ch, text=text, entities=ser_entities(m.entities))
+        post, report = await apply_edit_reported(ctx, post, ch, text=text, entities=entities)
         clear_state(ctx, event.sender_id)
-        await show_panel(ctx, event, post.id, note=note_for(post), new=True)
+        await show_panel(ctx, event, post.id, note=markup_note(how, "\n") + note_for(post, report), new=True)
 
     # ------------------------------------------------------------------- media
     @on_cb(ctx, "em")
@@ -154,9 +159,15 @@ def register(ctx: Ctx) -> None:
             raise UserError("Send a photo, video, GIF, audio file or document.")
         post, ch = await load_post(ctx, st["pid"])
         check_lengths(post.text or "", True)
-        post = await apply_edit(ctx, post, ch, replace_media=True, media_kind=kind, media_file_id=pack_file_id(m))
+
+        async def notify() -> None:
+            await say(event, "⏳ Telegram refused the bot, so the userbot is making the edit - a big file takes a while.")
+
+        post, report = await apply_edit_reported(
+            ctx, post, ch, replace_media=True, notify=notify, media_kind=kind, media_file_id=pack_file_id(m)
+        )
         clear_state(ctx, event.sender_id)
-        await show_panel(ctx, event, post.id, note=note_for(post), new=True)
+        await show_panel(ctx, event, post.id, note=note_for(post, report), new=True)
 
     @on_cb(ctx, "rm")
     async def cb_remove_media(event, parts):

@@ -10,12 +10,27 @@ from urllib.parse import urlparse
 
 from telethon import Button, errors
 
-from ..common import Ctx, UserError, apply_edit, cmd, edit_callback_message, guard, on_cb, purge_pending, require_owner, say, show
+from ..common import (
+    Ctx,
+    UserError,
+    apply_edit_reported,
+    cmd,
+    edit_callback_message,
+    edit_report_text,
+    guard,
+    on_cb,
+    purge_pending,
+    require_owner,
+    say,
+    show,
+)
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
+from ..richtext import message_text
 from ..sync_engine import SyncOptions, sync_ids
-from ..tgutil import classify_media, esc, explain_rpc, get_rights, pack_file_id, ser_entities
+from ..tgutil import classify_media, esc, explain_rpc, get_rights, pack_file_id
 from ..channelref import parse_channel_ref
+from .panel import check_lengths, markup_note
 
 log = logging.getLogger(__name__)
 
@@ -250,12 +265,23 @@ def register(ctx: Ctx) -> None:
                     raise UserError("That post no longer exists in the channel, or I can't add it to My posts.")
             if post.status != "sent":
                 raise UserError("That post is not published yet.")
-            caption = reply.raw_text or ""
-            await apply_edit(
-                ctx, post, channel, replace_media=True, media_kind=kind, media_file_id=pack_file_id(reply),
-                text=caption, entities=ser_entities(reply.entities),
+            caption, entities, how = message_text(reply, cfg.markup_input)  # Telegram's formatting, or HTML / Markdown
+            check_lengths(caption, True)
+
+            async def notify() -> None:
+                await say(event, "⏳ Telegram refused the bot, so the userbot is making the edit - a big file takes a while.")
+
+            _, report = await apply_edit_reported(
+                ctx, post, channel, replace_media=True, notify=notify, media_kind=kind, media_file_id=pack_file_id(reply),
+                text=caption, entities=entities,
             )
-            await say(event, f"✅ Replaced the media in <b>{esc(channel.title)}</b> and updated My posts.")
+            extra = edit_report_text(report)
+            await say(
+                event,
+                markup_note(how)
+                + f"✅ Replaced the media in <b>{esc(channel.title)}</b> and updated My posts."
+                + (f"\n{extra}" if extra else ""),
+            )
             return
         raise UserError("Use /replace with a channel post link, replying to the new media. Username swaps use /swap.")
 

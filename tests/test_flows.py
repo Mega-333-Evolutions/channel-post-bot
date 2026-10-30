@@ -54,15 +54,16 @@ def test_customize_new_post_with_buttons_and_edit_live(tmp_path):
         app = await make_app(tmp_path)
         await app.text("/new")  # nothing to suggest yet -> asks for the post
         assert "Send the post now" in app.out.last_text
-        await app.text("Hello *world*")  # stored literally (no markdown parsing)
+        await app.text("Hello *world*")  # typed as Markdown: read as formatting (MARKUP_INPUT=false would keep it literal)
         assert "buttons" in app.out.last_text.lower()
         await app.text("Get it - https://t.me/bot?start=1 | Join - t.me/animech\nMirror - https://example.com/x")
         pid = int(app.out.callback_data("Publish").split(":")[1])
         post = await app.db.get_post(pid)
-        assert post.text == "Hello *world*" and [len(r) for r in post.buttons] == [2, 1]
+        assert post.text == "Hello world" and post.entities == [{"k": "italic", "o": 6, "l": 5}]
+        assert [len(r) for r in post.buttons] == [2, 1]
         await app.press(f"pb:{pid}")
         await app.press(f"pby:{pid}")
-        assert app.tg.sent[-1][2] == "Hello *world*"
+        assert app.tg.sent[-1][2] == "Hello world"
 
         # edit the live post: change a button's text, then its link
         await app.press(f"bs:{pid}:0:0")
@@ -72,7 +73,7 @@ def test_customize_new_post_with_buttons_and_edit_live(tmp_path):
         await app.press(f"bu:{pid}:0:0")
         await app.text("https://t.me/goku?start=1")
         last_edit = app.tg.edits[-1][2]
-        assert last_edit.message == "Hello *world*"
+        assert last_edit.message == "Hello world"
         b = last_edit.reply_markup.rows[0].buttons[0]
         assert b.text == "Download now" and button_url(b) == "https://t.me/goku?start=1"
 

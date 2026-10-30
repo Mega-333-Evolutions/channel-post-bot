@@ -5,7 +5,8 @@ from telethon import types
 
 from ..buttons import valid
 from ..common import Ctx, UserError, is_cb, say, show
-from ..tgutil import classify_media, pack_file_id, ser_entities, utf16_len
+from ..richtext import message_text
+from ..tgutil import classify_media, pack_file_id, utf16_len
 from ..ui import button_keyboard, button_text, panel_keyboard, panel_text
 
 CAPTION_MAX = 1024
@@ -51,18 +52,28 @@ def check_lengths(text: str, has_media: bool) -> None:
         raise UserError(f"A text post can have at most {TEXT_MAX} characters (yours has {n}).")
 
 
-def extract_content(m) -> dict:
-    """A message from the user -> post fields (text, entities, media)."""
+class Content(dict):
+    """Post fields (text, entities, media_kind, media_file_id); `how` says whether the text was read as "html" or "markdown"."""
+
+    how = None
+
+
+def markup_note(how, sep: str = "\n\n") -> str:
+    """A line for the owner when their text was read as HTML or Markdown, followed by `sep` (empty otherwise)."""
+    return f"🎨 Formatting read from {'HTML' if how == 'html' else 'Markdown'} - see /formatting.{sep}" if how else ""
+
+
+def extract_content(m, markup: bool = True) -> Content:
+    """A message from the user -> post fields (text, entities, media).
+
+    Telegram's own formatting is kept as it is; without any, `markup` lets HTML or Markdown in the text become formatting."""
     kind = classify_media(m)
     if m.media and kind is None and not isinstance(m.media, types.MessageMediaWebPage):
         raise UserError("That kind of message can't be used in a post. Send text, a photo, video, GIF, audio or a file.")
-    text = m.raw_text or ""
+    text, entities, how = message_text(m, markup)
     if not kind and not text.strip():
         raise UserError("Send some text, or a photo / video / GIF / file.")
     check_lengths(text, bool(kind))
-    return {
-        "text": text,
-        "entities": ser_entities(m.entities),
-        "media_kind": kind,
-        "media_file_id": pack_file_id(m) if kind else None,
-    }
+    content = Content(text=text, entities=entities, media_kind=kind, media_file_id=pack_file_id(m) if kind else None)
+    content.how = how
+    return content

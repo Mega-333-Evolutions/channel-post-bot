@@ -6,6 +6,8 @@ import base64
 import copy
 import html
 import logging
+import os
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 
@@ -294,6 +296,32 @@ def media_info(m) -> tuple:
     return kind, (media_ref(m) if kind else None)
 
 
+@dataclass
+class MediaFile:
+    """A photo or file downloaded from Telegram, with what is needed to upload it again as the same kind of post."""
+
+    path: str
+    kind: str  # photo | video | animation | audio | document
+    name: str
+    mime_type: Optional[str] = None
+    attributes: list = field(default_factory=list)  # the file's name, video size and length, GIF mark ... as it had them
+
+
+async def fetch_media(client, ref: str, kind: str, folder: str) -> MediaFile:
+    """Download the photo / file behind the stored media reference `ref` (as `client` sees it) into `folder`."""
+    path = await with_media(ref, lambda media: client.download_media(media, file=folder + os.sep))
+    if not path:
+        raise ValueError("Telegram gave me nothing to download for that media")
+    doc = getattr(media_from_ref(ref), "document", None)
+    return MediaFile(
+        path=str(path),
+        kind=kind,
+        name=os.path.basename(str(path)),
+        mime_type=getattr(doc, "mime_type", None),
+        attributes=list(getattr(doc, "attributes", None) or []),
+    )
+
+
 def utf16_len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
@@ -325,15 +353,19 @@ async def flood_retry(factory: Callable[[], Awaitable[Any]], tries: int = 4) -> 
     return await factory()
 
 
-async def edit_raw(client, peer, message_id: int, *, text: Optional[str] = None, entities=None, markup=None, preview=None):
+async def edit_raw(
+    client, peer, message_id: int, *, text: Optional[str] = None, entities=None, markup=None, preview=None, media=None
+):
     """messages.editMessage with every field explicit.
 
     `markup=None` together with `text` removes the keyboard (that is how Telegram behaves);
-    a markup-only edit (text=None) leaves the text alone.
+    a markup-only edit (text=None) leaves the text alone. `media` (an InputMedia) replaces the photo / file.
     """
     kw: dict = {"peer": peer, "id": message_id}
     if markup is not None:
         kw["reply_markup"] = markup
+    if media is not None:
+        kw["media"] = media
     if text is not None:
         kw["message"] = text
         kw["entities"] = list(entities or [])
@@ -390,6 +422,9 @@ _HINTS = {
     "FileReferenceExpiredError": "The saved media expired - send the media again.",
     "MediaEmptyError": "Telegram could not use that media - send it again.",
     "EntityBoundsInvalidError": "The text formatting doesn't fit the text.",
+    "EntitiesTooLongError": "The text has too many formatted pieces (bold, links ...) for Telegram - use less formatting.",
+    "MessageTooLongError": "The text is too long for Telegram.",
+    "MediaCaptionTooLongError": "The caption is too long for Telegram.",
 }
 
 

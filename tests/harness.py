@@ -12,7 +12,7 @@ from app.db import Database
 from bot import register_all
 
 from .dbutil import db_url_for
-from .fakes import FakeChannelClient
+from .fakes import FakeChannelClient, rpc
 
 
 class FakeSent:
@@ -137,6 +137,13 @@ class FakeTG(FakeChannelClient):
 
     async def edit_message(self, peer, message, **kw):
         self.edits.append(("edit_message", message, kw))
+        err = self.fail.get("edit_message")  # Telegram refuses the bot's high-level edit (text / caption / new media)
+        if err is not None:
+            raise err
+        chan = self.registry.get(getattr(peer, "channel_id", None), self)
+        m = chan.msgs.get(message)
+        if m is not None and getattr(m, "via_other_bot", False):  # its keyboard belongs to another bot: only that bot may edit
+            raise rpc("MessageIdInvalidError")
 
     async def delete_messages(self, peer, ids, **kw):
         self.deleted.append(list(ids))
