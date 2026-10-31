@@ -160,8 +160,8 @@ def register(ctx: Ctx) -> None:
         post, ch = await load_post(ctx, st["pid"])
         check_lengths(post.text or "", True)
 
-        async def notify() -> None:
-            await say(event, "⏳ Telegram refused the bot, so the userbot is making the edit - a big file takes a while.")
+        async def notify(text: str) -> None:
+            await say(event, text)
 
         post, report = await apply_edit_reported(
             ctx, post, ch, replace_media=True, notify=notify, media_kind=kind, media_file_id=pack_file_id(m)

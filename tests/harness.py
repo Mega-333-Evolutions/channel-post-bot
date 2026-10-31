@@ -131,6 +131,8 @@ class FakeTG(FakeChannelClient):
         return m
 
     async def send_file(self, peer, file, **kw):
+        if self._is_dm(peer):  # to the userbot account: the chat simulation
+            return await super().send_file(peer, file, **kw)
         m = SimpleNamespace(id=next(self.ids))
         self.sent.append(("file", peer, file, kw))
         return m
@@ -146,6 +148,8 @@ class FakeTG(FakeChannelClient):
             raise rpc("MessageIdInvalidError")
 
     async def delete_messages(self, peer, ids, **kw):
+        if self._is_dm(peer):
+            return await super().delete_messages(peer, ids, **kw)
         self.deleted.append(list(ids))
         return [SimpleNamespace(pts_count=len(ids))]
 

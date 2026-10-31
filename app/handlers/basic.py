@@ -126,13 +126,19 @@ def register(ctx: Ctx) -> None:
                 "if it has the “Add new admins” right, and gives the rights back afterwards.\n\n"
                 "To set it up: on your own computer run <code>python make_userbot_session.py</code> with a "
                 "<b>separate</b> Telegram account, and put the printed text into the bot's secrets as "
-                "<code>USERBOT_SESSION</code>. See the README.",
+                "<code>USERBOT_SESSION</code>. Then send /start to this bot from that account (new media reaches the "
+                "userbot through its chat with the bot - that is what makes a replace quick). See the README.",
             )
             return
         if not ub.ready:
             await ub.connect()
-        kept = "stays an admin" if ub.keep_admin else "is made admin only while deleting"
-        await say(event, f"🤖 <b>Userbot:</b> {esc(ub.describe())}\nIt {kept} (USERBOT_KEEP_ADMIN).")
+        kept = "stays an admin" if ub.keep_admin else "is made admin only while it deletes or edits"
+        await say(
+            event,
+            f"🤖 <b>Userbot:</b> {esc(ub.describe())}\nIt {kept} (USERBOT_KEEP_ADMIN).\n"
+            "It must have started this bot (/start from that account): new media for an edit goes through its chat "
+            "with the bot, which is what makes a big file as quick as a small one.",
+        )
 
     @client.on(
         events.NewMessage(incoming=True, func=lambda e: e.is_private and not (e.raw_text or "").startswith("/"))

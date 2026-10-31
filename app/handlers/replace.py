@@ -268,8 +268,8 @@ def register(ctx: Ctx) -> None:
             caption, entities, how = message_text(reply, cfg.markup_input)  # Telegram's formatting, or HTML / Markdown
             check_lengths(caption, True)
 
-            async def notify() -> None:
-                await say(event, "⏳ Telegram refused the bot, so the userbot is making the edit - a big file takes a while.")
+            async def notify(text: str) -> None:
+                await say(event, text)
 
             _, report = await apply_edit_reported(
                 ctx, post, channel, replace_media=True, notify=notify, media_kind=kind, media_file_id=pack_file_id(reply),

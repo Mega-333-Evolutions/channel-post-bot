@@ -6,6 +6,10 @@ Editing: Telegram refuses the bot an edit of a post that belongs to another bot 
 or it was posted through it). The bot always tries first; when Telegram refuses, the userbot makes the edit (text,
 caption or a new photo / file). A user account can't set inline buttons, so Telegram may drop them with that edit -
 the bot puts them back where it can.
+A new photo / file goes to the userbot through the userbot's own chat with the bot: the bot sends it there (Telegram
+just points to the file it already has - nothing is uploaded), the userbot finds it in that chat and edits the post
+with that copy, again by reference. So a big file is as quick as a small one and keeps its thumbnail. Only when that
+chat does not work (the userbot account never started the bot) is the file downloaded and uploaded again.
 
 How it gets into the channel:
   1. the bot makes a one-time invite link (or reads the channel's own link) and the userbot joins with it
@@ -27,7 +31,7 @@ from typing import Optional
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.sessions import StringSession
 
-from .tgutil import MediaFile, edit_raw, flood_retry, get_rights, peer_of
+from .tgutil import MediaFile, edit_raw, flood_retry, get_rights, media_from_ref, media_key, peer_of, with_media
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +43,32 @@ _INVITE_RX = re.compile(
 
 class UserbotError(Exception):
     """Something the owner can fix; the text is meant to be shown."""
+
+
+class UserbotRefused(UserbotError):
+    """Telegram refused what the userbot tried; `name` is the Telegram error (e.g. MediaInvalidError)."""
+
+    def __init__(self, text: str, name: str = ""):
+        super().__init__(text)
+        self.name = name
+
+    @property
+    def about_media(self) -> bool:
+        """The refusal is about the photo / file the userbot used (so trying it another way may help)."""
+        return self.name in _MEDIA_REFUSED
+
+
+# What Telegram answers when the photo / file the userbot points to can't be used for an edit
+_MEDIA_REFUSED = {
+    "MediaInvalidError", "MediaEmptyError", "DocumentInvalidError", "PhotoInvalidError",
+    "FileReferenceExpiredError", "FileReferenceInvalidError", "FileReferenceEmptyError",
+}
+# What Telegram answers when the bot may not write to the userbot account (it never started the bot, or blocked it)
+_NOT_STARTED = {
+    "UserIsBlockedError", "PeerIdInvalidError", "InputUserDeactivatedError", "UserDeactivatedError", "UserIdInvalidError",
+}
+_DM_POLLS = 10  # how often, and how long apart, the userbot looks in its chat with the bot for the file it was sent
+_DM_WAIT = 0.5
 
 
 def parse_invite_hash(link: str) -> Optional[str]:
@@ -479,32 +509,127 @@ class UserbotEditor(_ChannelJob):
     WHAT = "edit other people's posts"
     VERB = "edit"
 
-    async def edit(self, message_id: int, *, text: str, entities: list, media: Optional[MediaFile] = None, preview=None) -> None:
-        """Make the post show `text` (with `entities`) and, when given, the photo / file `media` (uploaded again)."""
+    def __init__(self, ub: Userbot, ch):
+        super().__init__(ub, ch)
+        self._handed: list = []  # (the userbot account as the bot addresses it, the bot's id of the message): files put in its chat
+        self.dm_problem: Optional[str] = None  # why a file could not go through that chat (None: it did, or it was not tried)
+
+    async def close(self) -> None:
+        """Clean up the channel (rights, link) and the files the bot put into the userbot's chat with the bot."""
+        handed, self._handed = self._handed, []
+        for peer, message_id in handed:
+            try:
+                await self.ub.bot.delete_messages(peer, [message_id])
+            except Exception as e:  # noqa: BLE001 - at worst a message is left in the helper account's chat
+                log.info("could not delete the helper message in the userbot's chat: %s", type(e).__name__)
+        await super().close()
+
+    async def edit(self, message_id: int, *, text: str, entities: list, media=None, preview=None) -> None:
+        """Make the post show `text` (with `entities`) and, when given, `media`: what media_by_reference() returned (the
+        file does not move at all) or a MediaFile (uploaded again)."""
         await self._begin()
         client = self.ub.client
         try:
-            input_media = await self._input_media(media) if media is not None else None
+            if isinstance(media, MediaFile):
+                media = await self._upload(media)
             await flood_retry(
-                lambda: edit_raw(
-                    client, self.peer, message_id, text=text, entities=entities, preview=preview, media=input_media
-                )
+                lambda: edit_raw(client, self.peer, message_id, text=text, entities=entities, preview=preview, media=media)
             )
         except errors.MessageNotModifiedError:
             return  # it already looks like that
         except errors.RPCError as e:
             name = type(e).__name__
-            raise UserbotError(f"Telegram refused the userbot as well ({name}). {_EDIT_HINTS.get(name) or str(e)[:200]}")
+            raise UserbotRefused(
+                f"Telegram refused the userbot as well ({name}). {_EDIT_HINTS.get(name) or str(e)[:200]}", name
+            )
 
-    async def _input_media(self, f: MediaFile):
+    # ----------------------------------------------------------- a file by way of the userbot's chat with the bot
+    async def media_by_reference(self, ref: str):
+        """The new photo / file as the userbot's own account holds it, ready to edit the post with - or None.
+
+        The bot sends it to the userbot's chat with the bot (Telegram reuses the file it already has, nothing is
+        downloaded or uploaded) and the userbot picks the message up there. The access data of a file belongs to one
+        account, so the bot's own reference would be useless to the userbot: this is how the userbot gets its own.
+        None when it does not work; `dm_problem` says why, and the caller uploads the file instead."""
+        await self._begin()
+        self.dm_problem = None
+        try:
+            return await self._hand_over(ref)
+        except (errors.RPCError, ValueError, TypeError, OSError) as e:
+            self.dm_problem = f"it failed with {type(e).__name__}"
+            log.info("could not hand the file to the userbot: %s", type(e).__name__, exc_info=True)
+            return None
+
+    async def _hand_over(self, ref: str):
+        bot, client = self.ub.bot, self.ub.client
+        want = media_key(media_from_ref(ref))
+        if want is None:
+            raise ValueError("not a photo or a file")
+        try:  # both ends of the chat first: nothing is sent when one of them can't be found
+            user = await self._bot_view_of_userbot()
+        except UserbotError:
+            self.dm_problem = "the bot cannot find the userbot account"
+            return None
+        try:
+            bot_peer = await self._userbot_view_of_bot()
+        except UserbotError as e:
+            self.dm_problem = str(e)
+            return None
+        peer = types.InputPeerUser(user.user_id, user.access_hash)
+        try:
+            sent = await with_media(ref, lambda media: flood_retry(lambda: bot.send_file(peer, media, silent=True)))
+        except errors.RPCError as e:
+            name = type(e).__name__
+            self.dm_problem = (
+                "the userbot account has not started the bot yet (send /start to the bot from that account)"
+                if name in _NOT_STARTED
+                else f"Telegram would not let the bot send the file to the userbot ({name})"
+            )
+            return None
+        self._handed.append((peer, sent.id))  # deleted again in close()
+        for i in range(_DM_POLLS):  # the message has to reach the userbot's side first
+            if i:
+                await asyncio.sleep(_DM_WAIT)
+            try:
+                msgs = await flood_retry(lambda: client.get_messages(bot_peer, limit=10))
+            except errors.RPCError as e:
+                self.dm_problem = f"the userbot could not read its chat with the bot ({type(e).__name__})"
+                return None
+            for m in msgs:  # newest first; the same photo / file has the same id on both accounts
+                if media_key(getattr(m, "media", None)) == want:
+                    return utils.get_input_media(m.media)
+        self.dm_problem = "the file did not show up in the userbot's chat with the bot"
+        return None
+
+    async def _userbot_view_of_bot(self):
+        """The bot as the userbot account addresses it (found by the bot's username)."""
+        me = await self.ub.bot.get_me()
+        name = getattr(me, "username", None)
+        if not name:
+            raise UserbotError("the bot has no username, so the userbot cannot find its chat with it")
+        try:
+            return await self.ub.client.get_input_entity(name)
+        except (errors.RPCError, ValueError):
+            raise UserbotError("the userbot could not find the bot by its username")
+
+    # --------------------------------------------------------------------------------- the slow way
+    async def _upload(self, f: MediaFile):
+        """Upload a downloaded photo / file (with its thumbnail) as the new media of the post."""
         client = self.ub.client
         handle = await flood_retry(lambda: client.upload_file(f.path, file_name=f.name))
         if f.kind == "photo":
             return types.InputMediaUploadedPhoto(file=handle)
+        thumb = None
+        if f.thumb_path:
+            try:
+                thumb = await flood_retry(lambda: client.upload_file(f.thumb_path))
+            except (errors.RPCError, OSError) as e:  # the file goes without it rather than not at all
+                log.info("could not upload the thumbnail: %s", type(e).__name__)
         return types.InputMediaUploadedDocument(
             file=handle,
             mime_type=f.mime_type or "application/octet-stream",
             attributes=list(f.attributes),
+            thumb=thumb,
             force_file=True if f.kind == "document" else None,  # a file sent "as a file" stays one
         )
 

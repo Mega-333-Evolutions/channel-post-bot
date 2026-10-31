@@ -18,7 +18,7 @@ from .config import Config
 from .db import Database
 from .replace_engine import fetch_messages, is_skippable
 from .tgutil import build_markup, de_entities, edit_raw, esc, explain_rpc, fetch_media, media_info, peer_of, with_media
-from .userbot import UserbotError, edit_problem_text
+from .userbot import UserbotError, UserbotRefused, edit_problem_text
 
 log = logging.getLogger(__name__)
 
@@ -248,30 +248,53 @@ async def live_media(client, ch, message_id: int) -> Optional[tuple]:
 async def edit_by_userbot(ctx: Ctx, ch, p, *, replace_media: bool, bot_error: str, notify=None) -> Optional[EditReport]:
     """The userbot makes the live post look like `p`. None when there is no userbot to ask; UserbotError when it fails.
 
-    The new photo / file is downloaded by the bot (the userbot can't see the owner's chat with the bot) and uploaded again."""
+    A new photo / file goes through the userbot's own chat with the bot: the bot sends it there and the userbot edits the
+    post with that copy, so nothing is downloaded or uploaded - a big file is as quick as a small one and keeps its
+    thumbnail. Only when that does not work does the bot download the file (with its thumbnail) and the userbot upload
+    it again, which is slow for a big file. `notify(text)` tells the owner what is going on."""
     ub = ctx.userbot
     editor = await ub.editor_for(ch) if ub is not None else None
     if editor is None:
         return None
     report = EditReport(by_userbot=True, bot_error=bot_error)
     folder = None
-    try:
+
+    async def tell(text: str) -> None:
         if notify is not None:
-            await notify()
-        media = None
-        if replace_media and p.media_file_id:
-            folder = tempfile.mkdtemp(prefix="cpb-media-")
-            try:
-                media = await fetch_media(ctx.client, p.media_file_id, p.media_kind, folder)
-            except (errors.RPCError, OSError, ValueError) as e:
-                raise UserbotError(f"I could not download the new media for the userbot ({type(e).__name__}).")
-        await editor.edit(
-            p.message_id,
-            text=p.text or "",
-            entities=de_entities(p.entities),
-            media=media,
-            preview=None if p.media_kind else bool(p.link_preview),
-        )
+            await notify(text)
+
+    fields = dict(
+        text=p.text or "", entities=de_entities(p.entities), preview=None if p.media_kind else bool(p.link_preview)
+    )
+    try:
+        await tell("⏳ Telegram refused the bot, so the userbot is making the edit.")
+        if not (replace_media and p.media_file_id):
+            await editor.edit(p.message_id, **fields)
+        else:
+            done = False
+            media = await editor.media_by_reference(p.media_file_id)
+            if media is not None:
+                try:
+                    await editor.edit(p.message_id, media=media, **fields)
+                    done = True
+                    editor.notes.append("the new file went through the userbot's chat with the bot, so nothing was uploaded")
+                except UserbotRefused as e:
+                    if not e.about_media:
+                        raise
+                    editor.dm_problem = f"Telegram would not take the userbot's copy of the file ({e.name})"
+            if not done:
+                why = editor.dm_problem or "that did not work"
+                editor.notes.append(f"the file was downloaded and uploaded again, because {why}")
+                await tell(
+                    "⏳ The file can't go through the userbot's chat with the bot, so it is downloaded and uploaded "
+                    f"again - a big file takes a while. (Reason: {esc(why)}.)"
+                )
+                folder = tempfile.mkdtemp(prefix="cpb-media-")
+                try:
+                    media = await fetch_media(ctx.client, p.media_file_id, p.media_kind, folder)
+                except (errors.RPCError, OSError, ValueError) as e:
+                    raise UserbotError(f"I could not download the new media for the userbot ({type(e).__name__}).")
+                await editor.edit(p.message_id, media=media, **fields)
     finally:
         await editor.close()
         report.notes = list(editor.notes)

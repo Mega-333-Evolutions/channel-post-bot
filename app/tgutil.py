@@ -296,6 +296,15 @@ def media_info(m) -> tuple:
     return kind, (media_ref(m) if kind else None)
 
 
+def media_key(media) -> Optional[tuple]:
+    """("photo" | "doc", id) of the photo / file in a message's media; the id is the same on every account."""
+    if isinstance(media, types.MessageMediaPhoto) and getattr(media, "photo", None):
+        return "photo", media.photo.id
+    if isinstance(media, types.MessageMediaDocument) and getattr(media, "document", None):
+        return "doc", media.document.id
+    return None
+
+
 @dataclass
 class MediaFile:
     """A photo or file downloaded from Telegram, with what is needed to upload it again as the same kind of post."""
@@ -305,10 +314,13 @@ class MediaFile:
     name: str
     mime_type: Optional[str] = None
     attributes: list = field(default_factory=list)  # the file's name, video size and length, GIF mark ... as it had them
+    thumb_path: Optional[str] = None  # the picture Telegram shows for the file (JPEG); None: it has none
 
 
 async def fetch_media(client, ref: str, kind: str, folder: str) -> MediaFile:
-    """Download the photo / file behind the stored media reference `ref` (as `client` sees it) into `folder`."""
+    """Download the photo / file behind the stored media reference `ref` (as `client` sees it) into `folder`.
+
+    A file's thumbnail comes along: without it the file would be uploaded again with a plain file icon."""
     path = await with_media(ref, lambda media: client.download_media(media, file=folder + os.sep))
     if not path:
         raise ValueError("Telegram gave me nothing to download for that media")
@@ -319,7 +331,22 @@ async def fetch_media(client, ref: str, kind: str, folder: str) -> MediaFile:
         name=os.path.basename(str(path)),
         mime_type=getattr(doc, "mime_type", None),
         attributes=list(getattr(doc, "attributes", None) or []),
+        thumb_path=await fetch_thumb(client, ref, folder) if doc is not None else None,
     )
+
+
+async def fetch_thumb(client, ref: str, folder: str) -> Optional[str]:
+    """The thumbnail of the file behind `ref` (the largest one Telegram has) as a JPEG in `folder`, or None.
+
+    Best effort: a file that goes out without its thumbnail is better than an edit that fails."""
+    where = os.path.join(folder, "thumb")
+    try:
+        os.makedirs(where, exist_ok=True)
+        path = await with_media(ref, lambda media: client.download_media(media, file=where + os.sep, thumb=-1))
+    except (errors.RPCError, OSError, ValueError, TypeError) as e:
+        log.info("could not download the thumbnail: %s", type(e).__name__)
+        return None
+    return str(path) if path and os.path.isfile(str(path)) else None
 
 
 def utf16_len(s: str) -> int:

@@ -20,7 +20,7 @@ reported to a Telegram chat.
 | Auto-suggest | `/new` offers the next batch: after "Download Episodes 01 to 20" it proposes "Download Episodes 21 to 40", then 41 to 60 ... Tap **Use suggestion** and only the button link is asked |
 | `/autopost` | `/autopost 114 20` posts "Episodes 01 to 20", "21 to 40" ... up to 114, each with a download button, then asks for the real link of every button |
 | `/swap` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
-| `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption (nothing else); the caption keeps its formatting, Telegram's own or typed HTML / Markdown. Where Telegram refuses the bot - a post whose buttons another bot added - the userbot makes the edit; My posts is updated |
+| `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption (nothing else); the caption keeps its formatting, Telegram's own or typed HTML / Markdown. Where Telegram refuses the bot - a post whose buttons another bot added - the userbot makes the edit (quickly, even for a big file, and the thumbnail stays - see below); My posts is updated |
 | `/handleswap` | swaps a `@username` that is *written* in posts (text, captions, button names) - links are left alone. Preview first, full undo |
 | `/repost` | copies **every post of a channel, in order**, to the end of the channel (links swapped on the way, replies, pins and links between posts kept), registers the copies in My posts, verifies every button, **points links to the old posts - in this and in all your other connected channels - at the copies**, then deletes the old posts after your confirmation |
 | `/shift` | copies posts from **one channel into another** (all, or a range of message ids); the source is only read. `-c` points links to the source's posts in all your connected channels at the copies, `-all` also gives the destination the source's name, description and photo. Posts Telegram holds back after a copyright strike are copied from My posts, whatever Telegram hands out of them now; `--no-media` leaves the files out |
@@ -162,8 +162,14 @@ accepts the edit.
 If Telegram refuses the bot (`MessageIdInvalidError` - usually because another bot added the post's buttons, and only that
 bot may change such a post) and a userbot is set up, **the userbot makes the edit instead**, by itself:
 
-1. The bot downloads the new file (the userbot can't see your chat with the bot) and the userbot uploads it again with the
-   same file name, type and attributes (photo, video, GIF, audio or file); Telegram makes the thumbnail.
+1. **The new file goes through the userbot's own chat with the bot - nothing is downloaded or uploaded.** The bot sends the
+   file to the userbot account (Telegram just points to the file it already has; the message is silent and the bot deletes
+   it again afterwards), the userbot finds it in that chat and edits the post with *that* copy, by reference - the same as
+   `edit_message(chat, id, text, file=message)` in a userbot script. So a 2 GB file is as quick as a 7 KB one, and it is
+   the very same file, so its **thumbnail, name and video details stay**. This needs the userbot account to have started
+   the bot once (open the bot with that account and send `/start`).
+   If that does not work (the account never started the bot, or Telegram refuses the userbot's copy), the bot tells you
+   why, downloads the file with its thumbnail and the userbot uploads both again - the old, slow way for a big file.
 2. The userbot needs the **Edit messages of others** right in that channel. If it has not got it, the bot gives it that one
    right (the bot needs *Add new admins*), joins it the way **Userbot** describes, and takes the right away afterwards
    (unless `USERBOT_KEEP_ADMIN=true`).
@@ -464,6 +470,9 @@ Imported channels and posts are rows in the bot's own database: to post or edit 
 2. Put that text into the Space / host secrets as `USERBOT_SESSION`. Whoever has it can act as that account; you can end
    it any time in Telegram → Settings → Devices.
 3. In the bot, `/userbot` shows whether it is connected.
+4. With that same account, open the bot in Telegram and send it `/start` (once). For an edit with new media the bot hands the
+   file over in that chat (see `/replace`) - without this step the edit still works, but the file is downloaded and
+   uploaded again, which is slow for a big file and the message says so.
 
 The userbot is used **automatically** wherever the bot deletes something and Telegram refuses it - **🗑 Delete from channel** in
 `/posts`, `/repost` (delete the old posts, undo), `/shift` undo, a timed `/broadcast` deletion. Nothing asks you for permission
@@ -471,8 +480,8 @@ first: the only questions are about the deletion itself ("Delete N old messages?
 why (no userbot set up, a missing right, a channel that needs an approval ...).
 
 It is used the same way wherever the bot **edits** a published post and Telegram refuses it: `/replace` (media and caption),
-**✏️ Text / caption** and **🖼 Media** in `/posts`, and the link-preview switch (see `/replace` above for the details: the bot
-downloads a new file and the userbot uploads it again, and the saved buttons are put back where Telegram lets the bot).
+**✏️ Text / caption** and **🖼 Media** in `/posts`, and the link-preview switch (see `/replace` above for the details: a new
+file goes through the userbot's chat with the bot, and the saved buttons are put back where Telegram lets the bot).
 The bot always edits first; the userbot only steps in when Telegram answers the bot with an error that is not about the text
 itself. It can't change buttons (a user account can't set inline buttons).
 
@@ -529,9 +538,11 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
   real thing may show another shape. Try `/repost --last 3` and `/shift` with a small range (for example
   `/shift @source @destination 1 3`) on a test channel first.
   The userbot's edits are in the same position: the tests prove the requests (the right it is given and takes back, the
-  upload with the original file type, what is read back afterwards) against the simulation, not that Telegram lets a
-  channel admin account edit a post that another bot added buttons to, or whether the buttons then stay, go or can be
-  put back by the bot. The result message of `/replace` says what really happened - try it on one post of a test channel first.
+  file handed over in the userbot's chat with the bot and the edit by reference with the userbot's own copy, the upload
+  with the original file type and thumbnail as the fallback, what is read back afterwards) against the simulation, not that
+  Telegram lets a channel admin account edit a post that another bot added buttons to, that the file keeps the same id
+  when the bot sends it to another account, or whether the buttons then stay, go or can be put back by the bot. The result
+  message of `/replace` says what really happened - try it on one post of a test channel first.
 - `/shift -all` copies the name, description and profile photo only - not the invite links, the username, the admins or the
   channel's settings - and undo does not give the destination its old ones back. `-c` and the repost's link update read every
   message id of every connected channel up to its counter, so a big channel takes a while; a post of somebody else is only

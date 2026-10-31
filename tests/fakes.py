@@ -1,12 +1,13 @@
 """Tiny in-memory stand-ins for Telethon, good enough to exercise the engine offline."""
 import datetime
+import itertools
 import os
 from types import SimpleNamespace
 
 from telethon import errors, functions, types
 from telethon.tl.custom import Message
 
-from app.tgutil import make_url_button
+from app.tgutil import make_url_button, media_key
 
 
 def make_msg(i, text="", entities=None, markup=None, out=False, media=None, grouped_id=None, reply_to=None, pinned=False):
@@ -81,9 +82,50 @@ def photo_media(pid=11):
     return types.MessageMediaPhoto(photo=photo)
 
 
-def video_media(did=21):
-    doc = types.Document(did, did * 7, b"fr%d" % did, NOW, "video/mp4", 1000, 2, [types.DocumentAttributeVideo(5.0, 320, 240)])
+def video_media(did=21, thumb=False):
+    """A video; `thumb`: Telegram shows a picture for it (its bytes: b"THUMB OF <id>" unless the test sets `_media_data`)."""
+    thumbs = [types.PhotoStrippedSize("i", b"\x01\x28\x28"), types.PhotoSize("m", 320, 180, 1234)] if thumb else None
+    doc = types.Document(
+        did, did * 7, b"fr%d" % did, NOW, "video/mp4", 1000, 2, [types.DocumentAttributeVideo(5.0, 320, 240)], thumbs=thumbs
+    )
     return types.MessageMediaDocument(document=doc)
+
+
+def as_the_userbot_holds_it(media):
+    """The same photo / file with the access data of ANOTHER account: its id is the same everywhere, its access_hash and
+    file_reference belong to one account (so one account's copy is refused when another presents it)."""
+    if isinstance(media, types.MessageMediaPhoto):
+        p = media.photo
+        return types.MessageMediaPhoto(
+            photo=types.Photo(p.id, p.access_hash + 1000, b"ub-" + p.file_reference, p.date, p.sizes, p.dc_id)
+        )
+    d = media.document
+    return types.MessageMediaDocument(
+        document=types.Document(
+            d.id, d.access_hash + 1000, b"ub-" + d.file_reference, d.date, d.mime_type, d.size, d.dc_id, d.attributes,
+            thumbs=d.thumbs,
+        )
+    )
+
+
+class FakeDM:
+    """The chat between the bot and the userbot account: what the bot put there and what the account holds of it."""
+
+    def __init__(self):
+        self.bot_user = types.User(id=9100, access_hash=31337, first_name="Post Bot", username="the_post_bot", bot=True)
+        self.userbot_id = None  # the userbot account (set when its FakeUserClient is made) ...
+        self.userbot_user = None  # ... and its types.User
+        self.msgs = []  # the chat as the userbot sees it, oldest first
+        self.sent = []  # (the bot's id of the message, its kwargs) for everything the bot sent there
+        self.bot_ids = {}  # the bot's id of a message -> the userbot's message
+        self.deleted = []  # the bot's ids of the messages it deleted
+        self.error = None  # raised when the bot sends there (the account never started the bot, or blocked it)
+        self.read_error = None  # raised when the userbot reads the chat
+        self.reference_error = None  # raised when the userbot edits a post with a file it holds (not with an upload)
+        self.late = 0  # the next N reads find nothing: the message has not reached the userbot yet
+        self.known = {}  # ("photo" | "doc", id) -> (access_hash, file_reference) the userbot account holds
+        self._ids = itertools.count(500)  # the userbot's message ids
+        self._bot_ids = itertools.count(1000)  # the bot's message ids
 
 
 def service_msg(i):
@@ -150,6 +192,7 @@ class FakeChannelClient:
         self.user_edit_frees_message = False  # after a user account edited it, the bot may edit the post again
         self.user_edits = []  # the EditMessageRequests the userbot account made
         self._counter = [9000]  # ids for photos and uploads; shared
+        self._dm = FakeDM()  # the chat between the bot and the userbot account; shared
         self.pinned_order = []  # message ids in the order they were pinned
         self._n_invites = 0
 
@@ -164,6 +207,7 @@ class FakeChannelClient:
         other._photo_data, other._uploads, other._counter = self._photo_data, self._uploads, self._counter
         self._media_data.update(other._media_data)
         other._media_data = self._media_data
+        other._dm = self._dm
         return other
 
     def set_photo(self, data: bytes) -> int:
@@ -191,7 +235,18 @@ class FakeChannelClient:
             raise ValueError("this fake only has the bytes of a photo or a file")
         return self._media_data.get(key, b"bytes of %s %d" % (key[0].encode(), key[1]))
 
-    async def download_media(self, media, file=None):
+    async def download_media(self, media, file=None, thumb=None):
+        if thumb is not None:  # the thumbnail of a file: None when Telegram has none
+            doc = getattr(media, "document", None)
+            if not isinstance(doc, types.Document) or not doc.thumbs:
+                return None
+            data = self._media_data.get(("thumb", doc.id), b"THUMB OF %d" % doc.id)
+            if file is None or file is bytes:
+                return data
+            path = str(file) + f"photo_{doc.id}.jpg" if str(file).endswith(os.sep) else str(file)
+            with open(path, "wb") as f:
+                f.write(data)
+            return path
         if isinstance(media, types.Photo) and media.id in self._photo_data:
             return self._photo_data[media.id]
         data = self.media_bytes(media)
@@ -324,6 +379,47 @@ class FakeChannelClient:
             u = self.known_users[peer]
             return types.InputPeerUser(u.id, u.access_hash)
         raise ValueError(f"Could not find the input entity for {peer!r}")
+
+    # ------------------------------------------------------ the bot and its chat with the userbot account
+    async def get_me(self):
+        return self._dm.bot_user
+
+    def _is_dm(self, peer):
+        """Is `peer` the userbot account (the only user this simulation sends files to)?"""
+        return isinstance(peer, types.InputPeerUser) and peer.user_id == self._dm.userbot_id
+
+    async def send_file(self, peer, file, **kw):
+        """The bot sends a photo / file to the userbot account: Telegram reuses the file, the account gets its own copy."""
+        dm = self._dm
+        if not self._is_dm(peer):
+            raise NotImplementedError("this fake only sends files to the userbot account")
+        if dm.error is not None:
+            raise dm.error
+        if peer.access_hash != dm.userbot_user.access_hash:  # the bot has to know the account (its access hash)
+            raise rpc("PeerIdInvalidError")
+        key = media_key(file)
+        if key is None:
+            raise rpc("MediaInvalidError")
+        mine = as_the_userbot_holds_it(file)
+        inner = mine.photo if key[0] == "photo" else mine.document
+        dm.known[key] = (inner.access_hash, inner.file_reference)
+        self._media[key] = file  # the file as the bot holds it: what the channel shows after an edit by reference
+        msg = Message(id=next(dm._ids), peer_id=types.PeerUser(dm.bot_user.id), date=NOW, message="", out=False, media=mine)
+        dm.msgs.append(msg)
+        bot_id = next(dm._bot_ids)
+        dm.bot_ids[bot_id] = msg
+        dm.sent.append((bot_id, kw))
+        return SimpleNamespace(id=bot_id)
+
+    async def delete_messages(self, peer, ids, **kw):
+        dm = self._dm
+        if not self._is_dm(peer):
+            raise NotImplementedError("this fake only deletes in the chat with the userbot account")
+        for i in ids:
+            dm.deleted.append(i)
+            msg = dm.bot_ids.pop(i, None)
+            dm.msgs = [m for m in dm.msgs if m is not msg]  # (identity: Telethon's Message has no usable ==)
+        return [SimpleNamespace(pts_count=len(ids))]
 
     # ------------------------------------------------------------------------- message requests
     def _do_GetMessagesRequest(self, req):
@@ -564,6 +660,7 @@ class FakeUserClient:
         self.chan = chan
         self.me = types.User(id=user_id, access_hash=555, first_name=first_name, username=username, bot=bot or None)
         chan.users[user_id] = self.me
+        chan._dm.userbot_id, chan._dm.userbot_user = user_id, self.me
         self.authorized = authorized
         self.connected = False
         self.known_channel = False
@@ -588,7 +685,25 @@ class FakeUserClient:
             return types.InputPeerChannel(peer.channel_id, USER_HASH)
         if isinstance(peer, str) and self.chan.username and peer.lstrip("@").lower() == self.chan.username.lower():
             return types.InputPeerChannel(1, USER_HASH)
+        bot = self.chan._dm.bot_user
+        if isinstance(peer, str) and peer.lstrip("@").lower() == bot.username.lower():
+            return types.InputPeerUser(bot.id, bot.access_hash)
         raise ValueError(f"Could not find the input entity for {peer!r}")
+
+    async def get_messages(self, peer, limit=None, **kw):
+        """The newest messages of this account's chat with the bot (newest first, like Telethon)."""
+        dm, bot = self.chan._dm, self.chan._dm.bot_user
+        err = self.chan.fail.get("user:GetHistoryRequest")
+        if err is not None:
+            raise err
+        if not (isinstance(peer, types.InputPeerUser) and peer.user_id == bot.id and peer.access_hash == bot.access_hash):
+            raise ValueError(f"Could not find the input entity for {peer!r}")
+        if dm.read_error is not None:
+            raise dm.read_error
+        if dm.late > 0:
+            dm.late -= 1
+            return []
+        return list(reversed(dm.msgs))[: limit or 1]
 
     async def iter_dialogs(self):
         if self.known_channel and self.me.id in self.chan.members:
@@ -619,9 +734,26 @@ class FakeUserClient:
             return types.MessageMediaPhoto(photo=photo)
         if isinstance(inp, types.InputMediaUploadedDocument):
             chan._media_data[("doc", n)] = data
-            doc = types.Document(n, n * 7, b"up%d" % n, NOW, inp.mime_type, len(data), 2, list(inp.attributes))
+            thumbs = None
+            if inp.thumb is not None:  # an uploaded picture becomes the file's thumbnail
+                chan._media_data[("thumb", n)] = chan._uploads[inp.thumb.id]
+                thumbs = [types.PhotoSize("m", 320, 180, len(chan._uploads[inp.thumb.id]))]
+            doc = types.Document(n, n * 7, b"up%d" % n, NOW, inp.mime_type, len(data), 2, list(inp.attributes), thumbs=thumbs)
             return types.MessageMediaDocument(document=doc)
         raise rpc("MediaInvalidError")
+
+    def _by_reference(self, inp):
+        """An InputMediaPhoto / InputMediaDocument: only a photo / file this account holds, with ITS OWN access data."""
+        chan = self.chan
+        if chan._dm.reference_error is not None:
+            raise chan._dm.reference_error
+        key = ("photo", inp.id.id) if isinstance(inp, types.InputMediaPhoto) else ("doc", inp.id.id)
+        mine = chan._dm.known.get(key)
+        if mine is None:
+            raise rpc("MediaEmptyError")  # this account has never seen that file
+        if (inp.id.access_hash, inp.id.file_reference) != mine:
+            raise rpc("FileReferenceExpiredError")  # somebody else's access data
+        return chan._media[key]  # the file as the channel shows it (as the bot sees it)
 
     def _edit(self, req):
         """messages.editMessage by a user account: it needs the "Edit messages of others" right and can't set a keyboard."""
@@ -634,7 +766,12 @@ class FakeUserClient:
         m = chan.msgs.get(req.id)
         if m is None:
             raise rpc("MessageIdInvalidError")
-        media = self._uploaded_media(req.media) if req.media is not None else None
+        if req.media is None:
+            media = None
+        elif isinstance(req.media, (types.InputMediaPhoto, types.InputMediaDocument)):
+            media = self._by_reference(req.media)
+        else:
+            media = self._uploaded_media(req.media)
         text = m.message if req.message is None else req.message
         ents = list(m.entities or []) if req.message is None else list(req.entities or [])
         if media is None and text == m.message and [_bytes(e) for e in ents] == [_bytes(e) for e in (m.entities or [])]:
