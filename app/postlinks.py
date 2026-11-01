@@ -15,6 +15,7 @@ from telethon import types
 from telethon.helpers import add_surrogate, del_surrogate
 
 from .linkswap import apply_span_replacements
+from .richmsg import is_rich_message
 from .tgutil import button_url, with_url
 
 _HOST = r"(?:t\.me|telegram\.me|telegram\.dog)"
@@ -195,7 +196,10 @@ class Relinked:
 
 def relink_message(msg, links: PostLinks) -> Optional[Relinked]:
     """The new text / entities / buttons of `msg` once its links are remapped; None when nothing changes."""
-    text, entities, n_typed, n_hyper = links.remap_text(msg.message or "", msg.entities)
+    if is_rich_message(msg):  # the text of a rich message is blocks: only its buttons are changed
+        text, entities, n_typed, n_hyper = "", [], 0, 0
+    else:
+        text, entities, n_typed, n_hyper = links.remap_text(msg.message or "", msg.entities)
     markup, n_buttons = links.remap_markup(msg.reply_markup)
     if not (n_typed or n_hyper or n_buttons):
         return None

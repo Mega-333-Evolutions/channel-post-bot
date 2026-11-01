@@ -9,6 +9,7 @@ from typing import Optional
 from telethon.helpers import add_surrogate, del_surrogate
 
 from .linkswap import apply_span_replacements
+from .richmsg import is_rich
 from .tgutil import de_entities, ser_entities
 
 RANGE_RX = re.compile(r"(?P<a>\d+)(?P<sep>\s*(?:to|[-–—~&])\s*)(?P<pre>(?:ep?\.?\s*)?)(?P<b>\d+)", re.I)
@@ -64,6 +65,8 @@ class Suggestion:
 
 
 def build_suggestion(post) -> Optional[Suggestion]:
+    if is_rich(post):  # its text lives in blocks Telegram made: the numbers can't be moved on in them
+        return None
     rows: list = []
     pending: list = []
     first: Optional[Advance] = None

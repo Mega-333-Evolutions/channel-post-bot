@@ -11,7 +11,7 @@ from ..common import Ctx, UserError, clear_state, cmd, discard_temp, guard, on_c
 from ..suggest import make_suggestion
 from ..tgutil import esc, short
 from ..ui import CANCEL, KIND_NAME
-from .panel import extract_content, markup_note, show_panel
+from .panel import markup_note, read_content, show_panel
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +32,8 @@ def register(ctx: Ctx) -> None:
         await show(
             event,
             "✍️ <b>Send the post now.</b>\nText, or a photo / video / GIF / file with a caption. "
-            "Formatting (bold, links, spoilers...) is kept. No Telegram editor at hand? Type HTML or Markdown - /formatting shows how.",
+            "Formatting (bold, links, spoilers...) is kept. No Telegram editor at hand? Type HTML or Markdown - /formatting shows how; "
+            "headings, lists, tables, math and the other rich blocks: /rich.",
             CANCEL,
         )
 
@@ -153,7 +154,7 @@ def register(ctx: Ctx) -> None:
             return  # the other items of an album: only the first one is used
         if m.grouped_id:
             st["group"] = m.grouped_id
-        content = extract_content(m, ctx.cfg.markup_input)
+        content = await read_content(ctx, event)
         post = await db.create_post(
             channel_id=st["cid"],
             created_by=event.sender_id,

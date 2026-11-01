@@ -13,6 +13,7 @@ reported to a Telegram chat.
 | Area | Features |
 |---|---|
 | Posts | create text / photo / video / GIF / audio / file posts, Telegram's own formatting kept - or typed as **HTML / Markdown** when its editor is not at hand (see **Formatting**), preview, publish, drafts |
+| Rich messages | Telegram's newer message type - **headings, lists and task lists, tables, quotes (nested, with a source), expandable sections, code with a copy button, math, maps, pictures / audio / collages, buttons inside the text, footnotes, dates ...** - is published and edited exactly as it is: a rich message you send (or forward) to the bot is kept block for block, and the same can be **typed as HTML or Markdown** when Premium's editor is not at hand (see **Rich messages**, `/rich`) |
 | Edit later | text or caption, replace media (where Telegram refuses the bot, the userbot makes the edit), add / delete buttons, change button text, change button link, reorder buttons (⬅️⬆️⬇️➡️), link-preview toggle, **Mass replace links** (new links for the buttons of a channel, one after the other) |
 | Choosing a channel | every command that needs one of your channels lists them as a numbered text list (A to Z, 20 to a message); the buttons only carry the numbers (5 to a row), ◀ ▶ move to the next / previous 20 |
 | My posts | `/posts` lists drafts and published posts per channel, edit or delete them: **🗑 Delete from channel** deletes the post in the channel *and* removes it, with its data, from My posts (the userbot, if there is one, takes over by itself where the bot is refused - nothing is asked); **🧹 Only forget it in the bot** leaves the channel alone. **⬅️ Prev** is always shown; on the first page it jumps to the last page. Owners also get **🔧 Check buttons** (see below) |
@@ -147,6 +148,59 @@ How it decides, so ordinary text is never changed by accident:
   before anything is published. If it read something you did not mean, put a backslash before the mark - or switch typed
   formatting off with `MARKUP_INPUT=false` (Telegram's own formatting keeps working).
 - The length limits (4096 characters for text, 1024 for a caption) count the text that is left after the marks are taken out.
+
+## 🧩 Rich messages: headings, lists, tables, expandable sections, math, maps ...
+
+A rich message is not text with formatting - it is a tree of **blocks** that Telegram builds itself. Everything Telegram
+knows is supported, because the bot never rebuilds the blocks: it hands them (or the HTML / Markdown you typed) to Telegram
+unchanged. `/rich` shows the syntax in the chat (two messages: Markdown, and the HTML tags with every attribute).
+
+**When a post becomes a rich message** (the bot says **🧩 Rich message kept as it is** or **🧩 Rich message read from
+HTML / Markdown** and 👁 **Preview** shows what Telegram made of it before anything is published):
+
+- you send the bot a rich message made in Telegram - or **forward one to it**: it is kept block for block, with its
+  pictures and files; or
+- you type **Markdown or HTML that has something only rich messages have**: a heading (`# Title`), a task list
+  (`- [x] done`), a table, `$$math$$`, a footnote (`[^1]: note`), `==marked==` text, a picture alone on a line (`![](https://…)`),
+  a formatted date (`![22:45](tg://time?unix=…&format=wDT)`) - or in HTML `<h1>…<h6>`, `<p>`, `<ul>` `<ol>` `<li>`, `<table>`,
+  `<details>`, `<figure>`, `<aside>`, `<hr>`, `<footer>`, `<img>` `<video>` `<audio>` `<tg-document>`, `<tg-map>`,
+  `<tg-collage>`, `<tg-slideshow>`, `<tg-math>` `<tg-math-block>`, `<tg-button-row>`, `<tg-time>`, `<tg-reference>`, `<mark>`,
+  `<sub>` `<sup>`, `<a name>` / `<a href="#…">` anchors (the rest of the tags are on `/rich`); or
+- the first line of the text is just `<rich>`: then whatever follows is a rich message, read as HTML when it has tags and as
+  Markdown otherwise. `<rich rtl>` is for right-to-left text, `<rich noautolink>` stops Telegram from making links, @names
+  and #tags clickable (the options can be combined).
+
+Text that only *looks* a little like markup stays an ordinary post: `#anime #naruto`, `Price: $5 and $6`, `a == b`, `<3`,
+a bare `- item` list, `---`, `**bold**` or `<b>bold</b>` alone (those are formatting - see **Formatting**), and anything inside
+`` `code` `` or a code block. A message with Telegram formatting of its own is used as it is. `MARKUP_INPUT=false` switches
+the typed detection off (a rich message sent natively is still kept).
+
+**What works with a rich post.** Publish, preview, drafts, **✏️ Text** (a new rich message - typed or sent - or plain text
+again), the link buttons under the post (➕ Button, Set buttons, Mass replace links), `/broadcast`, the userbot (where Telegram
+refuses the bot, the userbot makes the edit), My posts, `/export` / `/import`, the sync (a rich post an admin edits in the
+channel is taken over as its new blocks; the bot's own typed post is only noted the first time it is seen), `/repost` and
+`/shift` (copied by Telegram where possible, otherwise sent again from its blocks with its buttons - their links swapped as
+usual; a post Telegram holds back is rebuilt from its saved copy).
+
+**What does not apply to one.** A caption is never a rich message (a photo's caption stays text); a rich message has no media
+slot (pictures go into the text: an `https://` link in the typed text - Telegram only takes web links there - or a rich
+message that already contains them, sent to the bot) and no link-preview switch; `/replace` refuses it; `/swap`, `/handleswap`
+and the post-link changes of `/repost` change its **buttons** only - the links and @names inside its text are left as they
+are (undo restores the buttons the same way); Auto-suggest does not propose a next post from one.
+
+**Limits** (Telegram's): 32768 characters, 500 blocks, 16 levels of nesting, 50 pictures / files, 20 table columns. The
+bot checks the length; for the rest Telegram's answer is shown (`see /rich for the syntax`) and nothing is published.
+
+**Not tested against real Telegram.** The tests prove what the bot builds and sends (every request is serialised with the real
+Telethon) against a simulation that stands in for Telegram's reading of HTML / Markdown, so the following are assumptions
+until you try them on a test channel:
+`InputRichMessageHTML` / `InputRichMessageMarkdown` read the text the way the Bot API's rich-message pages describe;
+Telegram lets an edit turn a plain post into a rich one and back; a rich message that arrives in parts (`part`) is completed with
+`messages.getRichMessage`; a userbot account without Premium may edit with `rich_message`; Telegram's own servers fetch the
+`https://` pictures typed into a text; a button inside the text of a rich message that needs its bot (`callback_data`) only
+works for the bot that made it, so in a forwarded message it belongs to another bot; the blocks Telegram returns for a post
+are the same from one read to the next (the sync tells an admin's edit by them - if they ever differ, the saved copy is
+simply taken over again); older Telegram apps may not show rich messages at all. If Telegram refuses something, the bot's message says so and nothing is changed.
 
 ## `/swap`, `/replace` and `/handleswap`
 
@@ -518,7 +572,7 @@ records of level ERROR, exceptions nobody caught in background tasks, and a cras
 
 ## Commands
 
-`/new` `/posts` `/autopost` `/formatting` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace` `/swap`
+`/new` `/posts` `/autopost` `/formatting` `/rich` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace` `/swap`
 `/handleswap` `/undo` `/repost` `/shift` `/sync` `/userbot` `/export` `/import`
 
 Auto-suggest reads the newest published post of the channel that has a button with numbers in its text
@@ -571,5 +625,6 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
 `TEST_DATABASE_URL=postgresql+asyncpg://user:pass@localhost/db pytest`.
 
 `tests/test_richtext.py` covers the HTML / Markdown reader (including random and hostile input), `tests/test_markup_flows.py`
-the flows that use it, `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
+the flows that use it, `tests/test_rich.py` and `tests/test_rich_flows.py` the rich messages (what is recognised, what is sent,
+receiving, editing, broadcast, the userbot, /swap, the sync and /repost), `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
 bot-first, userbot-second edit of `/replace` and My posts.

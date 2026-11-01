@@ -826,8 +826,9 @@ class Database:
                 q = select(Post).where(Post.channel_id == channel_id, Post.message_id == message_id)
                 p = (await s.execute(q)).scalar_one_or_none()
                 if p is not None:
-                    p.text = state.get("text", "")
-                    p.entities = state.get("entities", [])
+                    if not state.get("rich"):  # a rich message's text was never changed: it stays as saved
+                        p.text = state.get("text", "")
+                        p.entities = state.get("entities", [])
                     p.buttons = state.get("buttons", [])
                     p.updated_at = utcnow()
             if all_done:

@@ -17,6 +17,7 @@ from .buttons_sync import ensure_markup, link_urls
 from .config import Config
 from .db import Database
 from .replace_engine import fetch_messages, is_skippable
+from .richmsg import rich_of, send_rich, with_rich
 from .tgutil import build_markup, de_entities, edit_raw, esc, explain_rpc, fetch_media, media_info, peer_of, with_media
 from .userbot import UserbotError, UserbotRefused, edit_problem_text
 
@@ -141,6 +142,9 @@ def require_owner(ctx: Ctx, event) -> None:
 async def send_post(client, peer, post):
     ents = de_entities(post.entities)
     markup = build_markup(post.buttons)
+    rich = rich_of(post)
+    if rich is not None and not post.media_file_id:  # a rich message: Telegram builds its blocks from what was kept
+        return await send_rich(client, peer, rich, markup=markup)
     if post.media_file_id:
         return await with_media(
             post.media_file_id,
@@ -158,6 +162,10 @@ async def push_edit(client, ch, p, *, replace_media: bool = False) -> None:
     peer = peer_of(ch)
     ents = de_entities(p.entities)
     markup = build_markup(p.buttons)
+    rich = rich_of(p)
+    if rich is not None and not p.media_kind:
+        await with_rich(rich, lambda inp: edit_raw(client, peer, p.message_id, rich_message=inp, markup=markup))
+        return
     if replace_media and p.media_file_id:
         await with_media(
             p.media_file_id,
@@ -264,7 +272,10 @@ async def edit_by_userbot(ctx: Ctx, ch, p, *, replace_media: bool, bot_error: st
             await notify(text)
 
     fields = dict(
-        text=p.text or "", entities=de_entities(p.entities), preview=None if p.media_kind else bool(p.link_preview)
+        text=p.text or "",
+        entities=de_entities(p.entities),
+        preview=None if p.media_kind or rich_of(p) else bool(p.link_preview),
+        rich=None if p.media_kind else rich_of(p),
     )
     try:
         await tell("⏳ Telegram refused the bot, so the userbot is making the edit.")

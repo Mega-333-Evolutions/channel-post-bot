@@ -38,7 +38,7 @@ from ..db import utcnow
 from ..expiry import human, parse_duration, stamp
 from ..tgutil import esc, explain_rpc, flood_retry, peer_of
 from ..ui import CANCEL
-from .panel import extract_content, markup_note
+from .panel import markup_note, read_content
 
 log = logging.getLogger(__name__)
 
@@ -165,7 +165,7 @@ def register(ctx: Ctx) -> None:
             event,
             f"📣 <b>Broadcast</b> to {len(chans)} channel(s)\n{when}\n\n"
             "✍️ <b>Send the message now.</b> Text, or a photo / video / GIF / file with a caption. Formatting is kept "
-            "(or type HTML / Markdown - /formatting shows how).",
+            "(or type HTML / Markdown - /formatting shows how; rich blocks: /rich).",
             CANCEL,
         )
 
@@ -176,7 +176,7 @@ def register(ctx: Ctx) -> None:
             return  # the other items of an album: only the first one is used
         if m.grouped_id:
             st["group"] = m.grouped_id
-        content = extract_content(m, ctx.cfg.markup_input)
+        content = await read_content(ctx, event)
         set_state(ctx, event.sender_id, "bc_buttons", ttl=st["ttl"], content=content)
         await say(event, markup_note(content.how) + BUTTON_HELP, [[Button.inline("⏭ No buttons", "brs")], CANCEL[0]])
 

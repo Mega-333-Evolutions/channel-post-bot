@@ -9,6 +9,7 @@ from telethon import events
 
 from ..common import Ctx, UserError, cmd, clear_state, discard_temp, guard, say, show
 from ..picker import PAGE_CB
+from ..richmsg import RICH_HELP, RICH_HELP_HTML
 from ..richtext import CHEAT_SHEET
 from ..tgutil import esc
 
@@ -21,6 +22,7 @@ HELP = (
     "/posts - your posts and drafts: edit text, caption, media and buttons, or delete them - a published post is deleted in the channel and in My posts (a button post also has “Mass replace links”)\n"
     "/autopost 114 20 - post “Episodes 01 to 20”, “21 to 40” ... up to 114, each with a download button, then fill in the links\n"
     "/formatting - bold, italic, links, quotes ...: Telegram's own formatting is kept, or type HTML / Markdown instead\n"
+    "/rich - rich messages: headings, lists, tables, expandable sections, math, maps, pictures, buttons ... typed as HTML / Markdown, or sent as a Telegram rich message\n"
     "/cancel - stop what you're doing\n\n"
     "<b>Channels</b>\n"
     "/addchannel - register a channel (the bot must be an admin there)\n"
@@ -91,6 +93,12 @@ def register(ctx: Ctx) -> None:
     @guard(ctx)
     async def h_formatting(event):
         await say(event, CHEAT_SHEET)
+
+    @client.on(cmd("rich"))
+    @guard(ctx)
+    async def h_rich(event):
+        await say(event, RICH_HELP)
+        await say(event, RICH_HELP_HTML)
 
     @client.on(cmd("cancel"))
     @guard(ctx)

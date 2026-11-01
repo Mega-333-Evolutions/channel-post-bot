@@ -10,6 +10,7 @@ from telethon import errors, functions, types
 
 from .handleswap import compute_handle_changes
 from .linkswap import compute_message_changes
+from .richmsg import entry as rich_entry, is_rich_message, plain_of_message, rich_from_received, rich_of
 from .tgutil import (
     build_markup,
     de_entities,
@@ -230,6 +231,9 @@ async def apply_channel(
                 preview = preview_flag(m)
                 markup = change.new_markup if change.new_markup is not None else m.reply_markup
                 old_state = state_of(m.message, m.entities, m.reply_markup, preview)
+                rich = is_rich_message(m)
+                if rich:  # its text is blocks this run never touches: undo puts the buttons back and nothing else
+                    old_state["rich"] = True
                 try:
                     await flood_retry(lambda: _do_edit(client, peer, m, change, markup, preview))
                 except errors.MessageNotModifiedError:
@@ -256,11 +260,20 @@ async def apply_channel(
                 }
                 if kind:
                     adopt["media_kind"], adopt["media_file_id"] = kind, fid
+                new_state = state_of(change.new_text, change.new_entities, markup, preview)
+                if rich:
+                    new_state["rich"] = True
+                    saved = await db.find_by_message(ch.id, m.id)
+                    if saved is not None and rich_of(saved) is not None:
+                        del adopt["text"], adopt["entities"]  # the saved copy keeps what it was sent from
+                    else:  # a rich message nobody saved yet: it is taken over as its blocks
+                        adopt["text"] = plain_of_message(m)
+                        adopt["entities"] = [rich_entry(rich_from_received(m.rich_message))]
                 buf.append(
                     {
                         "message_id": m.id,
                         "old_state": old_state,
-                        "new_state": state_of(change.new_text, change.new_entities, markup, preview),
+                        "new_state": new_state,
                         "adopt": adopt,
                     }
                 )
@@ -298,17 +311,22 @@ async def undo_batch(
             continue
         old = c.old_state or {}
         try:
-            await flood_retry(
-                lambda: edit_raw(
-                    client,
-                    peer_of(ch),
-                    c.message_id,
-                    text=old.get("text", ""),
-                    entities=de_entities(old.get("entities")),
-                    markup=build_markup(old.get("buttons")),
-                    preview=old.get("preview"),
+            if old.get("rich"):  # a rich message: only its buttons were changed, so only they are put back
+                markup = build_markup(old.get("buttons"))
+                if markup is not None:
+                    await flood_retry(lambda: edit_raw(client, peer_of(ch), c.message_id, markup=markup))
+            else:
+                await flood_retry(
+                    lambda: edit_raw(
+                        client,
+                        peer_of(ch),
+                        c.message_id,
+                        text=old.get("text", ""),
+                        entities=de_entities(old.get("entities")),
+                        markup=build_markup(old.get("buttons")),
+                        preview=old.get("preview"),
+                    )
                 )
-            )
         except errors.MessageNotModifiedError:
             pass
         except errors.RPCError as e:

@@ -31,6 +31,7 @@ from typing import Optional
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.sessions import StringSession
 
+from .richmsg import with_rich
 from .tgutil import MediaFile, edit_raw, flood_retry, get_rights, media_from_ref, media_key, peer_of, with_media
 
 log = logging.getLogger(__name__)
@@ -524,17 +525,24 @@ class UserbotEditor(_ChannelJob):
                 log.info("could not delete the helper message in the userbot's chat: %s", type(e).__name__)
         await super().close()
 
-    async def edit(self, message_id: int, *, text: str, entities: list, media=None, preview=None) -> None:
+    async def edit(self, message_id: int, *, text: str, entities: list, media=None, preview=None, rich=None) -> None:
         """Make the post show `text` (with `entities`) and, when given, `media`: what media_by_reference() returned (the
-        file does not move at all) or a MediaFile (uploaded again)."""
+        file does not move at all) or a MediaFile (uploaded again). `rich` (a richmsg.Rich) makes it that rich message."""
         await self._begin()
         client = self.ub.client
         try:
             if isinstance(media, MediaFile):
                 media = await self._upload(media)
-            await flood_retry(
-                lambda: edit_raw(client, self.peer, message_id, text=text, entities=entities, preview=preview, media=media)
-            )
+            if rich is not None:
+                await flood_retry(
+                    lambda: with_rich(rich, lambda inp: edit_raw(client, self.peer, message_id, rich_message=inp))
+                )
+            else:
+                await flood_retry(
+                    lambda: edit_raw(
+                        client, self.peer, message_id, text=text, entities=entities, preview=preview, media=media
+                    )
+                )
         except errors.MessageNotModifiedError:
             return  # it already looks like that
         except errors.RPCError as e:

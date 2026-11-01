@@ -26,6 +26,7 @@ from ..common import (
 )
 from ..linkswap import normalize_username
 from ..replace_engine import ApplyResult, ChannelScan, ScanOptions, apply_channel, scan_channel, undo_batch
+from ..richmsg import is_rich
 from ..richtext import message_text
 from ..sync_engine import SyncOptions, sync_ids
 from ..tgutil import classify_media, esc, explain_rpc, get_rights, pack_file_id
@@ -265,6 +266,8 @@ def register(ctx: Ctx) -> None:
                     raise UserError("That post no longer exists in the channel, or I can't add it to My posts.")
             if post.status != "sent":
                 raise UserError("That post is not published yet.")
+            if is_rich(post):
+                raise UserError("That post is a rich message - it has no media or caption to replace. Edit its text in My posts.")
             caption, entities, how = message_text(reply, cfg.markup_input)  # Telegram's formatting, or HTML / Markdown
             check_lengths(caption, True)
 

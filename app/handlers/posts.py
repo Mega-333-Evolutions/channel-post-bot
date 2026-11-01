@@ -36,14 +36,17 @@ from ..common import (
 )
 from ..db import utcnow
 from ..repost_engine import delete_batch
-from ..richtext import message_text
+from ..richmsg import is_rich
 from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link
 from ..ui import CANCEL, post_label
 from ..userbot import delete_problem_text
 from .panel import (
     check_lengths,
+    is_rich_how,
     load_post,
     markup_note,
+    read_native,
+    read_text,
     show_button_screen,
     show_panel,
 )
@@ -123,7 +126,8 @@ def register(ctx: Ctx) -> None:
         post, _ = await load_post(ctx, parts[0])
         set_state(ctx, event.sender_id, "edit_text", pid=post.id)
         what = "caption" if post.media_kind else "text"
-        await say(event, f"✏️ Send the new {what}. Formatting is kept - or type HTML / Markdown (/formatting shows how).", CANCEL)
+        more = "" if post.media_kind else " Rich messages (headings, lists, tables ...) too: /rich."
+        await say(event, f"✏️ Send the new {what}. Formatting is kept - or type HTML / Markdown (/formatting shows how).{more}", CANCEL)
 
     @on_text(ctx, "edit_text")
     async def h_edit_text(event, st):
@@ -131,10 +135,12 @@ def register(ctx: Ctx) -> None:
         if classify_media(m):
             raise UserError("Send text only here. To change the media, use 🖼 Media.")
         post, ch = await load_post(ctx, st["pid"])
-        text, entities, how = message_text(m, ctx.cfg.markup_input)
-        if not post.media_kind and not text.strip():
+        native = await read_native(ctx, event)
+        text, entities, how = read_text(m, ctx.cfg.markup_input, native, allow_rich=not post.media_kind)
+        if not post.media_kind and not text.strip() and not is_rich_how(how):
             raise UserError("A text post can't be empty.")
-        check_lengths(text, bool(post.media_kind))
+        if not is_rich_how(how):
+            check_lengths(text, bool(post.media_kind))
         post, report = await apply_edit_reported(ctx, post, ch, text=text, entities=entities)
         clear_state(ctx, event.sender_id)
         await show_panel(ctx, event, post.id, note=markup_note(how, "\n") + note_for(post, report), new=True)
@@ -143,6 +149,11 @@ def register(ctx: Ctx) -> None:
     @on_cb(ctx, "em")
     async def cb_edit_media(event, parts):
         post, _ = await load_post(ctx, parts[0])
+        if is_rich(post):
+            raise UserError(
+                "A rich message has no media slot. Put pictures into the text itself (see /rich), "
+                "or send new text without rich blocks first."
+            )
         set_state(ctx, event.sender_id, "edit_media", pid=post.id)
         extra = "" if post.media_kind else "\nThe current text becomes its caption."
         await say(event, f"🖼 Send the new photo / video / GIF / audio / file.{extra}", CANCEL)
@@ -355,9 +366,14 @@ def register(ctx: Ctx) -> None:
     @on_cb(ctx, "pv")
     async def cb_preview(event, parts):
         post, _ = await load_post(ctx, parts[0])
-        if not (post.text or "").strip() and not post.media_file_id:
+        if not (post.text or "").strip() and not post.media_file_id and not is_rich(post):
             raise UserError("The post is empty.")
-        await send_post(client, await event.get_input_chat(), post)
+        try:
+            await send_post(client, await event.get_input_chat(), post)
+        except errors.RPCError as e:
+            if not is_rich(post):
+                raise
+            raise UserError("❌ " + explain_rpc(e) + "\nTelegram could not make that rich message - see /rich for the syntax.")
         miss = missing_links(post.buttons)
         if miss:
             await say(event, f"👆 Preview. ⚠️ {miss} button(s) without a link are not shown.")
@@ -369,7 +385,7 @@ def register(ctx: Ctx) -> None:
             raise UserError("This post is already published.")
         if missing_links(post.buttons):
             raise UserError("Some buttons (⚠️) have no link yet. Open them and add a link first.")
-        if not (post.text or "").strip() and not post.media_file_id:
+        if not (post.text or "").strip() and not post.media_file_id and not is_rich(post):
             raise UserError("The post is empty.")
         await show(
             event,

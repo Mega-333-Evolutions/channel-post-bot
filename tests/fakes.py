@@ -303,7 +303,28 @@ class FakeChannelClient:
         else:
             m._hidden, m.reply_markup = None, markup
 
-    def _new(self, text, entities, markup, media=None, gid=None, invert=None, hide=False, reply_to=None):
+    def _rich(self, inp):
+        """What Telegram makes of an InputRichMessage*: for HTML / Markdown the "parse" is one paragraph holding the source
+        (the same source always gives the same blocks); a message sent as blocks keeps them, with its pictures and files."""
+        if isinstance(inp, (types.InputRichMessageHTML, types.InputRichMessageMarkdown)):
+            src = inp.html if isinstance(inp, types.InputRichMessageHTML) else inp.markdown
+            if not src.strip():
+                raise rpc("MessageEmptyError")
+            kind = "html" if isinstance(inp, types.InputRichMessageHTML) else "markdown"
+            return types.RichMessage(
+                blocks=[types.PageBlockParagraph(types.TextPlain(f"[{kind}]{src}"))], photos=[], documents=[], rtl=inp.rtl
+            )
+        if isinstance(inp, types.InputRichMessage):
+            photos = [
+                types.Photo(p.id, p.access_hash, p.file_reference, NOW, [], 1) for p in inp.photos or []
+            ]
+            docs = [
+                types.Document(d.id, d.access_hash, d.file_reference, NOW, "video/mp4", 1, 1, []) for d in inp.documents or []
+            ]
+            return types.RichMessage(blocks=list(inp.blocks), photos=photos, documents=docs, rtl=inp.rtl)
+        raise rpc("MediaInvalidError")
+
+    def _new(self, text, entities, markup, media=None, gid=None, invert=None, hide=False, reply_to=None, rich=None):
         self._top += 1
         self._pts += 1
         m = Message(
@@ -317,6 +338,7 @@ class FakeChannelClient:
             grouped_id=gid,
             invert_media=invert,
             reply_to=types.MessageReplyHeader(reply_to_msg_id=reply_to) if reply_to else None,
+            rich_message=rich,
         )
         if self.hide_keyboard_on_create > 0 and markup is not None:
             hide = True
@@ -458,7 +480,7 @@ class FakeChannelClient:
             out.append(
                 self._new(
                     src.message, src.entities, src.reply_markup, src.media, gid, getattr(src, "invert_media", None),
-                    hide=self.forward_hides_keyboard,
+                    hide=self.forward_hides_keyboard, rich=getattr(src, "rich_message", None),
                 )
             )
         if not out:
@@ -482,6 +504,11 @@ class FakeChannelClient:
 
     def _do_SendMessageRequest(self, req):
         rid = self._check_reply(req)
+        if req.rich_message is not None:
+            rich = self._rich(req.rich_message)
+            m = self._new("", None, req.reply_markup, None, None, None, reply_to=rid, rich=rich)
+            m.rich_input = req.rich_message  # what the bot asked for (the tests look at it)
+            return self._updates([m])
         return self._updates([self._new(req.message, req.entities, req.reply_markup, None, None, req.invert_media, reply_to=rid)])
 
     def _do_SendMediaRequest(self, req):
@@ -529,6 +556,19 @@ class FakeChannelClient:
             raise rpc("MessageAuthorRequiredError")
         if getattr(m, "via_other_bot", False):  # buttons or a post made through another bot: only that bot may edit
             raise rpc("MessageIdInvalidError")
+        if req.rich_message is not None:  # the post becomes this rich message; no keyboard sent = keyboard removed
+            rich = self._rich(req.rich_message)
+            if (
+                m.rich_message is not None
+                and bytes(m.rich_message) == bytes(rich)
+                and _bytes(req.reply_markup) == _bytes(self._effective(m))
+            ):
+                raise rpc("MessageNotModifiedError")
+            m.message, m.entities, m.rich_message, m.rich_input = "", None, rich, req.rich_message
+            self._set_markup(m, req.reply_markup)
+            self.edits.append(req)
+            self._pts += 1
+            return self._updates([])
         if req.message is None:  # markup-only edit
             text, ents = m.message, list(m.entities or [])
             markup = req.reply_markup if req.reply_markup is not None else self._effective(m)
@@ -541,10 +581,20 @@ class FakeChannelClient:
         ):
             raise rpc("MessageNotModifiedError")
         m.message, m.entities = text, (ents or None)
+        if req.message is not None:
+            m.rich_message = None
         self._set_markup(m, markup)
         self.edits.append(req)
         self._pts += 1
         return self._updates([])
+
+    def _do_GetRichMessageRequest(self, req):
+        """messages.getRichMessage: the whole rich message of a post (the tests may put a longer one in `full_rich`)."""
+        full = getattr(self, "full_rich", {}).get(req.id)
+        m = self.msgs.get(req.id)
+        if full is None and (m is None or m.rich_message is None):
+            raise rpc("MessageIdInvalidError")
+        return full if full is not None else m.rich_message
 
     def _do_DeleteMessagesRequest(self, req):
         ids = list(req.id)
@@ -772,6 +822,18 @@ class FakeUserClient:
             media = self._by_reference(req.media)
         else:
             media = self._uploaded_media(req.media)
+        if req.rich_message is not None:
+            rich = chan._rich(req.rich_message)
+            if m.rich_message is not None and bytes(m.rich_message) == bytes(rich):
+                raise rpc("MessageNotModifiedError")
+            m.message, m.entities, m.rich_message, m.rich_input = "", None, rich, req.rich_message
+            if not chan.user_edit_keeps_markup:
+                chan._set_markup(m, None)
+            if chan.user_edit_frees_message:
+                m.via_other_bot = False
+            chan.user_edits.append(req)
+            chan._pts += 1
+            return chan._updates([])
         text = m.message if req.message is None else req.message
         ents = list(m.entities or []) if req.message is None else list(req.entities or [])
         if media is None and text == m.message and [_bytes(e) for e in ents] == [_bytes(e) for e in (m.entities or [])]:

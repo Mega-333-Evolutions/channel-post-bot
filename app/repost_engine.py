@@ -42,6 +42,7 @@ from .linkswap import compute_message_changes, url_only_markup
 from .postlinks import PostLinks, relink_message
 from .replace_engine import CHUNK, FALLBACK_EMPTY_BATCHES, fetch_messages, is_skippable, preview_flag
 from .restrictions import PLACEHOLDER_NOTE, is_placeholder_text, message_restriction, probe_channel
+from .richmsg import Rich, entry as rich_entry, is_rich_message, plain_of, rich_from_received, rich_of, with_rich
 from .tgutil import (
     FATAL,
     build_markup,
@@ -89,6 +90,16 @@ class Final:
     dropped: int = 0  # other bots' buttons that are not copied
     n_post_links: int = 0  # links to other posts of the same channel (whatever their new id will be)
     n_relinked: int = 0  # of those, how many were already pointed at a copy
+    rich: Optional[Rich] = None  # the post is a rich message: this is what the copy is made from (text / entities are empty)
+
+
+def rich_for(src) -> Optional[Rich]:
+    """The rich message that `src` is - a live post, or a stand-in made from a saved post - or None for an ordinary post."""
+    saved = getattr(src, "rich_saved", None)
+    if saved is not None:
+        return saved
+    rm = getattr(src, "rich_message", None)
+    return rich_from_received(rm) if rm is not None else None
 
 
 def final_state(src, opts: RepostOptions, links: Optional[PostLinks] = None) -> Final:
@@ -99,8 +110,11 @@ def final_state(src, opts: RepostOptions, links: Optional[PostLinks] = None) -> 
         change, _ = compute_message_changes(
             src, opts.old, opts.new, include_typed=opts.include_typed, include_posts=opts.include_posts
         )
+    rich = rich_for(src)
     text = change.new_text if change else (src.message or "")
     entities = list(change.new_entities) if change else list(src.entities or [])
+    if rich is not None:  # a rich message's text is blocks: nothing of it is changed here, only its buttons
+        text, entities = "", []
     # text mentions need an access hash to be re-sent; they are rare in channel posts
     entities = [e for e in entities if not isinstance(e, types.MessageEntityMentionName)]
     markup, dropped = url_only_markup(
@@ -130,6 +144,7 @@ def final_state(src, opts: RepostOptions, links: Optional[PostLinks] = None) -> 
         dropped=dropped,
         n_post_links=n_post_links,
         n_relinked=n_relinked,
+        rich=rich,
     )
 
 
@@ -212,7 +227,9 @@ def copy_source(unit: list, rows: dict, *, restricted: Optional[str] = None, use
         return "saved", why
     for m in unit:
         live = m.message or ""
-        if is_placeholder_text(live) or (not live.strip() and getattr(m, "media", None) is None):
+        if is_placeholder_text(live) or (
+            not live.strip() and getattr(m, "media", None) is None and rich_for(m) is None
+        ):
             return "skip", why
     return "live", why
 
@@ -223,6 +240,8 @@ def stand_in(m, row):
     s = copy.copy(m)
     s.message = row.text or ""
     s.entities = de_entities(row.entities)
+    s.rich_message = None  # what it shows is what My posts saved ...
+    s.rich_saved = rich_of(row)  # ... which is a rich message when the saved post is one
     s.reply_markup = build_markup(row.buttons)
     s.media = None
     s.saved_ref = None  # the saved media reference (resend_saved may need it again without its file reference)
@@ -267,7 +286,7 @@ def without_files(unit: list) -> tuple:
             c = copy.copy(m)
             c.media, c.saved_ref, c.invert_media = None, None, None
             lost += 1
-        if (c.message or "").strip():
+        if (c.message or "").strip() or rich_for(c) is not None:
             out.append(c)
     return out, lost
 
@@ -592,7 +611,22 @@ async def resend_unit(client, peer, unit: list, finals: list, reply_to: Optional
     """Rebuild a post from its parts (used when copying is not allowed, or the copy must differ from the original).
     `reply_to`: message id (in the channel `peer`) the new post answers."""
     reply = reply_header(reply_to)
-    if len(unit) > 1:
+    sender = None
+    if len(unit) == 1 and getattr(finals[0], "rich", None) is not None:
+        rich_final = finals[0]  # a rich message: Telegram builds it again from its blocks (or its HTML / Markdown)
+
+        async def send_rich_final():
+            return await with_rich(
+                rich_final.rich,
+                lambda inp: client(
+                    functions.messages.SendMessageRequest(
+                        peer=peer, message="", rich_message=inp, reply_markup=rich_final.markup, silent=True, reply_to=reply
+                    )
+                ),
+            )
+
+        sender = send_rich_final
+    elif len(unit) > 1:
         singles = [
             types.InputSingleMedia(media=utils.get_input_media(m.media), message=f.text, entities=f.entities or None)
             for m, f in zip(unit, finals)
@@ -634,7 +668,7 @@ async def resend_unit(client, peer, unit: list, finals: list, reply_to: Optional
                     reply_to=reply,
                 )
 
-    result = await flood_retry(lambda: client(make()))
+    result = await flood_retry(sender if sender is not None else (lambda: client(make())))
     news = new_messages_from(result)
     if len(news) != len(unit):
         await delete_ids(client, peer, [n.id for n in news])
@@ -847,8 +881,8 @@ def _rows(unit: list, finals: list, news: list) -> list:
                 "old_id": src.id,
                 "new_id": new.id,
                 "post": {
-                    "text": f.text,
-                    "entities": ser_entities(f.entities),
+                    "text": plain_of(f.rich) if f.rich is not None else f.text,
+                    "entities": [rich_entry(f.rich)] if f.rich is not None else ser_entities(f.entities),
                     "buttons": ser_markup(f.markup),
                     "media_kind": kind,
                     "media_file_id": ref,
@@ -1131,12 +1165,16 @@ async def relink_copies(
             if should_stop and should_stop():
                 res.stopped = True
                 return res
+            rich = is_rich_message(m)  # a rich message's text is blocks: only its buttons change, the text is not sent again
             try:
-                await flood_retry(
-                    lambda: edit_raw(
-                        client, peer, m.id, text=rl.text, entities=rl.entities, markup=rl.markup, preview=preview_flag(m)
+                if rich:
+                    await flood_retry(lambda: edit_raw(client, peer, m.id, markup=rl.markup))
+                else:
+                    await flood_retry(
+                        lambda: edit_raw(
+                            client, peer, m.id, text=rl.text, entities=rl.entities, markup=rl.markup, preview=preview_flag(m)
+                        )
                     )
-                )
                 if link_urls(rl.markup):
                     await ensure_markup(client, peer, m.id, rl.markup, pause=settle_pause)
             except errors.MessageNotModifiedError:
@@ -1155,9 +1193,10 @@ async def relink_copies(
             res.relinked += 1
             res.links += rl.links
             try:
-                await db.update_post_by_message(
-                    ch.id, m.id, text=rl.text, entities=ser_entities(rl.entities), buttons=ser_markup(rl.markup)
-                )
+                saved = dict(buttons=ser_markup(rl.markup))
+                if not rich:
+                    saved.update(text=rl.text, entities=ser_entities(rl.entities))
+                await db.update_post_by_message(ch.id, m.id, **saved)
             except Exception:  # the channel is right; the saved copy will be corrected by the next sync
                 log.warning("could not save the new links of %s", m.id, exc_info=True)
             if progress:

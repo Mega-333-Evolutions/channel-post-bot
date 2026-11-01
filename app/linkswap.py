@@ -13,6 +13,7 @@ from typing import Optional
 from telethon import types
 from telethon.helpers import add_surrogate, del_surrogate
 
+from .richmsg import is_rich_message
 from .tgutil import button_url, is_callback_button, with_url
 
 USERNAME_RX = re.compile(r"^[A-Za-z0-9_]{1,32}$")
@@ -140,8 +141,9 @@ class MsgChange:
 
 def compute_message_changes(msg, old: str, new: str, *, include_typed: bool = True, include_posts: bool = False) -> tuple:
     """Returns (MsgChange or None, number_of_skipped_post_links)."""
-    text = msg.message or ""
-    ents = list(msg.entities or [])
+    rich = is_rich_message(msg)  # the text of a rich message is blocks: only its buttons are changed
+    text = "" if rich else (msg.message or "")
+    ents = [] if rich else list(msg.entities or [])
     skipped = 0
     n_typed = n_links = n_btn = 0
 

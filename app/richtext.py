@@ -546,5 +546,7 @@ CHEAT_SHEET = (
     "<b>Example</b>\n"
     "<pre>**Attack on Titan** - Episode 12\n"
     "__Hindi__ | ||spoiler||\n"
-    "[Watch here](https://t.me/yourchannel)</pre>"
+    "[Watch here](https://t.me/yourchannel)</pre>\n\n"
+    "🧩 Headings, lists, tables, expandable sections, math, maps, pictures and buttons are <b>rich messages</b> - "
+    "see /rich."
 )

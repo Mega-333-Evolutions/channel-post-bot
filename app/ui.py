@@ -4,6 +4,7 @@ from __future__ import annotations
 from telethon import Button
 
 from .buttons import count, grid_label, link_positions, missing_links
+from .richmsg import rich_of
 from .tgutil import esc, post_link, short
 
 CANCEL = [[Button.inline("✖️ Cancel", "cx")]]
@@ -30,7 +31,12 @@ def panel_text(p, ch, note=None) -> str:
     lines = [f"<b>Post #{p.id}</b> · {state}", f"Channel: <b>{esc(ch.title)}</b>"]
     if p.status == "sent" and p.message_id:
         lines.append(f'<a href="{post_link(ch, p.message_id)}">Open in the channel</a>')
-    lines.append(f"Type: {KIND_ICON.get(p.media_kind, '📎')} {KIND_NAME.get(p.media_kind, p.media_kind)}")
+    rich = rich_of(p)
+    if rich is not None:
+        origin = {"html": "typed as HTML", "markdown": "typed as Markdown"}.get(rich.fmt, "made in Telegram")
+        lines.append(f"Type: 🧩 rich message ({origin})")
+    else:
+        lines.append(f"Type: {KIND_ICON.get(p.media_kind, '📎')} {KIND_NAME.get(p.media_kind, p.media_kind)}")
     n, miss = count(p.buttons), missing_links(p.buttons)
     lines.append(f"Buttons: {n}" + (f" (⚠️ {miss} without a link)" if miss else ""))
     if p.source == "adopted":
@@ -47,18 +53,17 @@ def panel_keyboard(p) -> list:
     kb = []
     for r, row in enumerate(p.buttons or []):
         kb.append([Button.inline(grid_label(b), f"bs:{pid}:{r}:{c}") for c, b in enumerate(row)])
+    rich = rich_of(p) is not None
     kb.append(
-        [
-            Button.inline("✏️ Caption" if p.media_kind else "✏️ Text", f"et:{pid}"),
-            Button.inline("🖼 Media", f"em:{pid}"),
-        ]
+        [Button.inline("✏️ Caption" if p.media_kind else "✏️ Text", f"et:{pid}")]
+        + ([] if rich else [Button.inline("🖼 Media", f"em:{pid}")])  # a rich message has no media slot
     )
     row3 = [Button.inline("➕ Button", f"ba:{pid}"), Button.inline("📋 Set buttons", f"bp:{pid}")]
     if p.buttons:
         row3.append(Button.inline("🧹 Clear", f"bc:{pid}"))
     kb.append(row3)
     extra = []
-    if not p.media_kind:
+    if not p.media_kind and not rich:
         extra.append(Button.inline(f"🔗 Link preview: {'on' if p.link_preview else 'off'}", f"lp:{pid}"))
     if p.media_kind and p.status == "draft":
         extra.append(Button.inline("🚫 Remove media", f"rm:{pid}"))

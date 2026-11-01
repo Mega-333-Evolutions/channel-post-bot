@@ -38,6 +38,7 @@ from .db import as_utc, utcnow
 from .replace_engine import fetch_messages
 from .repost_engine import delete_batch
 from .restrictions import message_restriction, norm_text, probe_channel
+from .richmsg import Rich, entry as rich_entry, is_rich_message, plain_of_message, rich_from_received, rich_of, with_fingerprint
 from .tgutil import classify_media, explain_rpc, media_from_ref, media_info, peer_of, ser_entities, ser_markup
 
 log = logging.getLogger(__name__)
@@ -127,12 +128,19 @@ def stored_media_key(ref: Optional[str]) -> Optional[tuple]:
         return ("unreadable", ref[:40])  # differs from anything real: the saved reference gets replaced
 
 
+def live_rich(m) -> Optional[Rich]:
+    """The rich message the live message is (as blocks), or None for an ordinary post."""
+    rm = getattr(m, "rich_message", None)
+    return rich_from_received(rm) if rm is not None else None
+
+
 def live_fields(m) -> dict:
     """The saved-post fields of a message as it is in the channel now."""
     kind, ref = media_info(m)
+    rich = live_rich(m)
     return {
-        "text": m.message or "",
-        "entities": ser_entities(m.entities),
+        "text": plain_of_message(m) if rich is not None else (m.message or ""),
+        "entities": [rich_entry(rich)] if rich is not None else ser_entities(m.entities),
         "buttons": ser_markup(m.reply_markup),
         "media_kind": kind,
         "media_file_id": ref,
@@ -140,8 +148,8 @@ def live_fields(m) -> dict:
 
 
 def message_supported(m) -> bool:
-    """Something My posts can show and edit: text, or a photo / video / GIF / audio / file."""
-    return bool((m.message or "").strip()) or classify_media(m) is not None
+    """Something My posts can show and edit: text, a rich message, or a photo / video / GIF / audio / file."""
+    return bool((m.message or "").strip()) or classify_media(m) is not None or is_rich_message(m)
 
 
 def adopt_fields(m) -> dict:
@@ -185,10 +193,24 @@ def diff_post(p, m) -> Diff:
     """What differs between the saved post `p` and the live message `m`."""
     live = live_fields(m)
     fields: dict = {}
-    if (p.text or "") != live["text"]:
-        fields["text"] = live["text"]
-    if list(p.entities or []) != live["entities"]:
-        fields["entities"] = live["entities"]
+    saved_rich, now_rich = rich_of(p), live_rich(m) if is_rich_message(m) else None
+    first_look = False
+    if saved_rich is None and now_rich is None:
+        if (p.text or "") != live["text"]:
+            fields["text"] = live["text"]
+        if list(p.entities or []) != live["entities"]:
+            fields["entities"] = live["entities"]
+    elif now_rich is not None:
+        # A rich message is compared by what Telegram shows of it (a fingerprint of its blocks), never by its text: the
+        # saved copy keeps the source the bot sent. A post that became rich in the channel is taken over as its blocks.
+        if saved_rich is None or (saved_rich.fp is not None and saved_rich.fp != now_rich.fp):
+            fields["text"], fields["entities"] = live["text"], live["entities"]
+        elif saved_rich.fp is None:  # the bot's own rich post, seen for the first time: remember what Telegram shows
+            fields["entities"] = [rich_entry(with_fingerprint(saved_rich, now_rich.fp))]
+            first_look = True
+    elif live["text"].strip() or live["media_kind"] is not None:
+        # the channel shows an ordinary post where a rich message was saved (an empty answer is not trusted)
+        fields["text"], fields["entities"] = live["text"], live["entities"]
     # media: replaced media is taken over; media that seems to have vanished is not (a message can't lose its media)
     if live["media_kind"] is not None:
         if p.media_kind != live["media_kind"] or stored_media_key(p.media_file_id) != media_key(m.media):
@@ -199,7 +221,9 @@ def diff_post(p, m) -> Diff:
             fields["buttons"] = live["buttons"]
     elif p.buttons:
         missing = True
-    quiet = set(fields) == {"text"} and (p.text or "").strip() == live["text"].strip()
+    quiet = (set(fields) == {"text"} and (p.text or "").strip() == live["text"].strip()) or (
+        first_look and set(fields) == {"entities"}
+    )
     return Diff(fields, missing, quiet)
 
 

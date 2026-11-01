@@ -180,6 +180,14 @@ class FakeTG(FakeChannelClient):
                 return None
         if isinstance(req, functions.channels.DeleteMessagesRequest):
             self.deleted.append(list(req.id))
+        if isinstance(req, functions.messages.SendMessageRequest) and req.rich_message is not None:
+            self.sent.append(("rich", req.peer, req.rich_message, {"reply_markup": req.reply_markup}))
+            if isinstance(req.peer, types.InputPeerUser):  # a chat with a person (the preview): nothing lands in a channel
+                if self.fail.get("SendMessageRequest") is not None:
+                    raise self.fail["SendMessageRequest"]
+                bytes(req)  # it must serialise
+                self._rich(req.rich_message)  # Telegram has to be able to make blocks of it
+                return types.UpdateShortSentMessage(id=next(self.ids), pts=0, pts_count=0, date=None, out=True)
         return await super().__call__(req)
 
 

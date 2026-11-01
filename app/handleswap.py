@@ -13,6 +13,7 @@ from telethon import types
 from telethon.helpers import add_surrogate, del_surrogate
 
 from .linkswap import MsgChange, apply_span_replacements
+from .richmsg import is_rich_message
 from .tgutil import button_url, is_callback_button, with_text
 
 # a "@name" that follows one of these is part of something else: an e-mail (a@bro), a link (t.me/x@bro, ?u=@bro) ...
@@ -44,8 +45,9 @@ def find_mention_spans(sur: str, entities, name: str) -> tuple:
 def compute_handle_changes(msg, old: str, new: str) -> tuple:
     """(MsgChange or None, number of mentions skipped because they are part of a link) - same shape as
     linkswap.compute_message_changes, so the /swap engine can apply it."""
-    text = msg.message or ""
-    ents = list(msg.entities or [])
+    rich = is_rich_message(msg)  # the text of a rich message is blocks: only its buttons are changed
+    text = "" if rich else (msg.message or "")
+    ents = [] if rich else list(msg.entities or [])
     sur = add_surrogate(text)
     spans, skipped = find_mention_spans(sur, ents, old) if text else ([], 0)
     new_sur, new_ents = sur, [copy.copy(e) for e in ents]

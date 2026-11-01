@@ -381,19 +381,31 @@ async def flood_retry(factory: Callable[[], Awaitable[Any]], tries: int = 4) -> 
 
 
 async def edit_raw(
-    client, peer, message_id: int, *, text: Optional[str] = None, entities=None, markup=None, preview=None, media=None
+    client,
+    peer,
+    message_id: int,
+    *,
+    text: Optional[str] = None,
+    entities=None,
+    markup=None,
+    preview=None,
+    media=None,
+    rich_message=None,
 ):
     """messages.editMessage with every field explicit.
 
-    `markup=None` together with `text` removes the keyboard (that is how Telegram behaves);
+    `markup=None` together with `text` (or `rich_message`) removes the keyboard (that is how Telegram behaves);
     a markup-only edit (text=None) leaves the text alone. `media` (an InputMedia) replaces the photo / file.
+    `rich_message` (an InputRichMessage*) makes the message that rich message instead of text.
     """
     kw: dict = {"peer": peer, "id": message_id}
     if markup is not None:
         kw["reply_markup"] = markup
     if media is not None:
         kw["media"] = media
-    if text is not None:
+    if rich_message is not None:
+        kw["rich_message"] = rich_message
+    elif text is not None:
         kw["message"] = text
         kw["entities"] = list(entities or [])
         if preview is not None:
