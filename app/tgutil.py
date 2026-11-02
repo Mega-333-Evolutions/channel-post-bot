@@ -467,6 +467,16 @@ _HINTS = {
 }
 
 
+# Telegram's own error codes (the name of the Python class is only "BadRequestError" for the ones Telethon doesn't know)
+_CODE_HINTS = {
+    "RICH_MESSAGE_BLOCK_INVALID": "Telegram would not take one of the blocks of that rich message.",
+}
+
+
 def explain_rpc(e: BaseException) -> str:
     name = type(e).__name__
-    return f"Telegram refused ({name}). " + _HINTS.get(name, str(e)[:200])
+    code = getattr(e, "message", None) or ""
+    hint = _HINTS.get(name)
+    if hint is None and code in _CODE_HINTS:
+        hint = f"{_CODE_HINTS[code]} ({code})"
+    return f"Telegram refused ({name}). " + (hint if hint is not None else str(e)[:200])

@@ -12,6 +12,7 @@ it like any other formatting.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import logging
@@ -22,8 +23,9 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 from telethon import errors, functions, types, utils
+from telethon.tl.tlobject import TLObject
 
-from .tgutil import _b64, _unb64
+from .tgutil import _b64, _unb64, flood_retry
 
 log = logging.getLogger(__name__)
 
@@ -83,7 +85,53 @@ def to_input(r: Rich):
         return types.InputRichMessageHTML(html=r.source, **flags)
     if r.fmt == "markdown":
         return types.InputRichMessageMarkdown(markdown=r.source, **flags)
-    return _unb64(r.source)
+    inp = copy.copy(_unb64(r.source))
+    # (a message saved by an older version may still hold blocks in Telegram's own form)
+    inp.blocks = inputify(inp.blocks, _user_ids(inp.users))
+    return inp
+
+
+def _input_geo(geo):
+    if isinstance(geo, types.GeoPoint):
+        return types.InputGeoPoint(lat=geo.lat, long=geo.long, accuracy_radius=geo.accuracy_radius)
+    if isinstance(geo, types.InputGeoPoint):
+        return geo
+    return types.InputGeoPointEmpty()
+
+
+def _user_ids(users) -> set:
+    return {u.user_id for u in users or [] if isinstance(getattr(u, "user_id", None), int)}
+
+
+def inputify(o, users: Optional[set] = None):
+    """Blocks the way Telegram wants them SENT. What it hands out and what it takes are the same blocks except where a
+    block holds something only Telegram can make: a map holds a stored point (with an access hash) when it comes in, and
+    must hold an input point (latitude and longitude) when it goes out.
+
+    `users`: the ids of the accounts that the message may mention (it carries their access data). A text mention of
+    anybody else would be refused, so it stays as the plain name; None leaves all mentions alone.
+
+    A thinking block (the "thinking ..." part of a message that is being streamed) is for drafts only - the Bot API says so
+    of <tg-thinking> - and a message that is sent can't hold one: it goes out as an expandable section called "Thinking"."""
+    if isinstance(o, types.PageBlockMap):
+        return types.InputPageBlockMap(
+            geo=_input_geo(o.geo), zoom=o.zoom, w=o.w, h=o.h, caption=inputify(o.caption, users)
+        )
+    if isinstance(o, types.PageBlockThinking):
+        return types.PageBlockDetails(
+            blocks=[types.PageBlockParagraph(inputify(o.text, users))], title=types.TextPlain("Thinking")
+        )
+    if users is not None and isinstance(o, types.TextMentionName) and o.user_id not in users:
+        return inputify(o.text, users)
+    if isinstance(o, list):
+        return [inputify(x, users) for x in o]
+    if isinstance(o, TLObject):
+        new = copy.copy(o)
+        for key, value in vars(o).items():
+            if isinstance(value, (list, TLObject)):
+                setattr(new, key, inputify(value, users))
+        return new
+    return o
 
 
 def blank_references(inp):
@@ -140,7 +188,7 @@ def fingerprint(rm) -> str:
     """Identifies what a rich message shows (its blocks; the file references of its pictures change from fetch to fetch)."""
     h = hashlib.sha1()
     for b in getattr(rm, "blocks", None) or []:
-        h.update(bytes(b))
+        h.update(bytes(inputify(b)))  # (a map's access hash is not part of what it shows)
     h.update(b"r" if getattr(rm, "rtl", None) else b"-")
     return h.hexdigest()[:20]
 
@@ -162,7 +210,7 @@ def input_of(rm, users: Optional[list] = None):
     photos = _input_files(getattr(rm, "photos", None), utils.get_input_photo, types.InputPhotoEmpty)
     docs = _input_files(getattr(rm, "documents", None), utils.get_input_document, types.InputDocumentEmpty)
     return types.InputRichMessage(
-        blocks=list(rm.blocks),
+        blocks=inputify(list(rm.blocks), _user_ids(users)),
         rtl=True if getattr(rm, "rtl", None) else None,
         photos=photos or None,
         documents=docs or None,
@@ -225,6 +273,119 @@ async def received(client, event) -> Optional[Rich]:
     if not getattr(rm, "blocks", None):
         raise RichError("That rich message has no content.")
     return rich_from_received(rm, await input_users(client, mention_ids(rm.blocks)))
+
+
+# --------------------------------------------------------------- when Telegram refuses a block of a received message
+_BLOCK_NAMES = {
+    "Heading1": "heading", "Heading2": "heading", "Heading3": "heading", "Heading4": "heading", "Heading5": "heading",
+    "Heading6": "heading", "Title": "heading", "Subtitle": "heading", "Header": "heading", "Subheader": "heading",
+    "Paragraph": "paragraph", "Preformatted": "code", "Blockquote": "quote", "BlockquoteBlocks": "quote",
+    "Pullquote": "pull quote", "List": "list", "OrderedList": "numbered list", "Details": "expandable section",
+    "Math": "math", "Map": "map", "ButtonRow": "buttons", "Photo": "picture", "Video": "video", "Audio": "audio",
+    "Document": "file", "Collage": "collage", "Slideshow": "slideshow", "Table": "table", "Divider": "rule",
+    "Anchor": "anchor", "Footer": "footer", "Unsupported": "a block this version does not know",
+    "Thinking": "thinking block", "Embed": "embedded page", "EmbedPost": "embedded post", "Channel": "channel card",
+    "RelatedArticles": "related articles", "AuthorDate": "author line", "Kicker": "kicker", "Cover": "cover",
+}
+MAX_PROBES = 60  # blocks that are looked through one by one (at most) when Telegram refuses a message
+
+
+def block_name(b) -> str:
+    """What a block is called to the owner: "map", "table" ..."""
+    raw = re.sub(r"^(?:Input)?PageBlock", "", type(b).__name__)
+    return _BLOCK_NAMES.get(raw, raw.lower() or "block")
+
+
+def is_block_invalid(e: BaseException) -> bool:
+    """Telegram says one of the blocks it was given is not acceptable (RICH_MESSAGE_BLOCK_INVALID)."""
+    return "RICH_MESSAGE_BLOCK_INVALID" in (getattr(e, "message", None) or str(e))
+
+
+async def refused_blocks(client, peer, r: Rich, *, pause: float = 0.4) -> Optional[List[int]]:
+    """The numbers (0, 1, 2 ...) of the top-level blocks of a received rich message that Telegram will not take back.
+
+    Called once the whole message has been refused. Found by sending groups of the blocks to `peer` - a chat with the
+    owner - quietly, and deleting them again straight away. None when it can't be told: the message is typed (Telegram
+    reads that itself), it has too many blocks to look through, no single block is at fault (every part is taken), or
+    something else than a refused block went wrong."""
+    if r.fmt != "blocks":
+        return None
+    whole = to_input(r)
+    blocks = list(whole.blocks)
+    if not blocks or len(blocks) > MAX_PROBES:
+        return None
+
+    async def accepted(idx: List[int]) -> bool:
+        part = copy.copy(whole)
+        part.blocks = [blocks[i] for i in idx]
+        try:
+            made = await flood_retry(
+                lambda: client(
+                    functions.messages.SendMessageRequest(peer=peer, message="", rich_message=part, silent=True)
+                )
+            )
+        except errors.RPCError as e:
+            if is_block_invalid(e):
+                return False
+            raise
+        try:
+            await client(functions.messages.DeleteMessagesRequest(id=[sent_message(made).id], revoke=True))
+        except Exception:  # noqa: BLE001 - a test message that stays is only clutter
+            log.info("could not delete a test message of the rich-message check")
+        await asyncio.sleep(pause)
+        return True
+
+    async def find(idx: List[int], known: bool = False) -> List[int]:
+        if not known and await accepted(idx):
+            return []
+        if len(idx) == 1:
+            return list(idx)
+        mid = len(idx) // 2
+        return await find(idx[:mid]) + await find(idx[mid:])
+
+    try:
+        bad = await find(list(range(len(blocks))), known=True)  # (the whole message was refused: no need to ask again)
+    except Exception as e:  # noqa: BLE001 - this is only a help for the owner
+        log.info("could not find the refused blocks: %s", type(e).__name__)
+        return None
+    return bad or None
+
+
+def block_labels(r: Rich, idx: List[int]) -> str:
+    """"4 (map), 9 (table)": the blocks numbered `idx` (from 0), counted from 1 and named."""
+    blocks = to_input(r).blocks
+    return ", ".join(f"{i + 1} ({block_name(blocks[i])})" for i in sorted(set(idx)) if 0 <= i < len(blocks))
+
+
+def block_count(r: Rich) -> int:
+    return len(to_input(r).blocks) if r.fmt == "blocks" else 0
+
+
+def digest(r: Rich) -> str:
+    """Short mark of what `r` holds (so a button made for one message is not used on another)."""
+    return hashlib.sha1(f"{r.fmt}:{r.source}".encode()).hexdigest()[:6]
+
+
+def pack_blocks(idx: List[int]) -> str:
+    """Block numbers as one short word (the bits of a number, in base 36) - small enough for a button."""
+    n, out = sum(1 << i for i in set(idx)), ""
+    while n:
+        n, d = divmod(n, 36)
+        out = "0123456789abcdefghijklmnopqrstuvwxyz"[d] + out
+    return out or "0"
+
+
+def unpack_blocks(word: str) -> List[int]:
+    n = int(word, 36)
+    return [i for i in range(n.bit_length()) if n >> i & 1]
+
+
+def without_blocks(r: Rich, drop: List[int]) -> Rich:
+    """The received rich message `r` without the top-level blocks numbered `drop` (what Telegram saw of it changes, so the
+    fingerprint is forgotten)."""
+    inp = to_input(r)
+    inp.blocks = [b for i, b in enumerate(inp.blocks) if i not in set(drop)]
+    return Rich("blocks", _b64(inp), r.rtl, r.noautolink, None)
 
 
 # ------------------------------------------------------------------------- plain text (lists, panels, previews)

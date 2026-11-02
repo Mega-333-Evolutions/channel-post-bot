@@ -188,8 +188,17 @@ message that already contains them, sent to the bot) and no link-preview switch;
 and the post-link changes of `/repost` change its **buttons** only - the links and @names inside its text are left as they
 are (undo restores the buttons the same way); Auto-suggest does not propose a next post from one.
 
+**A rich message that was made in Telegram** can't be handed on as it is: the bot sends its blocks again, and Telegram hands
+out and takes in the blocks in slightly different forms (a map comes with a stored point and goes out with plain latitude /
+longitude; a mention of someone the bot can't look up goes out as the plain name; a "thinking" block - the thinking part of a
+streamed answer, which the Bot API allows in drafts only - goes out as an expandable section called **Thinking** with the same
+text). The bot converts that, so the post looks the same. If Telegram still refuses it (`RICH_MESSAGE_BLOCK_INVALID`), **👁 Preview** (and **🚀 Publish**) say **which blocks**
+it won't take - the bot tries them one by one in your chat, silently, and deletes each test message at once - and a draft can go
+on without them with **✂️ Leave those out**. Send me the names of the blocks it lists if one keeps being refused.
+
 **Limits** (Telegram's): 32768 characters, 500 blocks, 16 levels of nesting, 50 pictures / files, 20 table columns. The
-bot checks the length; for the rest Telegram's answer is shown (`see /rich for the syntax`) and nothing is published.
+bot checks the length; for the rest Telegram's answer is shown (for typed text `see /rich for the syntax`; for a rich message
+made in Telegram the refused blocks, as above) and nothing is published.
 
 **Not tested against real Telegram.** The tests prove what the bot builds and sends (every request is serialised with the real
 Telethon) against a simulation that stands in for Telegram's reading of HTML / Markdown, so the following are assumptions
@@ -200,7 +209,10 @@ Telegram lets an edit turn a plain post into a rich one and back; a rich message
 `https://` pictures typed into a text; a button inside the text of a rich message that needs its bot (`callback_data`) only
 works for the bot that made it, so in a forwarded message it belongs to another bot; the blocks Telegram returns for a post
 are the same from one read to the next (the sync tells an admin's edit by them - if they ever differ, the saved copy is
-simply taken over again); older Telegram apps may not show rich messages at all. If Telegram refuses something, the bot's message says so and nothing is changed.
+simply taken over again); that the conversions above (map, mention, thinking block) are all a forwarded rich message needs - a
+block of another kind may be refused in the form Telegram hands it out, and then the preview names it (that is what the list of
+refused blocks is for);
+older Telegram apps may not show rich messages at all. If Telegram refuses something, the bot's message says so and nothing is changed.
 
 ## `/swap`, `/replace` and `/handleswap`
 
@@ -626,5 +638,6 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
 
 `tests/test_richtext.py` covers the HTML / Markdown reader (including random and hostile input), `tests/test_markup_flows.py`
 the flows that use it, `tests/test_rich.py` and `tests/test_rich_flows.py` the rich messages (what is recognised, what is sent,
-receiving, editing, broadcast, the userbot, /swap, the sync and /repost), `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
+receiving, editing, broadcast, the userbot, /swap, the sync and /repost), `tests/test_rich_refused.py` the blocks Telegram
+refuses (the conversion, finding them, ✂️ Leave those out), `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
 bot-first, userbot-second edit of `/replace` and My posts.

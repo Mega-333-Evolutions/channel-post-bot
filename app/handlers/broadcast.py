@@ -36,6 +36,7 @@ from ..common import (
 )
 from ..db import utcnow
 from ..expiry import human, parse_duration, stamp
+from ..richmsg import block_count, block_labels, is_block_invalid, refused_blocks, rich_of
 from ..tgutil import esc, explain_rpc, flood_retry, peer_of
 from ..ui import CANCEL
 from .panel import markup_note, read_content
@@ -187,10 +188,16 @@ def register(ctx: Ctx) -> None:
         if not chans:
             clear_state(ctx, uid)
             raise UserError("No channels any more. Register one with /addchannel first.")
+        shape = shape_of(draft)
         try:
-            await send_post(client, await event.get_input_chat(), shape_of(draft))  # the preview
+            await send_post(client, await event.get_input_chat(), shape)  # the preview
         except errors.RPCError as e:
-            raise UserError("❌ " + explain_rpc(e) + "\nThe message can't be sent like this - send it again.")
+            rich, which = rich_of(shape), ""
+            if rich is not None and rich.fmt == "blocks" and is_block_invalid(e):  # name the blocks Telegram won't take
+                bad = await refused_blocks(client, await event.get_input_chat(), rich)
+                if bad:
+                    which = f"\nIt won't take these blocks (of {block_count(rich)}): {block_labels(rich, bad)}."
+            raise UserError("❌ " + explain_rpc(e) + which + "\nThe message can't be sent like this - send it again.")
         token = secrets.token_hex(4)
         ctx.pending[token] = draft
         clear_state(ctx, uid)

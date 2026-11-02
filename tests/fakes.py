@@ -303,6 +303,36 @@ class FakeChannelClient:
         else:
             m._hidden, m.reply_markup = None, markup
 
+    def _check_blocks(self, inp):
+        """What Telegram refuses in the blocks of an InputRichMessage (RICH_MESSAGE_BLOCK_INVALID), as far as it is known: a
+        map that holds a stored point (the blocks it hands out hold those; it wants an input point back), a block that its
+        layer doesn't know, a thinking block (the Bot API: drafts only) and a text mention of somebody the message carries
+        no access data for.
+        `refuse_blocks`: further block classes (names) a test wants refused."""
+        users = {getattr(u, "user_id", None) for u in inp.users or []}
+        refused = (types.PageBlockMap, types.PageBlockUnsupported, types.PageBlockThinking)
+        extra = set(getattr(self, "refuse_blocks", ()))
+
+        def walk(o):
+            if (
+                isinstance(o, refused)
+                or type(o).__name__ in extra
+                or (isinstance(o, types.TextMentionName) and o.user_id not in users)
+            ):
+                raise errors.BadRequestError(
+                    functions.messages.SendMessageRequest(peer=types.InputPeerSelf(), message=""),
+                    "RICH_MESSAGE_BLOCK_INVALID",
+                    400,
+                )
+            if isinstance(o, (list, tuple)):
+                for x in o:
+                    walk(x)
+            elif hasattr(o, "to_dict") and not isinstance(o, (str, bytes)):
+                for v in vars(o).values():
+                    walk(v)
+
+        walk(list(inp.blocks))
+
     def _rich(self, inp):
         """What Telegram makes of an InputRichMessage*: for HTML / Markdown the "parse" is one paragraph holding the source
         (the same source always gives the same blocks); a message sent as blocks keeps them, with its pictures and files."""
@@ -315,6 +345,7 @@ class FakeChannelClient:
                 blocks=[types.PageBlockParagraph(types.TextPlain(f"[{kind}]{src}"))], photos=[], documents=[], rtl=inp.rtl
             )
         if isinstance(inp, types.InputRichMessage):
+            self._check_blocks(inp)
             photos = [
                 types.Photo(p.id, p.access_hash, p.file_reference, NOW, [], 1) for p in inp.photos or []
             ]

@@ -115,6 +115,7 @@ class FakeTG(FakeChannelClient):
         self.edits = []
         self.deleted = []
         self.ids = itertools.count(100)
+        self.dm_rich_ids = []  # ids of the rich messages the bot sent to a person (previews and checks)
         self.parse_mode = "html"
         self.rights = dict(admin=True, post=True, edit=True, delete=True, invite=False, add_admins=False)
 
@@ -181,13 +182,15 @@ class FakeTG(FakeChannelClient):
         if isinstance(req, functions.channels.DeleteMessagesRequest):
             self.deleted.append(list(req.id))
         if isinstance(req, functions.messages.SendMessageRequest) and req.rich_message is not None:
-            self.sent.append(("rich", req.peer, req.rich_message, {"reply_markup": req.reply_markup}))
+            self.sent.append(("rich", req.peer, req.rich_message, {"reply_markup": req.reply_markup, "silent": req.silent}))
             if isinstance(req.peer, types.InputPeerUser):  # a chat with a person (the preview): nothing lands in a channel
                 if self.fail.get("SendMessageRequest") is not None:
                     raise self.fail["SendMessageRequest"]
                 bytes(req)  # it must serialise
                 self._rich(req.rich_message)  # Telegram has to be able to make blocks of it
-                return types.UpdateShortSentMessage(id=next(self.ids), pts=0, pts_count=0, date=None, out=True)
+                mid = next(self.ids)
+                self.dm_rich_ids.append(mid)
+                return types.UpdateShortSentMessage(id=mid, pts=0, pts_count=0, date=None, out=True)
         return await super().__call__(req)
 
 

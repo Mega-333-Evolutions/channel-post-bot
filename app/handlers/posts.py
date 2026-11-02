@@ -36,7 +36,20 @@ from ..common import (
 )
 from ..db import utcnow
 from ..repost_engine import delete_batch
-from ..richmsg import is_rich
+from ..richmsg import (
+    block_count,
+    block_labels,
+    digest,
+    entry as rich_entry,
+    is_block_invalid,
+    is_rich,
+    pack_blocks,
+    plain_of,
+    refused_blocks,
+    rich_of,
+    unpack_blocks,
+    without_blocks,
+)
 from ..tgutil import classify_media, esc, explain_rpc, pack_file_id, peer_of, post_link
 from ..ui import CANCEL, post_label
 from ..userbot import delete_problem_text
@@ -363,6 +376,57 @@ def register(ctx: Ctx) -> None:
         await commit_buttons(event, post, ch, rows, new_msg=False)
 
     # ------------------------------------------------------- preview / publish
+    async def rich_refusal(event, post, e, typed: str, tail: str = "") -> None:
+        """Telegram refused to make a rich message of the post: say why.
+
+        A rich message that was typed (HTML / Markdown) is Telegram's to read: `typed` tells the owner to check the syntax. One
+        that was made in Telegram and sent to the bot is kept block by block, and Telegram does not say which block it
+        dislikes - so the blocks are tried out, in the owner's chat and quietly, to tell which ones it won't take (see
+        richmsg.refused_blocks). A draft can then go on without those: the ✂️ button. `tail` closes the message."""
+        rich = rich_of(post)
+        head = "❌ " + explain_rpc(e)
+        if rich is None or rich.fmt != "blocks":
+            raise UserError(f"{head}\n{typed}")
+        if not is_block_invalid(e):
+            raise UserError(f"{head}\nTelegram could not make that rich message.\n{tail}".strip())
+        bad = await refused_blocks(client, await event.get_input_chat(), rich)
+        if not bad:
+            raise UserError(
+                f"{head}\nI could not tell which block it is - /rich shows how to type the message as HTML / Markdown instead.\n{tail}".strip()
+            )
+        if len(bad) >= block_count(rich):
+            raise UserError(
+                f"{head}\nIt won't take any block of that message as it is - /rich shows how to type it as HTML / Markdown instead.\n{tail}".strip()
+            )
+        lines = [
+            esc(head),
+            f"It won't take these blocks (of {block_count(rich)}): {esc(block_labels(rich, bad))}. The others are fine.",
+        ]
+        if tail:
+            lines.append(esc(tail))
+        buttons = []
+        if post.status == "draft":
+            lines.append("✂️ <b>Leave those out</b> keeps the rest of the message as the post.")
+            buttons.append([Button.inline("✂️ Leave those out", f"rx:{post.id}:{digest(rich)}:{pack_blocks(bad)}")])
+        buttons.append([Button.inline("↩️ Back", f"po:{post.id}")])
+        await say(event, "\n".join(lines), buttons)
+
+    @on_cb(ctx, "rx")
+    async def cb_leave_out(event, parts):
+        post, ch = await load_post(ctx, parts[0])
+        rich = rich_of(post)
+        if post.status != "draft" or rich is None or rich.fmt != "blocks" or parts[1] != digest(rich):
+            raise UserError("The post is not the one that was checked any more - press 👁 Preview again.")
+        total = block_count(rich)
+        drop = [i for i in unpack_blocks(parts[2]) if i < total]
+        if not drop:
+            raise UserError("Those blocks are not in the post any more.")
+        if len(drop) >= total:
+            raise UserError("Nothing would be left of the message. Send it again in another form, or as HTML / Markdown (/rich).")
+        kept = without_blocks(rich, drop)
+        post = await apply_edit(ctx, post, ch, text=plain_of(kept), entities=[rich_entry(kept)])
+        await show_panel(ctx, event, post.id, note=f"✂️ Left out: {esc(block_labels(rich, drop))}.\n👁 Preview shows what is left.")
+
     @on_cb(ctx, "pv")
     async def cb_preview(event, parts):
         post, _ = await load_post(ctx, parts[0])
@@ -373,7 +437,8 @@ def register(ctx: Ctx) -> None:
         except errors.RPCError as e:
             if not is_rich(post):
                 raise
-            raise UserError("❌ " + explain_rpc(e) + "\nTelegram could not make that rich message - see /rich for the syntax.")
+            await rich_refusal(event, post, e, typed="Telegram could not make that rich message - see /rich for the syntax.")
+            return
         miss = missing_links(post.buttons)
         if miss:
             await say(event, f"👆 Preview. ⚠️ {miss} button(s) without a link are not shown.")
@@ -401,6 +466,9 @@ def register(ctx: Ctx) -> None:
         try:
             sent = await send_post(client, peer_of(ch), post)
         except errors.RPCError as e:
+            if is_rich(post):
+                await rich_refusal(event, post, e, typed="The post was NOT published.", tail="The post was NOT published.")
+                return
             raise UserError("❌ " + explain_rpc(e) + "\nThe post was NOT published.")
         await db.release_slot(ch.id, sent.id, keep_pid=post.id)  # the sync may have picked the message up a moment ago
         post = await db.update_post(post.id, status="sent", message_id=sent.id, sent_at=utcnow())
