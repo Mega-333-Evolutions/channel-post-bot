@@ -19,7 +19,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           # 1. Clone your Hugging Face Space
-          git clone https://user:${HF_TOKEN}@huggingface.co/spaces/Mega-Evolutions/ButtonBot hf_space
+          git clone https://user:${HF_TOKEN}@huggingface.co/spaces/kailashhh/Channel-Post-Bot hf_space
           
           # 2. Backup HF README.md to a safe temporary location
           if [ -f "hf_space/README.md" ]; then
