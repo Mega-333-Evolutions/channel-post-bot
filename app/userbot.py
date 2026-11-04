@@ -181,6 +181,14 @@ class Userbot:
             await self.connect()
         return self.editor(ch) if self.ready else None
 
+    async def reader_for(self, ch) -> Optional["UserbotReader"]:
+        """A reader for posts in `ch`, or None when no userbot is usable. The caller must always `await reader.close()`."""
+        if not self.enabled:
+            return None
+        if not self.ready:
+            await self.connect()
+        return UserbotReader(self, ch) if self.ready else None
+
 
 def _rights_dict(rights) -> dict:
     return {k: v for k, v in rights.to_dict().items() if k != "_"} if rights is not None else {}
@@ -488,6 +496,42 @@ class UserbotDeleter(_ChannelJob):
             await flood_retry(
                 lambda part=part: client(functions.channels.DeleteMessagesRequest(channel=self.peer, id=part))
             )
+
+
+class UserbotReader(_ChannelJob):
+    """Reads posts of ONE channel as the userbot: what the bot cannot see (a post of another bot, the buttons it carries).
+    Being a member of the channel is enough - no right is needed. Call close() when done, whatever happened."""
+
+    WHAT = "read posts"
+    VERB = "read"
+
+    async def _ensure_right(self) -> None:
+        return None  # a member can read
+
+    async def _member_peer(self):
+        peer = await super()._member_peer()
+        if peer is not None:
+            return peer
+        try:  # the account may be in the channel without it being in its address book yet: look through its chats
+            async for d in self.ub.client.iter_dialogs():
+                if getattr(d.entity, "id", None) == self.ch.id and isinstance(d.entity, types.Channel):
+                    return utils.get_input_peer(d.entity)
+        except errors.RPCError:
+            pass
+        return None
+
+    async def read(self, message_id: Optional[int] = None, limit: int = 3) -> list:
+        """The post `message_id` (a list of one), or the newest `limit` posts, newest first - as the userbot sees them."""
+        await self._begin()
+        client = self.ub.client
+        try:
+            if message_id:
+                res = await flood_retry(lambda: client.get_messages(self.peer, ids=[message_id]))
+            else:
+                res = await flood_retry(lambda: client.get_messages(self.peer, limit=limit))
+        except errors.RPCError as e:
+            raise UserbotRefused(f"Telegram refused the userbot ({type(e).__name__}).", type(e).__name__)
+        return [m for m in (res if isinstance(res, (list, tuple)) else [res]) if m is not None]
 
 
 _EDIT_HINTS = {

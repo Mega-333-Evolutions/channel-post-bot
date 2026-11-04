@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.config import DEFAULT_ERROR_LOG_CHAT_ID, Config, default_session_path, load_config
+from app.config import DEFAULT_AUTORENAME_BOT_ID, DEFAULT_ERROR_LOG_CHAT_ID, Config, default_session_path, load_config
 from app.health import start_health_server
 from bot import COMMANDS, secrets_of
 
@@ -21,7 +21,7 @@ REQUIRED = {"API_ID": "12345", "API_HASH": "abcdef0123456789", "BOT_TOKEN": "123
 def env_names() -> list:
     """Every environment variable app/config.py reads."""
     src = (ROOT / "app" / "config.py").read_text()
-    names = set(re.findall(r'(?:getenv|_ints|_bool|_chat_id|_float|_whole)\(\s*"([A-Z][A-Z0-9_]+)"', src))
+    names = set(re.findall(r'(?:getenv|_ints|_bool|_chat_id|_chat_ref|_float|_whole|_wait_seconds)\(\s*"([A-Z][A-Z0-9_]+)"', src))
     names |= set(re.findall(r'environ\[\s*"([A-Z][A-Z0-9_]+)"', src))
     return sorted(names)
 
@@ -159,6 +159,56 @@ def test_the_session_is_not_kept_in_the_app_folder_by_default(env):
     assert load_config().session_path == "data/bot"  # still possible when somebody wants it
 
 
+# ------------------------------------------------------------------------ automatic publishing
+def test_automatic_publishing_is_off_until_both_chats_are_set(env):
+    cfg = load_config()
+    assert cfg.db_channel is None and cfg.comm_chat is None and cfg.auto_publish is False
+    assert cfg.autorename_bot_id == DEFAULT_AUTORENAME_BOT_ID == 8926792949 and cfg.share_url_wait == 45.0
+    env.setenv("DB_CHANNEL", "-1001111111111")
+    cfg = load_config()
+    assert cfg.db_channel == -1001111111111 and cfg.comm_chat is None and cfg.auto_publish is False
+    env.setenv("COMMUNICATION_CHAT", " -1002222222222 ")
+    cfg = load_config()
+    assert cfg.comm_chat == -1002222222222 and cfg.auto_publish is True
+    env.setenv("AUTORENAME_BOT_ID", "42")
+    assert load_config().autorename_bot_id == 42
+
+
+def test_the_setting_names_are_not_case_sensitive(env):
+    env.setenv("DB_Channel", "-1001111111111")
+    env.setenv("Communication_chat", "-1002222222222")
+    cfg = load_config()
+    assert (cfg.db_channel, cfg.comm_chat, cfg.auto_publish) == (-1001111111111, -1002222222222, True)
+    env.setenv("DB_CHANNEL", "-1003333333333")  # the exact name wins when both are there
+    assert load_config().db_channel == -1003333333333
+
+
+@pytest.mark.parametrize("raw", ["0", "off", "none", "false", ""])
+def test_a_chat_can_be_switched_off_by_writing_off(env, raw):
+    env.setenv("DB_CHANNEL", raw)
+    env.setenv("COMMUNICATION_CHAT", "-1002222222222")
+    cfg = load_config()
+    assert cfg.db_channel is None and cfg.auto_publish is False
+
+
+@pytest.mark.parametrize("name", ["DB_CHANNEL", "COMMUNICATION_CHAT", "AUTORENAME_BOT_ID"])
+@pytest.mark.parametrize("raw", ["abc", "@db", "-100 12", "1.5"])
+def test_a_bad_chat_id_is_refused_with_its_name(env, name, raw):
+    env.setenv(name, raw)
+    with pytest.raises(SystemExit, match=name):
+        load_config()
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(None, 45.0), ("", 45.0), ("2", 10.0), ("10", 10.0), ("-5", 10.0), ("30", 30.0), ("100000", 600.0), ("banana", 45.0), ("nan", 45.0), ("inf", 45.0)],
+)
+def test_the_wait_for_the_share_url_button_is_never_shorter_than_ten_seconds(env, raw, expected):
+    if raw is not None:
+        env.setenv("SHARE_URL_WAIT_SECONDS", raw)
+    assert load_config().share_url_wait == expected
+
+
 # ------------------------------------------------------------------------------ secrets of the bot
 def test_every_secret_is_collected_for_redaction():
     cfg = Config(
@@ -256,7 +306,7 @@ def test_the_help_text_lists_the_commands_that_exist():
 
     for name in (
         "new", "posts", "repost", "replace", "undo", "userbot", "export", "import", "addchannel", "channels",
-        "autopost", "broadcast", "handleswap", "shift", "sync",
+        "autopost", "autopublish", "broadcast", "handleswap", "shift", "sync",
     ):
         assert f"/{name}" in HELP, name
     assert "--channel" not in HELP and "/testerror" not in HELP and "/fixlinks" not in HELP and "--clean" not in HELP

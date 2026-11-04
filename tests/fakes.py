@@ -1,4 +1,5 @@
 """Tiny in-memory stand-ins for Telethon, good enough to exercise the engine offline."""
+import copy
 import datetime
 import itertools
 import os
@@ -771,8 +772,29 @@ class FakeUserClient:
             return types.InputPeerUser(bot.id, bot.access_hash)
         raise ValueError(f"Could not find the input entity for {peer!r}")
 
+    def _as_seen_here(self, chan, m):
+        """A post of a channel as this account sees it: a keyboard the bot is not shown (another bot's) is visible here."""
+        if m is None or isinstance(m, (types.MessageService, types.MessageEmpty)):
+            return m
+        seen = copy.copy(m)
+        seen.reply_markup = chan._effective(m)
+        return seen
+
     async def get_messages(self, peer, limit=None, **kw):
-        """The newest messages of this account's chat with the bot (newest first, like Telethon)."""
+        """The newest messages of this account's chat with the bot (newest first, like Telethon); for a channel the account
+        is in: the posts `ids=[...]` asks for, or the newest `limit` posts."""
+        if isinstance(peer, types.InputPeerChannel):
+            chan = self.chan.registry.get(peer.channel_id, self.chan)
+            err = chan.fail.get("user:GetMessages")
+            if err is not None:
+                raise err
+            if self.me.id not in chan.members:
+                raise rpc("ChannelPrivateError")
+            ids = kw.get("ids")
+            if ids is not None:
+                return [self._as_seen_here(chan, chan.msgs.get(i)) for i in ids]
+            newest = sorted(chan.msgs.values(), key=lambda m: m.id, reverse=True)[: limit or 1]
+            return [self._as_seen_here(chan, m) for m in newest]
         dm, bot = self.chan._dm, self.chan._dm.bot_user
         err = self.chan.fail.get("user:GetHistoryRequest")
         if err is not None:

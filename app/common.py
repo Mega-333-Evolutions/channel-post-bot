@@ -46,6 +46,7 @@ class Ctx:
     expirer: Any = None  # app.expiry.Expirer (timed deletions of broadcasts) or None
     syncer: Any = None  # app.syncer.Syncer (keeps My posts in step with the channels) or None
     sync_ignore: set = field(default_factory=set)  # (channel id, message id) of posts the owner made the bot forget
+    publisher: Any = None  # app.dbpublish.AutoPublisher (publishes by itself when the autorename bot reports a file) or None
 
 
 def is_cb(event) -> bool:

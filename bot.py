@@ -22,6 +22,7 @@ from app.handlers import (
     channels,
     checkbtn,
     create,
+    dbpublish,
     masslinks,
     posts,
     replace,
@@ -39,6 +40,7 @@ COMMANDS = [
     ("new", "Create a post"),
     ("posts", "My posts and drafts"),
     ("autopost", "Post a series of episode download buttons"),
+    ("autopublish", "Text and button name of the posts made from the Database Channel (owner)"),
     ("formatting", "How to format text: bold, links, quotes ... (HTML / Markdown)"),
     ("addchannel", "Register a channel"),
     ("channels", "List channels"),
@@ -73,7 +75,7 @@ def build_client(cfg: Config) -> TelegramClient:
 
 
 def register_all(ctx: Ctx) -> None:
-    for module in (basic, backup, channels, create, posts, masslinks, autopost, broadcast, checkbtn, replace, repost, shift, sync):
+    for module in (basic, backup, channels, create, posts, masslinks, autopost, dbpublish, broadcast, checkbtn, replace, repost, shift, sync):
         module.register(ctx)
 
 
@@ -140,6 +142,8 @@ async def main() -> None:
             log.info("error log chat: off")
         if userbot.enabled:
             await userbot.connect()  # never fatal: the userbot is only needed for old posts
+        if ctx.publisher is not None:
+            await ctx.publisher.check()  # says in the log when the Database Channel or the communication chat cannot be reached
         ctx.expirer.start()  # deletes timed broadcasts when their time is up
         ctx.syncer.start()  # compares the channels with My posts now and then (and notices changes made meanwhile)
         await client.run_until_disconnected()

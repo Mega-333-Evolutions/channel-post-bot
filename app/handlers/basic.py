@@ -30,6 +30,7 @@ HELP = (
     "<b>Owner tools</b>\n"
     "/broadcast [time] - send one message to all channels; with a time (50m, 1h, 5d) it is deleted again from all channels and My posts afterwards\n"
     "/replace <post link> - reply to a new media message to replace that post's media and caption (where Telegram refuses the bot, the userbot does it)\n"
+    "/autopublish - the message text and the button name of the posts the bot makes by itself when the autorename bot reports an episode in the communication chat\n"
     "/swap @old @new - swap the username inside t.me links (button links and hyperlinks) in all channels\n"
     "/handleswap @old @new - change the username @old written in posts (text, captions, button names) to @new in all channels; links stay\n"
     "/undo - undo the last /swap or /handleswap\n"

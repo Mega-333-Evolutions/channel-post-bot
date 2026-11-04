@@ -237,6 +237,17 @@ class Admin(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
 
+class Setting(Base):
+    """One setting the owner changes from a chat command and that has to survive a restart: `value` is a JSON object.
+    (Its own table name: the database may be shared with other bots.)"""
+
+    __tablename__ = "post_bot_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONType, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """A datetime from the database as an aware UTC one (SQLite hands back naive values)."""
     if dt is None:
@@ -385,6 +396,30 @@ class Database:
                 await s.execute(delete(model).where(model.channel_id == cid))
             await s.commit()
             return int(n)
+
+    # ------------------------------------------------------------------ settings
+    async def get_setting(self, key: str) -> Optional[dict]:
+        async with self.Session() as s:
+            row = await s.get(Setting, key)
+            return dict(row.value or {}) if row is not None else None
+
+    async def set_setting(self, key: str, value: dict) -> None:
+        async with self.Session() as s:
+            row = await s.get(Setting, key)
+            if row is None:
+                s.add(Setting(key=key, value=dict(value), updated_at=utcnow()))
+            else:
+                row.value, row.updated_at = dict(value), utcnow()  # a new dict: a changed one inside the column would not be noticed
+            await s.commit()
+
+    async def delete_setting(self, key: str) -> bool:
+        async with self.Session() as s:
+            row = await s.get(Setting, key)
+            if row is None:
+                return False
+            await s.delete(row)
+            await s.commit()
+            return True
 
     # --------------------------------------------------------------------- posts
     async def create_post(self, **fields: Any) -> Post:

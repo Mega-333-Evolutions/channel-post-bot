@@ -15,6 +15,15 @@ except Exception:  # pragma: no cover
     pass
 
 
+def _env(name: str) -> str:
+    """An environment variable by name, whatever the capital letters (DB_Channel, DB_CHANNEL and db_channel are one setting)."""
+    raw = os.getenv(name)
+    if raw is None:
+        wanted = name.lower()
+        raw = next((v for k, v in os.environ.items() if k.lower() == wanted), None)
+    return (raw or "").strip()
+
+
 def _ints(name: str) -> frozenset:
     raw = os.getenv(name, "") or ""
     out = set()
@@ -33,6 +42,9 @@ def _bool(name: str, default: bool) -> bool:
 
 
 DEFAULT_ERROR_LOG_CHAT_ID = -1002525172451
+DEFAULT_AUTORENAME_BOT_ID = 8926792949
+MIN_SHARE_URL_WAIT = 10.0  # the file-store bot needs a few seconds to put its button on a new post: never give up sooner
+DEFAULT_SHARE_URL_WAIT = 45.0
 _OFF = {"0", "off", "none", "false", "no", "disabled", "disable"}
 
 
@@ -49,11 +61,30 @@ def _chat_id(name: str, default: Optional[int]) -> Optional[int]:
         raise SystemExit(f"{name} must be a chat id such as -1001234567890 (or 0 / off to switch it off), not {raw!r}")
 
 
+def _chat_ref(name: str) -> Optional[int]:
+    """A chat id such as -1001234567890 (or a bare channel id) from the environment; unset or empty -> None."""
+    raw = _env(name)
+    if raw == "" or raw.lower() in _OFF:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a numeric chat id such as -1001234567890, not {raw!r}")
+
+
 def _float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, "") or default)
     except ValueError:
         return default
+
+
+def _wait_seconds(name: str) -> float:
+    """How long to wait for the Share URL button: at least MIN_SHARE_URL_WAIT, at most ten minutes."""
+    value = _float(name, DEFAULT_SHARE_URL_WAIT)
+    if not math.isfinite(value):
+        value = DEFAULT_SHARE_URL_WAIT
+    return min(600.0, max(MIN_SHARE_URL_WAIT, value))
 
 
 def _whole(name: str, default: int) -> int:
@@ -84,6 +115,15 @@ class Config:
     sync_interval_minutes: int = 60  # how often every channel is compared with My posts (0 = never on its own)
     import_old_posts: bool = True  # read the posts that were in a channel before the bot was added into My posts
     markup_input: bool = True  # text typed as HTML or Markdown (and sent without Telegram formatting) becomes real formatting
+    db_channel: Optional[int] = None  # the Database Channel the autorename bot copies renamed episodes into (DB_CHANNEL)
+    comm_chat: Optional[int] = None  # the chat the autorename bot and this bot talk in (COMMUNICATION_CHAT)
+    autorename_bot_id: int = DEFAULT_AUTORENAME_BOT_ID  # the only account whose messages in that chat are acted on
+    share_url_wait: float = DEFAULT_SHARE_URL_WAIT  # seconds to wait for the 🔁 Share URL button of a new Database Channel post
+
+    @property
+    def auto_publish(self) -> bool:
+        """Posts are published by themselves when the autorename bot reports a file: both chats have to be known."""
+        return bool(self.db_channel and self.comm_chat)
 
     def is_owner(self, uid) -> bool:
         return uid in self.owners
@@ -130,4 +170,8 @@ def load_config() -> Config:
         sync_interval_minutes=max(0, _whole("SYNC_INTERVAL_MINUTES", 60)),
         import_old_posts=_bool("IMPORT_OLD_POSTS", True),
         markup_input=_bool("MARKUP_INPUT", True),
+        db_channel=_chat_ref("DB_CHANNEL"),
+        comm_chat=_chat_ref("COMMUNICATION_CHAT"),
+        autorename_bot_id=_chat_ref("AUTORENAME_BOT_ID") or DEFAULT_AUTORENAME_BOT_ID,
+        share_url_wait=_wait_seconds("SHARE_URL_WAIT_SECONDS"),
     )

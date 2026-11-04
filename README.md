@@ -20,6 +20,7 @@ reported to a Telegram chat.
 | Channels | `/addchannel` registers a channel, `/channels` lists them. Tapping a channel's number takes it out of the bot - and the bot asks whether its saved posts in My posts are deleted too (**Yes** / **No**, see **Taking a channel out**) |
 | Auto-suggest | `/new` offers the next batch: after "Download Episodes 01 to 20" it proposes "Download Episodes 21 to 40", then 41 to 60 ... Tap **Use suggestion** and only the button link is asked |
 | `/autopost` | `/autopost 114 20` posts "Episodes 01 to 20", "21 to 40" ... up to 114, each with a download button, then asks for the real link of every button |
+| Automatic publishing | the autorename bot copies a renamed episode into the **Database Channel** and says so in the **communication chat**; this bot answers *received*, waits for the file store's **🔁 Share URL** button on that post (at least 10 seconds), and posts `Episode 05` / *Click the button below to download 👇* with a **Download Episode 05** button that opens the file link, in the channel the autorename bot's message names - then reports *post published successfully* or *publication failed* with the reason. The text and the button name are yours to change with `/autopublish` (see **Automatic publishing**) |
 | `/swap` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
 | `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption (nothing else); the caption keeps its formatting, Telegram's own or typed HTML / Markdown. Where Telegram refuses the bot - a post whose buttons another bot added - the userbot makes the edit (quickly, even for a big file, and the thumbnail stays - see below); My posts is updated |
 | `/handleswap` | swaps a `@username` that is *written* in posts (text, captions, button names) - links are left alone. Preview first, full undo |
@@ -63,6 +64,9 @@ All settings are environment variables (a `.env` file works locally; on a host u
 | `ERROR_LOG_CHAT_ID` | chat that receives the error reports. Empty = `-1002525172451`, `0` or `off` = switched off |
 | `USERBOT_SESSION` | session text of the helper account (see **Userbot**). Empty = no userbot |
 | `USERBOT_KEEP_ADMIN` | `true` = the userbot stays an admin after a clean-up or an edit (default: the right is taken away again) |
+| `DB_CHANNEL`, `COMMUNICATION_CHAT` | ids of the Database Channel and of the chat the autorename bot and this bot talk in (like `-1001234567890`). Both have to be set to switch **Automatic publishing** on; the names are not case sensitive (`DB_Channel` and `Communication_chat` work as well) |
+| `AUTORENAME_BOT_ID` | the autorename bot's Telegram id - the only account whose messages in that chat are acted on (default `8926792949`) |
+| `SHARE_URL_WAIT_SECONDS` | how long to wait for the 🔁 Share URL button of the new Database Channel post (default 45, never less than 10: the file store needs a few seconds to add it) |
 | `DELETE_SERVICE_MESSAGES` | `true` (default) = the bot deletes the notices Telegram adds to the channels. `false` = leave them |
 | `IMPORT_OLD_POSTS` | `true` (default) = the posts that were in a channel before the bot was added are read into My posts too (see **Sync**). `false` = follow only what happens from now on |
 | `SYNC_INTERVAL_MINUTES` | minutes between two full checks of every channel against My posts (default 60). `0` = no automatic checks and no live tracking of edits / deletes / new posts; `/sync` still works. Every check wakes a serverless database such as Neon for a few minutes, so a longer value (e.g. `180`) lets it sleep more |
@@ -103,6 +107,66 @@ the button in the channel at once. The posts are in My posts like any other.
 **Mass replace links** is the same question-after-question flow for a channel you already have: open a published button
 post in `/posts` and tap it; the bot asks for that post's new link, then for the next button post of the channel (posts
 without a link button are skipped). Stop with ✖️ Cancel at any time; what was answered stays changed.
+
+## 🤖 Automatic publishing from the Database Channel
+
+Switched on by `DB_CHANNEL` **and** `COMMUNICATION_CHAT` (see **Settings**); the autorename bot has the same two settings.
+
+**What happens**
+
+1. In the autorename bot a manual format can have a **Channel** (the id of the channel of that series). After `/rename` it asks
+   *upload to the Database Channel?*; on **Yes** it copies the renamed episode there (no download or upload) and writes this in the
+   communication chat:
+
+   ```
+   File uploaded to the Database Channel
+   Episode: 05
+   Channel: -1001234567890
+   File: Black Clover - S2 E05.mkv
+   Post: 1234
+   Ref: 3f9a1c
+   ```
+
+   `Episode` is the episode number of the renamed file (zeros kept), `Channel` the id from the format, `Post` the copy in the
+   Database Channel and `Ref` a token every answer repeats.
+2. This bot answers **📥 Message received** in the chat, then looks at that post of the Database Channel and **waits for its
+   🔁 Share URL button** - the file store adds it a few seconds after the post appears, so it looks again every 3 seconds, for at
+   least 10 seconds (`SHARE_URL_WAIT_SECONDS`, default 45), before it says *no 🔁 Share URL button found*. It looks through the bot
+   first; when the bot cannot read the post, or sees no button once the first 10 seconds are over (Telegram may not show a keyboard
+   that another bot added), the **userbot** looks as well (it joins the Database Channel like it does for edits; `USERBOT_SESSION`).
+3. The button's link is the **file link**: a Share URL button usually opens Telegram's share sheet
+   (`https://t.me/share/url?url=<file link>`), and the bot takes the share sheet off.
+4. The post is made in **the channel the message names** - nothing is guessed from the file name. That channel has to be connected
+   to this bot (`/addchannel`, with the right to post). The post is a text with one button, made from two templates, and saved in My posts:
+
+   | | default | example for episode `05` |
+   |---|---|---|
+   | message text | `Episode {episode}` + empty line + `Click the button below to download 👇` | `Episode 05` ... |
+   | button name | `Download Episode {episode}` | `Download Episode 05` |
+
+   `{episode}` (also written `{episode number}` or `{episode_number}`) is the episode number from the autorename bot's message,
+   `{channel}` the name of the channel the post goes to. No earlier post of the channel is needed.
+5. **✅ Post published successfully** (with the channel, the post link and the button) - or **❌ Publication failed: &lt;reason&gt;** -
+   goes back to the chat as a reply, and the autorename bot shows it in its *Processing* message. Reasons that are reported: no
+   `Channel:` or `Episode:` line, the channel is not connected / is the Database Channel itself, the post is not a file, no
+   🔁 Share URL button after the wait (and who looked), a link that cannot be used, Telegram refusing the post.
+
+**`/autopublish`** (owner) shows the two templates and changes them: **✏️ Message text** (send the new text: Telegram formatting is kept,
+or type HTML / Markdown - `/formatting`), **✏️ Button name**, **👁 Preview** (a post for episode 05), **↩️ Default text** / **↩️ Default button**.
+Words in braces that are not variables are refused, so a typo does not end up in a channel.
+
+**Set-up that has to be right (Telegram's rules, not mine)**
+
+- Both bots must be **in the communication chat**, and **Bot-to-Bot Communication Mode** has to be on for them in @BotFather. A bot only receives
+  another bot's messages in a group when that mode is on and the message is meant for it (a reply to its own message, a command aimed at it)
+  or the bot is an admin there with Group Privacy off - so make this bot an admin of the chat and turn **Group Privacy off** in @BotFather
+  (if it still sees nothing, remove it from the chat and add it again). The answers of this bot are replies to the autorename bot's message,
+  which is the case that always reaches it.
+- This bot and the autorename bot must be admins of the Database Channel (this one only reads it). The userbot is optional there.
+- Only messages of `AUTORENAME_BOT_ID` in `COMMUNICATION_CHAT` are acted on, each once; one post is made at a time.
+- **Not tested against real Telegram** - the tests use a simulated channel and chat (see **Tests**). Whether Telegram shows this bot the
+  keyboards another bot adds to a channel post, and delivers the autorename bot's messages as described above, is exactly what the
+  userbot fallback and the set-up above are for; the first run on a test channel will tell.
 
 ## ✍️ Formatting: Telegram's own, HTML and Markdown
 
@@ -585,7 +649,7 @@ records of level ERROR, exceptions nobody caught in background tasks, and a cras
 ## Commands
 
 `/new` `/posts` `/autopost` `/formatting` `/rich` `/cancel` · `/addchannel` `/channels` · owner only: `/broadcast` (`/boardcast`) `/replace` `/swap`
-`/handleswap` `/undo` `/repost` `/shift` `/sync` `/userbot` `/export` `/import`
+`/handleswap` `/undo` `/repost` `/shift` `/sync` `/userbot` `/autopublish` `/export` `/import`
 
 Auto-suggest reads the newest published post of the channel that has a button with numbers in its text
 (`Episodes 01 to 20`, `1-12`, `S01E01-E12`, `Episode 05`). It keeps zero-padding and batch size, advances the
@@ -640,4 +704,6 @@ posts, so cancelled drafts don't skip numbers and editing or deleting the last p
 the flows that use it, `tests/test_rich.py` and `tests/test_rich_flows.py` the rich messages (what is recognised, what is sent,
 receiving, editing, broadcast, the userbot, /swap, the sync and /repost), `tests/test_rich_refused.py` the blocks Telegram
 refuses (the conversion, finding them, ✂️ Leave those out), `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
-bot-first, userbot-second edit of `/replace` and My posts.
+bot-first, userbot-second edit of `/replace` and My posts. `tests/test_dbpublish.py` covers the automatic publishing: the message of the autorename bot,
+the wait for the Share URL button (a fake clock: never less than 10 seconds), the userbot looking, the channel taken from the message, the
+templates (formatting, emoji offsets) and `/autopublish`.
