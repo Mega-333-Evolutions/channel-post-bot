@@ -20,7 +20,7 @@ reported to a Telegram chat.
 | Channels | `/addchannel` registers a channel, `/channels` lists them. Tapping a channel's number takes it out of the bot - and the bot asks whether its saved posts in My posts are deleted too (**Yes** / **No**, see **Taking a channel out**) |
 | Auto-suggest | `/new` offers the next batch: after "Download Episodes 01 to 20" it proposes "Download Episodes 21 to 40", then 41 to 60 ... Tap **Use suggestion** and only the button link is asked |
 | `/autopost` | `/autopost 114 20` posts "Episodes 01 to 20", "21 to 40" ... up to 114, each with a download button, then asks for the real link of every button |
-| Automatic publishing | the autorename bot copies a renamed episode into the **Database Channel** and says so in the **communication chat**; this bot answers *received*, waits for the file store's **🔁 Share URL** button on that post (at least 10 seconds), and posts `Episode 05` / *Click the button below to download 👇* with a **Download Episode 05** button that opens the file link, in the channel the autorename bot's message names - then reports *post published successfully* or *publication failed* with the reason. The text and the button name are yours to change with `/autopublish` (see **Automatic publishing**) |
+| Automatic publishing | the autorename bot copies a renamed episode into the **Database Channel** and says so in the **communication chat**; this bot answers *received*, waits for the file store's **🔁 Share URL** button on that post (at least 10 seconds), and posts `Episode 05` / *Click the button below to download 👇* with a **Download Episode 05** button that opens the file link, in the channel the autorename bot's message names - then reports *post published successfully* or *publication failed* with the reason. The autorename bot's **🗑 Delete post** button makes this bot delete that post again (channel and My posts). The text and the button name are yours to change with `/autopublish` (see **Automatic publishing**) |
 | `/swap` | swaps `@old` → `@new` inside t.me links (button links, hyperlinks, typed links) in **every post of every channel**, also posts not made by this bot. Preview first, full undo. Works only where Telegram lets the bot edit the post |
 | `/replace` | reply to new media with `/replace <channel post link>` to replace that published post's media and caption (nothing else); the caption keeps its formatting, Telegram's own or typed HTML / Markdown. Where Telegram refuses the bot - a post whose buttons another bot added - the userbot makes the edit (quickly, even for a big file, and the thumbnail stays - see below); My posts is updated |
 | `/handleswap` | swaps a `@username` that is *written* in posts (text, captions, button names) - links are left alone. Preview first, full undo |
@@ -150,6 +150,29 @@ Switched on by `DB_CHANNEL` **and** `COMMUNICATION_CHAT` (see **Settings**); the
    goes back to the chat as a reply, and the autorename bot shows it in its *Processing* message. Reasons that are reported: no
    `Channel:` or `Episode:` line, the channel is not connected / is the Database Channel itself, the post is not a file, no
    🔁 Share URL button after the wait (and who looked), a link that cannot be used, Telegram refusing the post.
+6. **Deleting it again.** The autorename bot puts a **🗑 Delete post** button on *Post published successfully* (it asks *Are you sure?*
+   first). On **Yes** it writes this in the chat:
+
+   ```
+   Delete the published post
+   Channel: -1001234567890
+   Message: 57
+   File: Black Clover - S2 E05.mkv
+   Ref: 8c21d0
+   ```
+
+   `Channel` and `Message` (the post as a message of its channel) are the ones this bot reported when it published. It answers
+   **📥 Message received**, deletes the post in the channel - the bot first, the userbot where Telegram refuses the bot, exactly like
+   **Delete from channel** in My posts - removes it from **My posts** (with a timed deletion or a "forgotten on purpose" mark that
+   hung on it), and replies **🗑 Post deleted successfully** or **❌ Deletion failed: &lt;reason&gt;**. Only then does the autorename
+   bot delete its copy in the Database Channel; on a failure it leaves everything as it is and offers *Try again*.
+   Only a post **this bot published by itself** is deleted: one that is not in My posts but still in the channel, one somebody made with
+   the bot, an adopted one - and anything in the Database Channel - is left alone, and the reply says why. A post that is already gone
+   from the channel and from My posts counts as deleted, so pressing the button twice (or deleting it in My posts first) is no error.
+
+7. **Only the link.** The autorename bot can also write `Get the share URL` (with `Post: <id of the copy in the Database Channel>` and `Ref`) when
+   it could not see the 🔁 Share URL button itself. This bot answers **📥 Message received**, waits for the button exactly as above (userbot included)
+   and replies **🔗 Share URL ready** with `URL: <file link>`, or **❌ Share URL failed: &lt;reason&gt;**. Nothing is posted in any channel.
 
 **`/autopublish`** (owner) shows the two templates and changes them: **✏️ Message text** (send the new text: Telegram formatting is kept,
 or type HTML / Markdown - `/formatting`), **✏️ Button name**, **👁 Preview** (a post for episode 05), **↩️ Default text** / **↩️ Default button**.
@@ -163,7 +186,7 @@ Words in braces that are not variables are refused, so a typo does not end up in
   (if it still sees nothing, remove it from the chat and add it again). The answers of this bot are replies to the autorename bot's message,
   which is the case that always reaches it.
 - This bot and the autorename bot must be admins of the Database Channel (this one only reads it). The userbot is optional there.
-- Only messages of `AUTORENAME_BOT_ID` in `COMMUNICATION_CHAT` are acted on, each once; one post is made at a time.
+- Only messages of `AUTORENAME_BOT_ID` in `COMMUNICATION_CHAT` are acted on, each once; one post is made (or deleted) at a time.
 - **Not tested against real Telegram** - the tests use a simulated channel and chat (see **Tests**). Whether Telegram shows this bot the
   keyboards another bot adds to a channel post, and delivers the autorename bot's messages as described above, is exactly what the
   userbot fallback and the set-up above are for; the first run on a test channel will tell.
@@ -706,4 +729,5 @@ receiving, editing, broadcast, the userbot, /swap, the sync and /repost), `tests
 refuses (the conversion, finding them, ✂️ Leave those out), `tests/test_userbot_edit.py` the userbot's editor and `tests/test_replace_userbot.py` the
 bot-first, userbot-second edit of `/replace` and My posts. `tests/test_dbpublish.py` covers the automatic publishing: the message of the autorename bot,
 the wait for the Share URL button (a fake clock: never less than 10 seconds), the userbot looking, the channel taken from the message, the
-templates (formatting, emoji offsets) and `/autopublish`.
+templates (formatting, emoji offsets) and `/autopublish`; `tests/test_dblink.py` the link-only request; `tests/test_dbdelete.py` the deletion of such a post: the message, the bot and
+the userbot deleting, what is left alone (posts not published automatically, the Database Channel) and every reason it reports.

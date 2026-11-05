@@ -18,6 +18,11 @@ The message of the autorename bot (it writes the Channel and Episode lines from 
      so on) and the button name ("Download Episode {episode}"). The button opens the file link of the Share URL button.
      It goes to the channel the message names - nothing is guessed from the file name.
   4. "Post published successfully" - or "Publication failed: <why>" - goes back to the communication chat.
+
+Deleting: the "Delete post" button of the autorename bot writes "Delete the published post" in the communication chat
+(Channel / Message / File / Ref lines: the channel and the message id of the post, as this bot reported them). This bot then
+deletes that post in the channel - only one it published by itself - and in My posts, and answers "Post deleted successfully"
+(also when the post was already gone) or "Deletion failed: <why>".
 """
 from __future__ import annotations
 
@@ -40,8 +45,9 @@ from .config import MIN_SHARE_URL_WAIT
 from .db import utcnow
 from .linkswap import apply_span_replacements
 from .replace_engine import fetch_messages, get_top_id, is_skippable
+from .repost_engine import delete_batch, gone_ids
 from .tgutil import button_url, de_entities, explain_rpc, peer_of, post_link, ser_entities
-from .userbot import UserbotError
+from .userbot import UserbotError, delete_problem_text
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +63,8 @@ BUTTON_MAX = 60  # of the button name template
 BUTTON_SHOWN = 64  # a button name is cut at this length when the post is made
 
 _NOTICE_RX = re.compile(r"(?i)file\s+uploaded\s+to\s+the\s+database\s+channel")
+_DELETE_RX = re.compile(r"(?i)\A\s*delete\s+the\s+published\s+post\b")  # the first words of the message, not anywhere in it
+_LINK_RX = re.compile(r"(?i)\A\s*get\s+the\s+share\s+url\b")
 _SHARE_RX = re.compile(r"(?i)\bshare\s*url\b")
 _SHARE_LINK_RX = re.compile(r"(?i)^https?://(?:t\.me|telegram\.me|telegram\.dog)/share(?:/url)?\?(.*)$")
 # {episode}, {episode number}, {episode_number}, {channel} (also {channel name}); spaces inside the braces do not matter
@@ -89,6 +97,12 @@ def chat_number(raw: Optional[str]) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _field(text: Optional[str], label: str) -> str:
+    """The value of a ``Label: value`` line of a message; empty when there is no such line."""
+    m = re.search(rf"(?im)^\s*{label}\s*:\s*(.+?)\s*$", text or "")
+    return m.group(1).strip() if m else ""
+
+
 def parse_notice(text: Optional[str]) -> Optional[Notice]:
     """The message the autorename bot writes ("File uploaded to the Database Channel", then Episode / Channel / File /
     Post / Ref lines); None for anything else."""
@@ -96,8 +110,7 @@ def parse_notice(text: Optional[str]) -> Optional[Notice]:
         return None
 
     def field_of(label: str) -> str:
-        m = re.search(rf"(?im)^\s*{label}\s*:\s*(.+?)\s*$", text or "")
-        return m.group(1).strip() if m else ""
+        return _field(text, label)
 
     post = field_of("post")
     channel_raw = field_of("channel")
@@ -111,7 +124,61 @@ def parse_notice(text: Optional[str]) -> Optional[Notice]:
     )
 
 
-def _tail(notice: Optional[Notice]) -> str:
+@dataclass
+class DeleteNotice:
+    """The autorename bot asking for a published post to be deleted."""
+
+    channel: Optional[int] = None  # the channel the post is in, as written (-100…); None when the message names none
+    channel_raw: str = ""  # what stood after "Channel:" (shown when it is not an id)
+    message_id: Optional[int] = None  # the post, as a message of that channel (the "Message:" line of "Post published successfully")
+    file: str = ""
+    ref: str = ""  # repeated in every answer, as in the notice of an upload
+
+
+def parse_delete_notice(text: Optional[str]) -> Optional[DeleteNotice]:
+    """The message the autorename bot writes to have a post deleted ("Delete the published post", then Channel / Message /
+    File / Ref lines); None for anything else."""
+    if not _DELETE_RX.search(text or ""):
+        return None
+    channel_raw, message = _field(text, "channel"), _field(text, "message")
+    return DeleteNotice(
+        channel=chat_number(channel_raw),
+        channel_raw=channel_raw[:60],
+        message_id=int(message) if re.fullmatch(r"\d{1,12}", message) else None,
+        file=_field(text, "file"),
+        ref=_field(text, "ref")[:40],
+    )
+
+
+@dataclass
+class LinkNotice:
+    """The autorename bot asking only for the Share URL of a file in the Database Channel (nothing is published)."""
+
+    post_id: Optional[int] = None  # the file in the Database Channel
+    ref: str = ""
+
+
+def parse_link_notice(text: Optional[str]) -> Optional[LinkNotice]:
+    """"Get the share URL", then Post / Ref lines; None for anything else."""
+    if not _LINK_RX.search(text or ""):
+        return None
+    post = _field(text, "post")
+    return LinkNotice(post_id=int(post) if re.fullmatch(r"\d{1,12}", post) else None, ref=_field(text, "ref")[:40])
+
+
+def link_received_text(notice: Optional[LinkNotice] = None) -> str:
+    return "📥 Message received - looking for the Share URL…" + _tail(notice)
+
+
+def link_ready_text(url: str, notes: list, notice: Optional[LinkNotice] = None) -> str:
+    return "\n".join(["🔗 Share URL ready", f"URL: {url}", *[f"ℹ️ {n}" for n in notes]]) + _tail(notice)
+
+
+def link_failed_text(reason: str, notice: Optional[LinkNotice] = None) -> str:
+    return f"❌ Share URL failed: {' '.join((reason or 'unknown reason').split())[:600]}" + _tail(notice)
+
+
+def _tail(notice: Any) -> str:
     return f"\nRef: {notice.ref}" if notice is not None and notice.ref else ""
 
 
@@ -134,6 +201,7 @@ class Published:
     file: str
     episode: str = ""
     notes: list = field(default_factory=list)
+    message_id: int = 0  # the new post as a message of its channel (what a deletion names)
 
 
 def published_text(p: Published, notice: Optional[Notice] = None) -> str:
@@ -141,14 +209,41 @@ def published_text(p: Published, notice: Optional[Notice] = None) -> str:
         "✅ Post published successfully",
         f"Channel: {p.channel.title}",
         f"Post: {p.link}",
-        f"Button: {p.label} → {p.url}",
     ]
+    if p.message_id:
+        lines.append(f"Message: {p.message_id}")
+    lines.append(f"Button: {p.label} → {p.url}")
     if p.episode:
         lines.append(f"Episode: {p.episode}")
     lines += [f"ℹ️ {n}" for n in p.notes]
     if p.file:
         lines.append(f"File: {p.file}")
     return "\n".join(lines) + _tail(notice)
+
+
+@dataclass
+class Deleted:
+    channel: Any
+    message_id: int
+    file: str = ""
+    notes: list = field(default_factory=list)
+
+
+def delete_received_text(notice: Optional[DeleteNotice] = None) -> str:
+    return "📥 Message received - deleting the post…" + _tail(notice)
+
+
+def deleted_text(d: Deleted, notice: Optional[DeleteNotice] = None) -> str:
+    lines = ["🗑 Post deleted successfully", f"Channel: {d.channel.title}", f"Message: {d.message_id}"]
+    lines += [f"ℹ️ {n}" for n in d.notes]
+    if d.file:
+        lines.append(f"File: {d.file}")
+    return "\n".join(lines) + _tail(notice)
+
+
+def delete_failed_text(reason: str, notice: Optional[DeleteNotice] = None) -> str:
+    reason = " ".join((reason or "unknown reason").split())
+    return f"❌ Deletion failed: {reason[:600]}" + (f"\nFile: {notice.file}" if notice is not None and notice.file else "") + _tail(notice)
 
 
 # ------------------------------------------------------------------------------------------------ chat ids, names
@@ -325,12 +420,21 @@ class AutoPublisher:
     # --------------------------------------------------------------------------------------------- entry point
     async def handle(self, event: Any) -> None:
         """A message of the autorename bot in the communication chat."""
-        notice = parse_notice(getattr(event, "raw_text", None))
-        if notice is None or event.id in self._handled:
+        text = getattr(event, "raw_text", None)
+        notice = parse_notice(text)
+        removal = None if notice is not None else parse_delete_notice(text)
+        lookup = None if notice is not None or removal is not None else parse_link_notice(text)
+        if (notice is None and removal is None and lookup is None) or event.id in self._handled:
             return  # something else it says, or the same notice again
         self._handled[event.id] = None
         while len(self._handled) > KEEP_NOTICES:
             self._handled.popitem(last=False)
+        if removal is not None:
+            await self._remove(event, removal)
+            return
+        if lookup is not None:
+            await self._lookup(event, lookup)
+            return
         await self._answer(event, received_text(notice))
         async with self.lock:
             try:
@@ -343,6 +447,44 @@ class AutoPublisher:
                 log.exception("automatic publishing failed")
                 text = failed_text(f"something went wrong inside the bot ({type(e).__name__}: {str(e)[:150]})", notice)
         await self._answer(event, text)
+
+    async def _remove(self, event: Any, notice: DeleteNotice) -> None:
+        """A request to delete a published post: "received", then "deleted" or why not."""
+        await self._answer(event, delete_received_text(notice))
+        async with self.lock:
+            try:
+                text = deleted_text(await self.delete(notice), notice)
+            except Failure as f:
+                log.info("automatic deletion: %s", f)
+                text = delete_failed_text(str(f), notice)
+            except Exception as e:  # noqa: BLE001 - the autorename bot must always get an answer
+                log.exception("automatic deletion failed")
+                text = delete_failed_text(f"something went wrong inside the bot ({type(e).__name__}: {str(e)[:150]})", notice)
+        await self._answer(event, text)
+
+    async def _lookup(self, event: Any, notice: LinkNotice) -> None:
+        """A request for the Share URL of a file in the Database Channel: "received", then the link or why not."""
+        await self._answer(event, link_received_text(notice))
+        async with self.lock:
+            try:
+                text = link_ready_text(*await self.share_link(notice), notice)
+            except Failure as f:
+                text = link_failed_text(str(f), notice)
+            except Exception as e:  # noqa: BLE001 - the autorename bot must always get an answer
+                log.exception("looking for the share url failed")
+                text = link_failed_text(f"something went wrong inside the bot ({type(e).__name__}: {str(e)[:150]})", notice)
+        await self._answer(event, text)
+
+    async def share_link(self, notice: LinkNotice) -> tuple:
+        """(file link, notes) of the 🔁 Share URL button of that Database Channel post - waited for like when publishing, the
+        userbot looking too when the bot cannot see it. Nothing is posted anywhere."""
+        if not notice.post_id:
+            raise Failure("The message does not say which post of the Database Channel: it has no “Post:” line.")
+        seen = await self._wait_for_share(await self._database_channel(), Notice(post_id=notice.post_id))
+        link = norm_url(file_link(seen.found[1]))
+        if not link:
+            raise Failure(f"The 🔁 Share URL button of that post has a link I cannot use: {seen.found[1][:150]}")
+        return link, (["The Share URL button was read through the userbot."] if seen.via == "userbot" else [])
 
     async def _answer(self, event: Any, text: str) -> None:
         try:
@@ -384,23 +526,73 @@ class AutoPublisher:
             done.notes.append("The Share URL button was read through the userbot.")
         return done
 
-    async def _target_channel(self, notice: Notice) -> Any:
+    async def delete(self, notice: DeleteNotice) -> Deleted:
+        """Delete a post this bot made by itself: in its channel (the userbot takes over where Telegram refuses the bot, as in
+        My posts) and in My posts. A post that is gone from the channel and from My posts counts as deleted."""
+        ctx, db = self.ctx, self.ctx.db
+        ch = await self._target_channel(notice, deleting=True)
+        mid = notice.message_id
+        if not mid:
+            raise Failure("The message does not say which post to delete: it has no “Message:” line.")
+        peer = peer_of(ch)
+        post = await db.find_by_message(ch.id, mid)
+        done = Deleted(channel=ch, message_id=mid, file=notice.file)
+        if post is None:  # not in My posts: only a message that is gone from the channel as well counts as deleted
+            try:
+                gone = await gone_ids(ctx.client, peer, [mid])
+            except errors.RPCError as e:
+                raise Failure(f"I could not look at the post in “{ch.title}”: {explain_rpc(e)}")
+            if mid not in gone:
+                raise Failure(
+                    f"Message {mid} of “{ch.title}” is not one of the posts this bot published (My posts does not have it), "
+                    "so I did not delete it."
+                )
+            done.notes.append("The post was already gone from the channel and from My posts.")
+            return done
+        if post.source != "bot" or post.created_by:
+            raise Failure(
+                f"Message {mid} of “{ch.title}” was not published automatically, so I did not delete it. "
+                "Delete it from My posts if you want it gone."
+            )
+        fallback, deleter = await ctx.userbot.fallback_for(ch) if ctx.userbot is not None else (None, None)
+        try:
+            out = await delete_batch(ctx.client, peer, [mid], fallback)
+        except errors.RPCError as e:
+            raise Failure(f"Telegram refused to look at the post in “{ch.title}”: {explain_rpc(e)}")
+        finally:
+            if deleter is not None:
+                await deleter.close()
+        if mid not in out.gone:
+            why = delete_problem_text(ctx.userbot, bot_error=out.bot_error, fallback_error=out.fallback_error, tried=out.tried_userbot)
+            raise Failure(f"Telegram did not delete the post in “{ch.title}”. {why} It is still in My posts.")
+        await db.forget_posts(post.channel_id, [mid])  # gone from the channel: from My posts too, with what hangs on it
+        if out.by_userbot:
+            done.notes.append("The bot was not allowed to delete it, so the userbot did.")
+        return done
+
+    async def _target_channel(self, notice: Any, *, deleting: bool = False) -> Any:
         """The channel the message names: connected to this bot, switched on, and not the Database Channel itself."""
         if notice.channel is None:
             if notice.channel_raw:
                 raise Failure(f"The message names “{notice.channel_raw}” as the channel, which is not a channel id (like -1001234567890).")
+            if deleting:
+                raise Failure("The message does not say which channel the post is in: it has no “Channel:” line.")
             raise Failure(
                 "The message does not say which channel to post in: it has no “Channel:” line "
                 "(the Channel option of the format the episode was renamed with)."
             )
         cid = channel_id_of(notice.channel)
         if cid == channel_id_of(self.ctx.cfg.db_channel):
-            raise Failure("The channel in the message is the Database Channel itself - the post has to go to the channel of the series.")
+            raise Failure(
+                "The channel in the message is the Database Channel itself - this bot only deletes the posts it made in the channel of the series."
+                if deleting
+                else "The channel in the message is the Database Channel itself - the post has to go to the channel of the series."
+            )
         ch = await self.ctx.db.get_channel(cid)
         if ch is None or not ch.active:
             raise Failure(
                 f"The channel {notice.channel} is not connected to this bot (/channels lists the connected ones, /addchannel adds one), "
-                "so I cannot post there."
+                f"so I cannot {'delete' if deleting else 'post'} there."
             )
         return ch
 
@@ -541,5 +733,6 @@ class AutoPublisher:
         await db.release_slot(ch.id, sent.id, keep_pid=post.id)  # the sync may have picked the message up a moment ago
         await db.update_post(post.id, status="sent", message_id=sent.id, sent_at=utcnow())
         return Published(
-            channel=ch, link=post_link(ch, sent.id), label=label, url=link, file=name or notice.file, episode=notice.episode
+            channel=ch, link=post_link(ch, sent.id), label=label, url=link, file=name or notice.file, episode=notice.episode,
+            message_id=sent.id,
         )
